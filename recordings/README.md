@@ -57,6 +57,16 @@ row writes the same bytes (the normalizations below make it so), so a diff
 is a real change in the service or in the test. `TCAE_VCR=check` is that
 comparison as a failing test, for CI.
 
+## What the requests carry
+
+Go's module tests talk raw HTTP through `net/http`, which sends
+`User-Agent: Go-http-client/1.1` by itself; Aether's `std.http.client` sends
+no `User-Agent` at all. Each test's request helper sets one
+(`USER_AGENT`, `testcontainers-ae-tests (Aether std.http.client)`), as an
+app's client library would, so the recordings show a representative request.
+That is the test's client speaking: Servirtium records the headers as they
+were sent and adds none.
+
 ## Normalizations in force
 
 Applied when a tape is written; playback serves the tape as written.

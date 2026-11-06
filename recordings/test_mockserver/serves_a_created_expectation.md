@@ -5,6 +5,7 @@
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -30,6 +31,7 @@ Connection: keep-alive
 Content-Length: 107
 Content-Type: application/json
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -42,7 +44,7 @@ Host: {{request.host}}
 version: 5.15.0
 connection: keep-alive
 content-type: application/json; charset=utf-8
-content-length: 312
+content-length: 296
 ```
 ### Response body recorded for playback (201: application/json; charset=utf-8):
 
@@ -74,6 +76,7 @@ content-length: 312
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -98,6 +101,7 @@ Hello from tcae
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 

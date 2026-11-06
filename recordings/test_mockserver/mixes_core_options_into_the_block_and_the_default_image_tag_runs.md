@@ -5,6 +5,7 @@
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 

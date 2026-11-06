@@ -5,6 +5,7 @@
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -34,6 +35,7 @@ Connection: keep-alive
 Content-Length: 12
 Content-Type: application/json
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -62,6 +64,7 @@ true
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -96,6 +99,7 @@ Connection: keep-alive
 Content-Length: 37
 Content-Type: application/json
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -121,6 +125,7 @@ Content-Length: 0
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -163,6 +168,7 @@ Content-Length: 312
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -187,6 +193,7 @@ Content-Length: 0
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -214,6 +221,7 @@ Content-Length: 3
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 

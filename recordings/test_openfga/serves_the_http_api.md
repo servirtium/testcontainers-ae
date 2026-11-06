@@ -5,6 +5,7 @@
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -33,6 +34,7 @@ Connection: keep-alive
 Content-Length: 15
 Content-Type: application/json
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -45,7 +47,7 @@ Host: {{request.host}}
 Content-Type: application/json
 Vary: Origin
 X-Http-Code: 201
-Content-Length: 144
+Content-Length: 112
 ```
 ### Response body recorded for playback (201: application/json):
 
@@ -60,6 +62,7 @@ Content-Length: 144
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -70,7 +73,7 @@ Host: {{request.host}}
 ```
 Content-Type: application/json
 Vary: Origin
-Content-Length: 201
+Content-Length: 169
 ```
 ### Response body recorded for playback (200: application/json):
 
@@ -85,6 +88,7 @@ Content-Length: 201
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -96,7 +100,7 @@ Host: {{request.host}}
 Content-Type: application/json
 Openfga-Store-Id: {{store-id-1}}
 Vary: Origin
-Content-Length: 163
+Content-Length: 131
 ```
 ### Response body recorded for playback (200: application/json):
 

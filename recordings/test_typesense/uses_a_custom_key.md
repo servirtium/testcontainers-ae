@@ -5,6 +5,7 @@
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -33,6 +34,7 @@ Connection: keep-alive
 Content-Length: 151
 Content-Type: application/json
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 X-TYPESENSE-API-KEY: REDACTED[wrong-key]
 ```
 ### Request body recorded for playback ():
@@ -63,6 +65,7 @@ Connection: keep-alive
 Content-Length: 151
 Content-Type: application/json
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 X-TYPESENSE-API-KEY: REDACTED[custom-key]
 ```
 ### Request body recorded for playback ():
@@ -91,6 +94,7 @@ transfer-encoding: chunked
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 X-TYPESENSE-API-KEY: REDACTED[custom-key]
 ```
 ### Request body recorded for playback ():

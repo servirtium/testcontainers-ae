@@ -5,6 +5,7 @@
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -14,7 +15,7 @@ Host: {{request.host}}
 
 ```
 Cache-Control: must-revalidate
-Content-Length: 247
+Content-Length: 233
 Content-Type: application/json
 Server: CouchDB/3.5.3 (Erlang OTP/27)
 ```
@@ -32,6 +33,7 @@ Server: CouchDB/3.5.3 (Erlang OTP/27)
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -59,6 +61,7 @@ Server: CouchDB/3.5.3 (Erlang OTP/27)
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -87,6 +90,7 @@ Server: CouchDB/3.5.3 (Erlang OTP/27)
 Authorization: Basic REDACTED[admin-wrong-password]
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -115,6 +119,7 @@ Server: CouchDB/3.5.3 (Erlang OTP/27)
 Authorization: Basic REDACTED[admin]
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -144,6 +149,7 @@ Server: CouchDB/3.5.3 (Erlang OTP/27)
 Authorization: Basic REDACTED[admin]
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -153,7 +159,7 @@ Host: {{request.host}}
 
 ```
 Cache-Control: must-revalidate
-Content-Length: 464
+Content-Length: 271
 Content-Type: application/json
 Server: CouchDB/3.5.3 (Erlang OTP/27)
 ```

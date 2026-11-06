@@ -5,6 +5,7 @@
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -16,7 +17,7 @@ Host: {{request.host}}
 Cache-Control: no-store
 Content-Type: application/json
 Strict-Transport-Security: max-age=31536000; includeSubDomains
-Content-Length: 295
+Content-Length: 261
 ```
 ### Response body recorded for playback (200: application/json):
 
@@ -32,6 +33,7 @@ Content-Length: 295
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 X-Vault-Token: REDACTED-TOKEN
 ```
 ### Request body recorded for playback ():
@@ -44,7 +46,7 @@ X-Vault-Token: REDACTED-TOKEN
 Cache-Control: no-store
 Content-Type: application/json
 Strict-Transport-Security: max-age=31536000; includeSubDomains
-Content-Length: 315
+Content-Length: 279
 ```
 ### Response body recorded for playback (200: application/json):
 
@@ -60,6 +62,7 @@ Content-Length: 315
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 X-Vault-Token: REDACTED-TOKEN
 ```
 ### Request body recorded for playback ():
@@ -72,7 +75,7 @@ X-Vault-Token: REDACTED-TOKEN
 Cache-Control: no-store
 Content-Type: application/json
 Strict-Transport-Security: max-age=31536000; includeSubDomains
-Content-Length: 561
+Content-Length: 534
 ```
 ### Response body recorded for playback (200: application/json):
 
@@ -90,6 +93,7 @@ Connection: keep-alive
 Content-Length: 22
 Content-Type: application/json
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 X-Vault-Token: REDACTED-TOKEN
 ```
 ### Request body recorded for playback ():
@@ -103,7 +107,7 @@ X-Vault-Token: REDACTED-TOKEN
 Cache-Control: no-store
 Content-Type: application/json
 Strict-Transport-Security: max-age=31536000; includeSubDomains
-Content-Length: 279
+Content-Length: 243
 ```
 ### Response body recorded for playback (200: application/json):
 
@@ -119,6 +123,7 @@ Content-Length: 279
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 X-Vault-Token: REDACTED-TOKEN
 ```
 ### Request body recorded for playback ():
@@ -131,7 +136,7 @@ X-Vault-Token: REDACTED-TOKEN
 Cache-Control: no-store
 Content-Type: application/json
 Strict-Transport-Security: max-age=31536000; includeSubDomains
-Content-Length: 313
+Content-Length: 277
 ```
 ### Response body recorded for playback (200: application/json):
 
@@ -147,6 +152,7 @@ Content-Length: 313
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 ```
 ### Request body recorded for playback ():
 
@@ -174,6 +180,7 @@ Content-Length: 33
 ```
 Connection: keep-alive
 Host: {{request.host}}
+User-Agent: testcontainers-ae-tests (Aether std.http.client)
 X-Vault-Token: not-the-token
 ```
 ### Request body recorded for playback ():

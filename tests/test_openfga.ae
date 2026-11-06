@@ -18,8 +18,16 @@ import modules.openfga
 const IMAGE = "openfga/openfga:v1.18.0"
 
 // One HTTP request: (status, body, error). hdrs are "Name: value" lines.
+// The User-Agent this test's HTTP client sends, as an app's client library
+// would: Go's net/http adds `Go-http-client/1.1` by itself, Aether's
+// std.http.client adds none. Set here, in the test's own client, so the
+// recordings show a representative request; Servirtium records what the
+// client sends and adds nothing of its own.
+const USER_AGENT = "testcontainers-ae-tests (Aether std.http.client)"
+
 fn http_do(method: string, url: string, hdrs: string[], body: string) -> (int, string, string) {
     req = client.request(method, url)
+    client.set_header(req, "User-Agent", USER_AGENT)
     client.set_timeout(req, 30s)
     for h in hdrs {
         colon = string.index_of(h, ":")
