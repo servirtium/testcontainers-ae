@@ -1,0 +1,95 @@
+// Ported from testcontainers-go modules/meilisearch/meilisearch.go, modules/meilisearch/options.go
+//
+// modules.meilisearch: a Meilisearch container. The master key travels with
+// the container in a struct.
+//
+//     import modules.meilisearch
+//
+//     m, err = meilisearch.run("getmeili/meilisearch:v1.10.3") {
+//         master_key("my-master-key")
+//         dump_import("testdata/movies.dump")
+//     }
+//     defer tc.terminate(m.container)
+//     addr, _ = meilisearch.address(m)   // "http://localhost:32771"
+//
+// Go's WithDumpImport stores the path in an options struct and Run turns it
+// into a file copy and a command afterwards; here the setter does both at
+// once on the request, which is the same container.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    MeilisearchContainer, run, address, master_key_of, master_key, dump_import,
+    PORT, DEFAULT_MASTER_KEY, meilisearch_request_new, meilisearch_request_free
+)
+
+const PORT = "7700/tcp"
+const DEFAULT_MASTER_KEY = "just-a-master-key-for-test"
+const MASTER_KEY_ENV = "MEILI_MASTER_KEY"
+
+struct MeilisearchContainer {
+    container: *docker.Container
+    master_key: string
+}
+
+// Go's moduleOpts: the port, the default master key, and a wait for
+// GET /health = 200 with {"status":"available"} (120s, as Go).
+meilisearch_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.env(r, MASTER_KEY_ENV, DEFAULT_MASTER_KEY)
+    tc.wait_for(r, wait.for_http("/health") {
+        with_port(PORT)
+        with_startup_timeout(120s)
+        with_status(200)
+        with_response_matcher(|body: string| -> string.contains(body, "\"status\":\"available\"") == 1)
+    })
+    return r
+}
+
+meilisearch_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithMasterKey.
+master_key(_ctx: ptr, key: string) { tc.env(_ctx, MASTER_KEY_ENV, key) }
+
+fn base_name(p: string) -> string {
+    i = string.index_of(p, "/")
+    rest = p
+    while i >= 0 {
+        rest = string.substring(rest, i + 1, string.length(rest))
+        i = string.index_of(rest, "/")
+    }
+    return rest
+}
+
+// Go's WithDumpImport: copy the dump file to /dumps/<name> and start with
+// `meilisearch --import-dump /dumps/<name>`.
+dump_import(_ctx: ptr, dump_file_path: string) {
+    name = base_name(dump_file_path)
+    tc.file(_ctx, dump_file_path, "/dumps/${name}", 493)
+    tc.cmd(_ctx, ["meilisearch", "--import-dump", "/dumps/${name}"])
+}
+
+builder run(image: string) with meilisearch_request_new -> (*MeilisearchContainer, string) {
+    r = _builder
+    if r == null { r = meilisearch_request_new() }
+    key = tc.req_env(r, MASTER_KEY_ENV)
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run meilisearch: ${err}" }
+    m = heap.new(MeilisearchContainer)
+    m.container = c
+    m.master_key = key
+    if err != "" { return m, "run meilisearch: ${err}" }
+    return m, ""
+}
+
+// The master key (Go's MasterKey).
+master_key_of(m: *MeilisearchContainer) -> string { return m.master_key }
+
+// "http://host:port" (Go's Address; plain HTTP, as Go).
+address(m: *MeilisearchContainer) -> (string, string) {
+    return tc.endpoint(m.container, PORT, "http")
+}

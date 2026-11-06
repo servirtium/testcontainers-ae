@@ -1,0 +1,62 @@
+// Ported from testcontainers-go port_forwarding_test.go (TestExposeHostPorts, one case)
+//
+// A container reaches a service on the test's host: an Aether std.http
+// server in this process, on a port the kernel picks, on every interface
+// (0.0.0.0); an alpine container fetches it as
+// host.testcontainers.internal:<port>, and the server sees the request.
+//
+// Every interface, not 127.0.0.1: host-gateway is the host's loopback only
+// on a Podman machine or a Docker VM (Docker Desktop, OrbStack, Colima).
+// On Docker on Linux it is the bridge's address and on rootless Podman
+// (pasta) the host's own, neither of which reaches a loopback-only
+// listener, so 0.0.0.0 is the one bind that works on all of them
+// (DESIGN.md section 12). Go's tunnel dials localhost from the test
+// process, so a loopback listener is fine there; here the service must be
+// reachable on the gateway.
+
+import std.spec
+import std.string
+import std.http
+import std.sync
+import testcontainers as tc
+import testcontainers.testing
+
+var hits: ptr = null
+
+fn handle(req: ptr, res: ptr, ud: ptr) {
+    _ = sync.atomic_add(hits, 1)
+    http.response_set_status(res, 200)
+    http.response_set_body(res, "hello from the host")
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "host port access (HostAccessPorts)") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("reaches a server on the host as host.testcontainers.internal (TestExposeHostPorts)") callback {
+            hits = sync.atomic_new(0)
+            server = http.server_create(0)
+            http.server_get(server, "/hello", handle, null)
+            spec.assert_ok(http.server_bind(server, "0.0.0.0", 0), "bind a port on every interface")
+            spec.assert_ok(http.server_start_background(server), "start the host server")
+            port = http.http_server_port(server)
+            c, err = tc.run("alpine:3") {
+                host_access_port(port)
+                cmd(["sleep", "300"])
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "run")
+            if err != "" { return }
+            code, out, eerr = tc.exec(c, ["wget", "-qO-", "-T", "10", "http://${tc.HOST_INTERNAL}:${port}/hello"])
+            spec.assert_ok(eerr, "exec")
+            spec.assert_eq(code, 0, "wget exits 0: ${out}")
+            spec.assert_contains(out, "hello from the host", "the body the host served")
+            spec.assert_true(sync.atomic_load(hits) >= 1, "the host server saw the request")
+            http.http_server_stop(server)
+        }
+    }
+    return spec.run_summary(fw)
+}

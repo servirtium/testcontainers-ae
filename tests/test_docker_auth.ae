@@ -1,0 +1,116 @@
+// Ported from testcontainers-go docker_auth_test.go (credential helpers, one case each)
+//
+// Registry credentials from credential helpers: a fake
+// docker-credential-tcaetest on PATH and a temp DOCKER_CONFIG whose
+// config.json names it in credHelpers (for one registry) and credsStore
+// (for an auths entry with no credentials). Then, against the engine, a
+// registry with htpasswd: an image pushed to it with credentials is pulled
+// back through the helper, and the pull fails without it.
+
+import std.spec
+import std.string
+import std.fs
+import std.os
+import std.json
+import std.encoding
+import std.list
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.registry
+
+const HELPER = <<SH
+#!/bin/sh
+read host
+echo "$host" >> "$(dirname "$0")/asked"
+case "$host" in
+  myreg.example:5000) echo '{"ServerURL":"myreg.example:5000","Username":"alice","Secret":"s3cret"}' ;;
+  tok.example) echo '{"ServerURL":"tok.example","Username":"<token>","Secret":"idtok"}' ;;
+  localhost:*) echo "{\"ServerURL\":\"$host\",\"Username\":\"testuser\",\"Secret\":\"testpassword\"}" ;;
+  *) echo "credentials not found in native keychain"; exit 1 ;;
+esac
+SH
+
+// The X-Registry-Auth value decoded: its JSON text.
+fn decoded(auth: string) -> string {
+    b64 = string.replace_all(string.replace_all(auth, "-", "+"), "_", "/")
+    text, err = encoding.base64_decode(b64)
+    if err != "" { return "bad base64: ${err}" }
+    return text
+}
+
+fn write_config(dir: string, body: string) {
+    fs.write("${dir}/config.json", body)
+}
+
+main() {
+    fw = spec.init()
+    dir, derr = fs.make_temp_dir("", "tcae-auth-")
+    if derr != "" {
+        println("temp dir: ${derr}")
+        return 1
+    }
+    fs.write("${dir}/docker-credential-tcaetest", "${HELPER}\n")
+    argv = list.new()
+    list.add(argv, "755")
+    list.add(argv, "${dir}/docker-credential-tcaetest")
+    _, _, _, _ = os.run_full("chmod", argv, null, "")
+    list.free(argv)
+    oldpath = os.os_getenv("PATH")
+    os.setenv("PATH", "${dir}:${oldpath}")
+    os.setenv("DOCKER_CONFIG", dir)
+
+    spec.describe(fw, "registry credentials through credential helpers (docker_auth.go)") {
+        spec.it("asks credHelpers' helper for its registry, credsStore for an auths entry without credentials") callback {
+            write_config(dir, "{\"auths\":{\"tok.example\":{}},\"credHelpers\":{\"myreg.example:5000\":\"tcaetest\"},\"credsStore\":\"tcaetest\"}")
+            a1, e1 = docker.registry_auth_lookup("myreg.example:5000")
+            spec.assert_ok(e1, "credHelpers lookup")
+            t1 = decoded(a1)
+            spec.assert_contains(t1, "\"username\":\"alice\"", "the helper's user: ${t1}")
+            spec.assert_contains(t1, "\"password\":\"s3cret\"", "the helper's secret")
+            spec.assert_contains(t1, "\"serveraddress\":\"myreg.example:5000\"", "the server")
+            a2, e2 = docker.registry_auth_lookup("tok.example")
+            spec.assert_ok(e2, "credsStore lookup")
+            spec.assert_contains(decoded(a2), "\"identitytoken\":\"idtok\"", "a <token> user is an identity token")
+            a3, e3 = docker.registry_auth_lookup("other.example")
+            spec.assert_ok(e3, "no entry")
+            spec.assert_str_eq(a3, "", "no auths entry and no credHelpers entry: nothing, the helper is not asked")
+            asked, _ = fs.read("${dir}/asked")
+            spec.assert_str_eq(asked, "myreg.example:5000\ntok.example\n", "what the helper was asked, on stdin")
+        }
+    }
+
+    spec.describe(fw, "a private registry through a credential helper") {
+        spec.after_each() callback { testing.cleanup_all() }
+        spec.it("pulls an image pushed with htpasswd credentials through the helper") callback {
+            if testing.engine_ok() == 0 { return }
+            reg, err = registry.run("registry:2.8.3") {
+                htpasswd_file("modules/registry/testdata/auth/htpasswd")
+            }
+            if reg != null { testing.cleanup_container(reg.container) }
+            spec.assert_ok(err, "registry starts")
+            if err != "" { return }
+            cl, _ = docker.client()
+            spec.assert_ok(registry.pull_image(reg, "alpine:3"), "pull alpine:3")
+            ref = "${reg.registry_name}/tcae/alpine:helper"
+            spec.assert_ok(registry.tag_image(reg, "alpine:3", ref), "tag")
+            spec.assert_ok(registry.push_image(reg, ref, "testuser", "testpassword"), "push with credentials")
+            docker.remove_image(cl, ref, true)
+            write_config(dir, "{\"auths\":{}}")
+            perr0 = docker.pull_image(cl, ref, "")
+            spec.assert_true(perr0 != "", "without credentials the pull is refused")
+            write_config(dir, "{\"credHelpers\":{\"${reg.registry_name}\":\"tcaetest\"}}")
+            perr = docker.pull_image(cl, ref, "")
+            spec.assert_ok(perr, "the pull through the helper")
+            spec.assert_true(docker.image_exists(cl, ref), "the image is here")
+            docker.remove_image(cl, ref, true)
+        }
+    }
+    r = spec.run_summary(fw)
+    os.setenv("PATH", oldpath)
+    fs.delete("${dir}/docker-credential-tcaetest")
+    fs.delete("${dir}/config.json")
+    fs.delete("${dir}/asked")
+    fs.delete_dir(dir)
+    return r
+}

@@ -1,0 +1,144 @@
+// Ported from testcontainers-go modules/localstack/localstack.go (and types.go)
+//
+// modules.localstack: a LocalStack container (AWS services on port 4566).
+//
+//     import modules.localstack
+//
+//     c, err = localstack.run("localstack/localstack:3.4") {
+//         tc.env("SERVICES", "s3,sqs")
+//     }
+//     defer tc.terminate(c)
+//     ep, _ = localstack.endpoint(c)          // "http://localhost:32771"
+//
+// Like Go, run refuses a legacy image (< 0.11), mounts the engine's socket at
+// /var/run/docker.sock (for Lambda), and sets HOSTNAME_EXTERNAL (images before
+// 2.0) or LOCALSTACK_HOST (2.0 and later, and the named recent tags) to the
+// last network alias on the first network when the caller gave aliases, else
+// to the daemon's host, unless the caller set it. That runs after the
+// caller's block, as Go's configureDockerHost option does.
+//
+// Not ported: Go's deprecated RunContainer / StartContainer / WithNetwork /
+// OverrideContainerRequest wrappers (use run, with_network and network_alias),
+// and the AWS SDK v1/v2 clients of its tests and examples (the test here signs
+// nothing: LocalStack accepts any credentials, so it speaks the S3 REST API).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, endpoint, is_minimum_version, PORT, DEFAULT_IMAGE,
+    localstack_request_new, localstack_request_free
+)
+
+const PORT = "4566/tcp"
+const DEFAULT_IMAGE = "localstack/localstack:1.4.0"
+const HOSTNAME_EXTERNAL = "HOSTNAME_EXTERNAL"
+const LOCALSTACK_HOST = "LOCALSTACK_HOST"
+
+localstack_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_http("/_localstack/health") { with_port(PORT); with_startup_timeout(120s) })
+    return r
+}
+
+localstack_request_free(p: ptr) { tc.request_free(p) }
+
+fn is_recent_tag(v: string) -> bool {
+    return v == "community-archive" || v == "latest" || v == "s3" || v == "s3-latest" || v == "stable"
+}
+
+// Leading decimal digits of a version component as an int; -1 when none.
+fn lead_int(s: string) -> int {
+    n = string.length(s)
+    i = 0
+    v = 0
+    while i < n {
+        ch = string.char_at(s, i)
+        if ch < 48 || ch > 57 { break }
+        v = v * 10 + (ch - 48)
+        i = i + 1
+    }
+    if i == 0 { return -1 }
+    return v
+}
+
+// Go's isMinimumVersion(image, "vMAJOR.MINOR"): the tag is the text after the
+// last ':' of the image (digest dropped); the recent named tags always pass;
+// a trailing "-suffix" (an architecture) is dropped before the version check.
+is_minimum_version(image: string, min_major: int, min_minor: int) -> bool {
+    img = image
+    at = string.index_of(img, "@")
+    if at >= 0 { img = string.substring(img, 0, at) }
+    version = img
+    ci = string.index_of(img, ":")
+    while ci >= 0 {
+        version = string.substring(img, ci + 1, string.length(img))
+        nxt = string.index_of_from(img, ":", ci + 1)
+        if nxt < 0 { break }
+        ci = nxt
+    }
+    if is_recent_tag(version) { return true }
+    dash = -1
+    i = 0
+    while i < string.length(version) {
+        if string.char_at(version, i) == 45 { dash = i }
+        i = i + 1
+    }
+    if dash >= 0 { version = string.substring(version, 0, dash) }
+    if is_recent_tag(version) { return true }
+    if string.starts_with(version, "v") == 1 { version = string.substring(version, 1, string.length(version)) }
+    parts = string.split(version, ".")
+    count = string.string_array_size(parts)
+    major = -1
+    minor = 0
+    if count >= 1 { major = lead_int(string.string_array_get(parts, 0)) }
+    if count >= 2 {
+        minor = lead_int(string.string_array_get(parts, 1))
+        if minor < 0 { minor = 0 }
+    }
+    string.string_array_free(parts)
+    if major < 0 { return false }
+    if major != min_major { return major > min_major }
+    return minor >= min_minor
+}
+
+builder run(image: string) with localstack_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = localstack_request_new() }
+    if !is_minimum_version(image, 0, 11) {
+        tc.request_free(r)
+        return null, "version=${image}. Testcontainers for Aether does not support running LocalStack in legacy mode. Please use a version >= 0.11.0"
+    }
+    cl, cerr = docker.client()
+    if cerr != "" {
+        tc.request_free(r)
+        return null, "run localstack: ${cerr}"
+    }
+    // The engine's socket, for Lambda (Go: Binds = dockerHost:/var/run/docker.sock)
+    tc.bind(r, docker.engine_socket_for_mounts(cl), "/var/run/docker.sock")
+
+    // configureDockerHost, after the caller's options
+    env_var = HOSTNAME_EXTERNAL
+    if is_minimum_version(image, 2, 0) { env_var = LOCALSTACK_HOST }
+    if !tc.req_has_env(r, env_var) {
+        nets = tc.req_networks(r)
+        value = docker.daemon_host(cl)
+        if nets.len > 0 {
+            aliases = tc.req_network_aliases(r, nets[0])
+            if aliases.len > 0 { value = aliases[aliases.len - 1] }
+        }
+        tc.env(r, env_var, value)
+    }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run localstack: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" of the edge port 4566, what an AWS client takes as its
+// endpoint URL.
+endpoint(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "http")
+}

@@ -1,0 +1,235 @@
+// Ported from go-sql-driver/mysql v1.9.3 driver.go (registration under
+// "mysql", Open), with the database/sql/driver methods of connection.go
+// (Exec and Query falling back to a prepared statement when they have
+// arguments and interpolateParams is off: Go's driver.ErrSkip),
+// statement.go, transaction.go and result.go mapped onto sql's vtable.
+// Copyright 2012 The Go-MySQL-Driver Authors. All rights reserved.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at http://mozilla.org/MPL/2.0/.
+//
+// Modifications: ported to Aether by the testcontainers-ae contributors.
+//
+// sql.mysql: the MySQL (and MariaDB) driver for `sql`, over
+// sql.mysql.mysqlconn.
+//
+//     import sql
+//     import sql.mysql as mysqldrv      // alias it beside modules.mysql
+//
+//     mysqldrv.register()               // "mysql"
+//     db, err = sql.open("mysql", "app:secret@tcp(localhost:3306)/app")
+//     _, err = sql.exec(db, "INSERT INTO t (id, name) VALUES (?, ?)", [sql.int64(1), sql.text("x")])
+//
+// Registration is an explicit call (Aether has no import-time init): call
+// register() once before sql.open; again is harmless.
+//
+// Placeholders are MySQL's `?`. A statement without arguments runs as
+// COM_QUERY (text protocol); with arguments it is prepared, executed with
+// the binary protocol and closed, as database/sql does when Go's driver
+// returns driver.ErrSkip, unless the DSN says interpolateParams=true (the
+// arguments are then escaped into the SQL text, as Go does). Values come
+// back as text: the text protocol's own, and the binary protocol's
+// converted the way database/sql converts Go's values to a string
+// (sql.mysql.mysqlproto). Column types are Go's DatabaseTypeName ("INT",
+// "VARCHAR", "BLOB", "DATETIME", ...). LastInsertId and RowsAffected come
+// from the OK packet. A server error reads "Error 1146 (42S02): Table
+// 'app.nope' doesn't exist"; sql.sqlstate(err) gives "42S02" and
+// error_number(err) gives 1146.
+
+import std.string
+import sql
+import sql.mysql.mysqlproto
+import sql.mysql.mysqlconn
+
+exports(
+    register, driver, conn_of, error_number, register_tls_config,
+    register_server_pub_key, MyHandle
+)
+
+struct MyHandle {
+    c: *mysqlconn.MyConn
+}
+
+// The mysqlconn connection under a sql handle.
+conn_of(h: ptr) -> *mysqlconn.MyConn { return (h as *MyHandle).c }
+
+// The MySQL error number in an error from this driver, 0 if it has none
+// (Go: var me *mysql.MySQLError; errors.As(err, &me); me.Number).
+error_number(err: string) -> int { return mysqlproto.error_number(err) }
+
+// Go's mysql.RegisterTLSConfig, for tls=<name> in a DSN: verify the server
+// against the CA file ("" the system store) and the server name ("" the
+// DSN's host).
+register_tls_config(name: string, root_ca_file: string, server_name: string) -> string {
+    return mysqlconn.register_tls_config(name, root_ca_file, server_name)
+}
+
+// Go's mysql.RegisterServerPubKey, for serverPubKey=<name>: the server's
+// RSA public key as a PEM "PUBLIC KEY" block.
+register_server_pub_key(name: string, pem_text: string) -> string {
+    return mysqlconn.register_server_pub_key(name, pem_text)
+}
+
+fn fill_rows(rs: *mysqlconn.ResultSet, rows_p: ptr) {
+    rows = rows_p as *sql.Rows
+    sql.rows_set_columns(rows, rs.names, rs.types)
+    ncols = rs.names.len
+    i = 0
+    while i < rs.nrows {
+        string[] vals = []
+        bool[] nulls = []
+        j = 0
+        while j < ncols {
+            k = i * ncols + j
+            vals.push(rs.values[k])
+            nulls.push(rs.nulls[k])
+            j = j + 1
+        }
+        sql.rows_append(rows, vals, nulls)
+        i = i + 1
+    }
+}
+
+fn set_result(c: *mysqlconn.MyConn, res_p: ptr) {
+    res = res_p as *sql.Result
+    res.rows_affected = mysqlconn.last_affected_rows(c)
+    res.last_insert_id = mysqlconn.last_insert_id(c)
+    res.has_last_insert_id = true
+    res.tag = ""
+}
+
+// Can the arguments be interpolated (interpolateParams=true)? (query, "")
+// or ("", ERR_SKIP).
+fn interpolate(c: *mysqlconn.MyConn, q: string, args: sql.Value[]) -> (string, string) {
+    if !c.cfg.interpolate_params { return "", mysqlproto.ERR_SKIP }
+    nbe = (mysqlconn.status(c) & mysqlproto.STATUS_NO_BACKSLASH_ESCAPES) != 0
+    return mysqlproto.interpolate_params(q, args, nbe, c.max_allowed_packet)
+}
+
+// ---- the vtable ----
+
+fn d_connect(dsn: string, conn_p: ptr) -> string {
+    c, err = mysqlconn.connect(dsn)
+    if err != "" { return err }
+    h = heap.new(MyHandle)
+    h.c = c
+    conn = conn_p as *sql.Conn
+    conn.handle = h as ptr
+    return ""
+}
+
+fn d_close(h: ptr) -> string { return mysqlconn.close(conn_of(h)) }
+
+fn d_ping(h: ptr) -> string { return mysqlconn.ping(conn_of(h)) }
+
+// database/sql's fallback for ErrSkip: prepare, execute, close.
+fn exec_prepared(c: *mysqlconn.MyConn, q: string, args: sql.Value[], res_p: ptr) -> string {
+    st, perr = mysqlconn.prepare(c, q)
+    if perr != "" { return perr }
+    err = mysqlconn.stmt_exec(c, st, args)
+    if err == "" { set_result(c, res_p) }
+    _ = mysqlconn.stmt_close(c, st)
+    return err
+}
+
+fn d_exec(h: ptr, q: string, args: sql.Value[], res_p: ptr) -> string {
+    c = conn_of(h)
+    if args.len == 0 {
+        err = mysqlconn.exec(c, q)
+        if err != "" { return err }
+        set_result(c, res_p)
+        return ""
+    }
+    iq, ierr = interpolate(c, q, args)
+    if ierr == mysqlproto.ERR_SKIP { return exec_prepared(c, q, args, res_p) }
+    if ierr != "" { return ierr }
+    err = mysqlconn.exec(c, iq)
+    if err != "" { return err }
+    set_result(c, res_p)
+    return ""
+}
+
+fn d_query(h: ptr, q: string, args: sql.Value[], rows_p: ptr) -> string {
+    c = conn_of(h)
+    if args.len > 0 {
+        iq, ierr = interpolate(c, q, args)
+        if ierr == mysqlproto.ERR_SKIP {
+            st, perr = mysqlconn.prepare(c, q)
+            if perr != "" { return perr }
+            rs, err = mysqlconn.stmt_query(c, st, args)
+            _ = mysqlconn.stmt_close(c, st)
+            if err != "" { return err }
+            fill_rows(rs, rows_p)
+            return ""
+        }
+        if ierr != "" { return ierr }
+        rs2, err2 = mysqlconn.query(c, iq)
+        if err2 != "" { return err2 }
+        fill_rows(rs2, rows_p)
+        return ""
+    }
+    rs, err = mysqlconn.query(c, q)
+    if err != "" { return err }
+    fill_rows(rs, rows_p)
+    return ""
+}
+
+fn d_prepare(h: ptr, q: string, st_p: ptr) -> string {
+    ms, err = mysqlconn.prepare(conn_of(h), q)
+    if err != "" { return err }
+    st = st_p as *sql.Stmt
+    st.handle = ms as ptr
+    st.inputs = ms.param_count
+    return ""
+}
+
+fn d_stmt_exec(h: ptr, sh: ptr, args: sql.Value[], res_p: ptr) -> string {
+    c = conn_of(h)
+    err = mysqlconn.stmt_exec(c, sh as *mysqlconn.Stmt, args)
+    if err != "" { return err }
+    set_result(c, res_p)
+    return ""
+}
+
+fn d_stmt_query(h: ptr, sh: ptr, args: sql.Value[], rows_p: ptr) -> string {
+    rs, err = mysqlconn.stmt_query(conn_of(h), sh as *mysqlconn.Stmt, args)
+    if err != "" { return err }
+    fill_rows(rs, rows_p)
+    return ""
+}
+
+fn d_stmt_close(h: ptr, sh: ptr) -> string {
+    return mysqlconn.stmt_close(conn_of(h), sh as *mysqlconn.Stmt)
+}
+
+fn d_begin(h: ptr) -> string { return mysqlconn.begin(conn_of(h)) }
+fn d_commit(h: ptr) -> string { return mysqlconn.commit(conn_of(h)) }
+fn d_rollback(h: ptr) -> string { return mysqlconn.rollback(conn_of(h)) }
+
+// mysqlConn.IsValid: a closed connection is dropped by sql.
+fn d_is_bad(h: ptr) -> bool { return mysqlconn.is_closed(conn_of(h)) }
+
+// The driver's vtable.
+driver() -> *sql.Driver {
+    d = sql.new_driver("mysql")
+    d.connect = d_connect as fn(string, ptr) -> string
+    d.close = d_close as fn(ptr) -> string
+    d.ping = d_ping as fn(ptr) -> string
+    d.exec = d_exec as fn(ptr, string, sql.Value[], ptr) -> string
+    d.query = d_query as fn(ptr, string, sql.Value[], ptr) -> string
+    d.prepare = d_prepare as fn(ptr, string, ptr) -> string
+    d.stmt_exec = d_stmt_exec as fn(ptr, ptr, sql.Value[], ptr) -> string
+    d.stmt_query = d_stmt_query as fn(ptr, ptr, sql.Value[], ptr) -> string
+    d.stmt_close = d_stmt_close as fn(ptr, ptr) -> string
+    d.begin = d_begin as fn(ptr) -> string
+    d.commit = d_commit as fn(ptr) -> string
+    d.rollback = d_rollback as fn(ptr) -> string
+    d.is_bad = d_is_bad as fn(ptr) -> bool
+    return d
+}
+
+// Register the driver as "mysql" (driver.go's init). Idempotent.
+register() {
+    sql.register("mysql", driver())
+}

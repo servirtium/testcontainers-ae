@@ -1,0 +1,838 @@
+// sql: a database/sql-shaped interface for Aether, with drivers registered
+// by name. Designed to the shape of Go's database/sql (Open, Ping, Exec,
+// Query, QueryRow, Prepare, Begin/Commit/Rollback, Rows.Next/Scan/Close,
+// driver registration by name), written in Aether's idiom: no Go standard
+// library code is ported here.
+//
+//     import sql
+//     import sql.postgres as pgsql
+//
+//     pgsql.register()                        // Go's `import _ "github.com/jackc/pgx/v5/stdlib"`
+//     db, err = sql.open("postgres", "postgres://app:secret@localhost:5432/app?sslmode=disable")
+//     defer sql.close(db)
+//     _, err = sql.exec(db, "INSERT INTO t (id, name) VALUES ($1, $2)", [sql.int64(1), sql.text("it's")])
+//     rows, err = sql.query(db, "SELECT id, name FROM t WHERE id > $1", [sql.int64(0)])
+//     while sql.next(rows) {
+//         id, _ = sql.int_at(rows, 0)
+//         name, _ = sql.string_at(rows, 1)
+//     }
+//     sql.close_rows(rows)
+//
+// THE ONE-WAY RULE: nothing under sql/ imports testcontainers (or modules).
+// sql/ is meant to be teased out into a package of its own; tests/run.sh
+// checks the rule.
+//
+// DRIVERS. Aether has no interfaces and no import-time init, so a driver is a
+// *Driver: a struct of function pointers (a vtable) filled in by the driver
+// module and handed to register(name, driver) by an explicit call the program
+// makes once (sql.postgres's `register()` does it, idempotently). Every
+// driver function returns its error as a string ("" is success) and writes
+// what it produces into the sql-owned struct it is given (a *Conn, a *Result,
+// a *Rows, a *Stmt), so the vtable needs no tuples. The contract for each
+// field is next to it in struct Driver; sql.postgres is the model to copy.
+//
+// CONNECTIONS. One connection per *DB, made lazily on first use (as Go's
+// sql.Open makes none), and made again on the next call when a driver says
+// the one it had is broken (Go's driver.ErrBadConn). There is no pool yet:
+// a *DB is for one thread, and while a Tx is open on it, the DB's own
+// exec/query refuse (the one connection is the Tx's). The API is shaped so
+// a pool can replace the single connection without changing a caller.
+//
+// ROWS are read whole by the driver into the *Rows (no streaming cursor
+// yet); next/close behave as Go's do over them. Values are kept as the text
+// the database sent (bytea already decoded to its bytes by the driver) and
+// converted by the typed accessors, the way database/sql's convertAssign
+// converts a driver's []byte.
+//
+// ARGS are positional, `$1`-style placeholders in the SQL, with an array of
+// Value: sql.text(s), sql.int64(n), sql.float64(f), sql.boolean(b),
+// sql.blob(bytes), sql.null_value(). How a driver gets them to the database
+// (bound as protocol parameters, or rendered into the SQL) is its own
+// business.
+
+import std.string
+import std.bytes
+
+exports(
+    Value, Driver, Conn, DB, Tx, Stmt, Rows, Result,
+    KIND_NULL, KIND_TEXT, KIND_INT, KIND_FLOAT, KIND_BOOL, KIND_BYTES,
+    ERR_NO_ROWS, ERR_TX_DONE, ERR_CONN_DONE,
+    // values
+    text, int64, float64, boolean, blob, null_value, value_text, value_bytes,
+    // registry
+    new_driver, register, drivers, lookup,
+    // DB
+    open, close, ping, exec, query, query_row, prepare, begin, driver_name,
+    // Stmt
+    stmt_exec, stmt_query, stmt_query_row, stmt_close, num_input,
+    // Tx
+    tx_exec, tx_query, tx_query_row, tx_prepare, commit, rollback,
+    // Rows
+    next, close_rows, rows_err, column_names, column_types, num_columns,
+    string_at, int_at, float_at, bool_at, bytes_at, is_null_at, row_count,
+    // Result
+    rows_affected, last_insert_id,
+    // for drivers
+    new_rows, rows_set_columns, rows_append, sqlstate
+)
+
+// ---- values ----
+
+const KIND_NULL = 0
+const KIND_TEXT = 1
+const KIND_INT = 2
+const KIND_FLOAT = 3
+const KIND_BOOL = 4
+const KIND_BYTES = 5
+
+// One argument: Go's driver.Value (nil, int64, float64, bool, []byte,
+// string). Only the field of its kind is meaningful; `s` holds the bytes of
+// a KIND_BYTES value (Aether strings are counted, so binary-safe).
+struct Value {
+    kind: int
+    s: string
+    i: long
+    f: float
+    b: bool
+}
+
+text(s: string) -> Value { return Value { kind: KIND_TEXT, s: s, i: 0, f: 0.0, b: false } }
+int64(n: long) -> Value { return Value { kind: KIND_INT, s: "", i: n, f: 0.0, b: false } }
+float64(f: float) -> Value { return Value { kind: KIND_FLOAT, s: "", i: 0, f: f, b: false } }
+boolean(v: bool) -> Value { return Value { kind: KIND_BOOL, s: "", i: 0, f: 0.0, b: v } }
+blob(data: byte[]) -> Value {
+    return Value { kind: KIND_BYTES, s: bytes.string_from_slice(data), i: 0, f: 0.0, b: false }
+}
+null_value() -> Value { return Value { kind: KIND_NULL, s: "", i: 0, f: 0.0, b: false } }
+
+// The value as text, the way a driver that speaks text sends it: decimal
+// integers, floats that read back exactly (%.17g, "NaN", "Infinity"),
+// "true"/"false", the string itself; a blob's raw bytes and a null's ""
+// (check the kind first: their text form is the driver's to choose, as
+// Postgres' bytea hex is).
+value_text(v: Value) -> string {
+    if v.kind == KIND_TEXT { return v.s }
+    if v.kind == KIND_INT { return string.from_long(v.i) }
+    if v.kind == KIND_FLOAT { return string.from_double(v.f) }
+    if v.kind == KIND_BOOL {
+        if v.b { return "true" }
+        return "false"
+    }
+    if v.kind == KIND_BYTES { return v.s }
+    return ""
+}
+
+// A blob's bytes (a copy), or a text value's bytes.
+value_bytes(v: Value) -> byte[] {
+    byte[] out = []
+    for c in string.bytes(v.s) { out.push(c as byte) }
+    return out
+}
+
+// ---- errors ----
+
+const ERR_NO_ROWS = "sql: no rows in result set"
+const ERR_TX_DONE = "sql: transaction has already been committed or rolled back"
+const ERR_CONN_DONE = "sql: database is closed"
+
+// The SQLSTATE in a driver's error string: the five characters after
+// "SQLSTATE " (Go's pgconn.PgError.Code, its Error() is "... (SQLSTATE
+// 28P01)"), or the parenthesised five after a MySQL error number (Go's
+// MySQLError.Error() is "Error 1045 (28000): ..."); "" when there is none.
+sqlstate(err: string) -> string {
+    i = string.index_of(err, "SQLSTATE ")
+    if i >= 0 {
+        start = i + 9
+        if start + 5 > string.length(err) { return "" }
+        return string.substring(err, start, start + 5)
+    }
+    if string.starts_with(err, "Error ") == 1 {
+        p = string.index_of(err, " (")
+        if p > 6 && p + 9 <= string.length(err) && string.substring(err, p + 7, p + 9) == "):" {
+            return string.substring(err, p + 2, p + 7)
+        }
+    }
+    return ""
+}
+
+// ---- the driver contract ----
+
+// A connection a driver made: the driver sets `handle` in connect and gets it
+// back in every other call. `bad` is set by sql when the driver reports the
+// connection unusable.
+struct Conn {
+    handle: ptr
+    bad: bool
+}
+
+// What exec produced (Go's driver.Result). A driver that has no insert id
+// leaves has_last_insert_id false.
+struct Result {
+    rows_affected: long
+    last_insert_id: long
+    has_last_insert_id: bool
+    tag: string               // the database's own status text ("INSERT 0 1"), "" if none
+}
+
+// A driver: name, and the functions sql calls. Each returns "" or an error;
+// `h` is the Conn's handle. A driver fills every field (new_driver gives
+// stand-ins that return "not supported" for the optional ones).
+//
+//   connect(dsn, conn)                      parse dsn, connect, set conn.handle
+//   close(h)                                end the connection (Go's Conn.Close)
+//   ping(h)                                 a round trip (Go's Pinger)
+//   exec(h, query, args, result)            run, fill *Result (Go's ExecerContext)
+//   query(h, query, args, rows)             run, fill *Rows via rows_set_columns /
+//                                           rows_append (Go's QueryerContext)
+//   prepare(h, query, stmt)                 set stmt.handle, stmt.inputs (-1 unknown)
+//   stmt_exec(h, stmt_handle, args, result)
+//   stmt_query(h, stmt_handle, args, rows)
+//   stmt_close(h, stmt_handle)
+//   begin(h), commit(h), rollback(h)        Go's Conn.Begin, Tx.Commit, Tx.Rollback
+//   is_bad(h) -> bool                       the connection is broken: sql drops it
+//                                           and connects again on the next call
+//                                           (Go's driver.ErrBadConn / Validator)
+struct Driver {
+    name: string
+    connect: fn(string, ptr) -> string
+    close: fn(ptr) -> string
+    ping: fn(ptr) -> string
+    exec: fn(ptr, string, Value[], ptr) -> string
+    query: fn(ptr, string, Value[], ptr) -> string
+    prepare: fn(ptr, string, ptr) -> string
+    stmt_exec: fn(ptr, ptr, Value[], ptr) -> string
+    stmt_query: fn(ptr, ptr, Value[], ptr) -> string
+    stmt_close: fn(ptr, ptr) -> string
+    begin: fn(ptr) -> string
+    commit: fn(ptr) -> string
+    rollback: fn(ptr) -> string
+    is_bad: fn(ptr) -> bool
+}
+
+fn unsupported1(h: ptr) -> string { return "sql: not supported by this driver" }
+fn unsupported_prepare(h: ptr, q: string, st: ptr) -> string { return "sql: prepared statements are not supported by this driver" }
+fn unsupported_stmt(h: ptr, st: ptr, args: Value[], out: ptr) -> string { return "sql: prepared statements are not supported by this driver" }
+fn unsupported_stmt_close(h: ptr, st: ptr) -> string { return "" }
+fn never_bad(h: ptr) -> bool { return false }
+
+// A driver with the optional functions stubbed (prepare, transactions,
+// is_bad); the driver module sets connect, close, ping, exec and query, and
+// replaces any stub it implements.
+new_driver(name: string) -> *Driver {
+    d = heap.new(Driver)
+    d.name = name
+    d.prepare = unsupported_prepare as fn(ptr, string, ptr) -> string
+    d.stmt_exec = unsupported_stmt as fn(ptr, ptr, Value[], ptr) -> string
+    d.stmt_query = unsupported_stmt as fn(ptr, ptr, Value[], ptr) -> string
+    d.stmt_close = unsupported_stmt_close as fn(ptr, ptr) -> string
+    d.begin = unsupported1 as fn(ptr) -> string
+    d.commit = unsupported1 as fn(ptr) -> string
+    d.rollback = unsupported1 as fn(ptr) -> string
+    d.is_bad = never_bad as fn(ptr) -> bool
+    return d
+}
+
+// ---- the registry (Go's sql.Register / sql.Drivers) ----
+
+var registry: ptr[] = []
+
+// Make a driver available to open under `name`. Registering a name again
+// replaces the driver (Go panics; here a driver module's register() may be
+// called from several places, so it must be harmless).
+register(name: string, d: *Driver) {
+    i = 0
+    while i < registry.len {
+        e = registry[i] as *Driver
+        if e.name == name {
+            registry[i] = alias(name, d) as ptr
+            return
+        }
+        i = i + 1
+    }
+    registry.push(alias(name, d) as ptr)
+}
+
+// The same vtable under another name (one driver, several registered names:
+// "postgres", "pgx", "pgx/v5").
+fn alias(name: string, d: *Driver) -> *Driver {
+    if d.name == name { return d }
+    a = heap.new(Driver)
+    a.name = name
+    a.connect = d.connect
+    a.close = d.close
+    a.ping = d.ping
+    a.exec = d.exec
+    a.query = d.query
+    a.prepare = d.prepare
+    a.stmt_exec = d.stmt_exec
+    a.stmt_query = d.stmt_query
+    a.stmt_close = d.stmt_close
+    a.begin = d.begin
+    a.commit = d.commit
+    a.rollback = d.rollback
+    a.is_bad = d.is_bad
+    return a
+}
+
+// The registered names, in registration order.
+drivers() -> string[] {
+    string[] out = []
+    for p in registry {
+        d = p as *Driver
+        out.push(d.name)
+    }
+    return out
+}
+
+// The driver registered under name, or null.
+lookup(name: string) -> *Driver {
+    for p in registry {
+        d = p as *Driver
+        if d.name == name { return d }
+    }
+    return null
+}
+
+// ---- DB ----
+
+struct DB {
+    driver: *Driver
+    dsn: string
+    conn: *Conn         // null until first use, and after a bad connection
+    generation: int     // bumped on every new connection (prepared statements re-prepare)
+    closed: bool
+    in_tx: bool
+}
+
+struct Tx {
+    db: *DB
+    done: bool
+}
+
+struct Stmt {
+    db: *DB
+    tx: *Tx             // a Tx's statement, or null
+    query: string
+    handle: ptr         // the driver's
+    inputs: int         // the placeholders the driver counted, -1 unknown
+    generation: int     // the connection it was prepared on
+    closed: bool
+}
+
+struct Rows {
+    columns: string[]
+    types: string[]     // the database's type names (Go's DatabaseTypeName), "" unknown
+    cells: string[]     // row-major
+    nulls: bool[]
+    ncols: int
+    nrows: int
+    cursor: int         // -1 before the first next
+    closed: bool
+    err: string
+}
+
+// Open a database by driver name and data source name (Go's sql.Open). Like
+// Go's, it does not connect: the first ping/exec/query does. An unknown
+// driver is Go's error.
+open(driver_name: string, dsn: string) -> (*DB, string) {
+    d = lookup(driver_name)
+    if d == null {
+        return null, "sql: unknown driver \"${driver_name}\" (forgotten import?)"
+    }
+    db = heap.new(DB)
+    db.driver = d
+    db.dsn = dsn
+    db.conn = null
+    db.generation = 0
+    db.closed = false
+    db.in_tx = false
+    return db, ""
+}
+
+driver_name(db: *DB) -> string { return db.driver.name }
+
+// The connection, made if there is none.
+fn conn_of(db: *DB) -> (*Conn, string) {
+    if db.closed { return null, ERR_CONN_DONE }
+    if db.conn != null {
+        if !db.conn.bad { return db.conn, "" }
+        drop_conn(db)
+    }
+    c = heap.new(Conn)
+    c.handle = null
+    c.bad = false
+    d = db.driver
+    err = d.connect(db.dsn, c as ptr)
+    if err != "" { return null, err }
+    db.conn = c
+    db.generation = db.generation + 1
+    return c, ""
+}
+
+fn drop_conn(db: *DB) {
+    c = db.conn
+    if c == null { return }
+    db.conn = null
+    if c.handle != null {
+        d = db.driver
+        _ = d.close(c.handle)
+    }
+}
+
+// After a driver call failed: if the driver says the connection is broken,
+// drop it, so the next call connects again.
+fn after_error(db: *DB, c: *Conn) {
+    if c.handle == null { return }
+    d = db.driver
+    if d.is_bad(c.handle) {
+        c.bad = true
+        if !db.in_tx { drop_conn(db) }
+    }
+}
+
+// Close the database and its connection (Go's DB.Close). Null-safe.
+close(db: *DB) -> string {
+    if db == null { return "" }
+    if db.closed { return "" }
+    drop_conn(db)
+    db.closed = true
+    return ""
+}
+
+// Connect if need be and make a round trip (Go's DB.Ping).
+ping(db: *DB) -> string {
+    if db.in_tx { return "sql: the DB's one connection is in a transaction; use the Tx (there is no pool yet)" }
+    c, err = conn_of(db)
+    if err != "" { return err }
+    d = db.driver
+    perr = d.ping(c.handle)
+    if perr != "" { after_error(db, c) }
+    return perr
+}
+
+fn busy(db: *DB) -> string {
+    if db.in_tx { return "sql: the DB's one connection is in a transaction; use the Tx (there is no pool yet)" }
+    return ""
+}
+
+fn do_exec(db: *DB, q: string, args: Value[]) -> (Result, string) {
+    res = Result { rows_affected: 0, last_insert_id: 0, has_last_insert_id: false, tag: "" }
+    c, err = conn_of(db)
+    if err != "" { return res, err }
+    d = db.driver
+    out = heap.new(Result)
+    out.tag = ""
+    eerr = d.exec(c.handle, q, args, out as ptr)
+    if eerr != "" {
+        after_error(db, c)
+        return res, eerr
+    }
+    res.rows_affected = out.rows_affected
+    res.last_insert_id = out.last_insert_id
+    res.has_last_insert_id = out.has_last_insert_id
+    res.tag = out.tag
+    return res, ""
+}
+
+fn do_query(db: *DB, q: string, args: Value[]) -> (*Rows, string) {
+    c, err = conn_of(db)
+    if err != "" { return null, err }
+    rows = new_rows()
+    d = db.driver
+    qerr = d.query(c.handle, q, args, rows as ptr)
+    if qerr != "" {
+        after_error(db, c)
+        return null, qerr
+    }
+    return rows, ""
+}
+
+// Run a statement that returns no rows (Go's DB.Exec).
+exec(db: *DB, q: string, args: Value[]) -> (Result, string) {
+    b = busy(db)
+    if b != "" { return Result { rows_affected: 0, last_insert_id: 0, has_last_insert_id: false, tag: "" }, b }
+    return do_exec(db, q, args)
+}
+
+// Run a query (Go's DB.Query). Close the rows when done (close_rows).
+query(db: *DB, q: string, args: Value[]) -> (*Rows, string) {
+    b = busy(db)
+    if b != "" { return null, b }
+    return do_query(db, q, args)
+}
+
+fn first_row(rows: *Rows, err: string) -> (*Rows, string) {
+    if err != "" { return null, err }
+    if !next(rows) {
+        close_rows(rows)
+        return null, ERR_NO_ROWS
+    }
+    return rows, ""
+}
+
+// A query expected to return a row (Go's DB.QueryRow): the rows positioned
+// on the first one, or ERR_NO_ROWS. Read it with the *_at accessors.
+query_row(db: *DB, q: string, args: Value[]) -> (*Rows, string) {
+    rows, err = query(db, q, args)
+    return first_row(rows, err)
+}
+
+// ---- prepared statements ----
+
+fn do_prepare(db: *DB, tx: *Tx, q: string) -> (*Stmt, string) {
+    c, err = conn_of(db)
+    if err != "" { return null, err }
+    st = heap.new(Stmt)
+    st.db = db
+    st.tx = tx
+    st.query = q
+    st.handle = null
+    st.inputs = -1
+    st.closed = false
+    d = db.driver
+    perr = d.prepare(c.handle, q, st as ptr)
+    if perr != "" {
+        after_error(db, c)
+        return null, perr
+    }
+    st.generation = db.generation
+    return st, ""
+}
+
+// Prepare a statement on the DB's connection (Go's DB.Prepare). If the
+// connection is replaced later, the statement is prepared again on the new
+// one when it is next used, as Go's does on another pool connection.
+prepare(db: *DB, q: string) -> (*Stmt, string) {
+    b = busy(db)
+    if b != "" { return null, b }
+    return do_prepare(db, null, q)
+}
+
+// The placeholders in the statement, -1 if the driver does not know.
+num_input(st: *Stmt) -> int { return st.inputs }
+
+fn stmt_ready(st: *Stmt) -> (*Conn, string) {
+    if st.closed { return null, "sql: statement is closed" }
+    db = st.db
+    if st.tx != null {
+        if st.tx.done { return null, ERR_TX_DONE }
+    } else {
+        b = busy(db)
+        if b != "" { return null, b }
+    }
+    c, err = conn_of(db)
+    if err != "" { return null, err }
+    if st.generation != db.generation {
+        d = db.driver
+        perr = d.prepare(c.handle, st.query, st as ptr)
+        if perr != "" {
+            after_error(db, c)
+            return null, perr
+        }
+        st.generation = db.generation
+    }
+    return c, ""
+}
+
+stmt_exec(st: *Stmt, args: Value[]) -> (Result, string) {
+    res = Result { rows_affected: 0, last_insert_id: 0, has_last_insert_id: false, tag: "" }
+    c, err = stmt_ready(st)
+    if err != "" { return res, err }
+    db = st.db
+    d = db.driver
+    out = heap.new(Result)
+    out.tag = ""
+    eerr = d.stmt_exec(c.handle, st.handle, args, out as ptr)
+    if eerr != "" {
+        after_error(db, c)
+        return res, eerr
+    }
+    res.rows_affected = out.rows_affected
+    res.last_insert_id = out.last_insert_id
+    res.has_last_insert_id = out.has_last_insert_id
+    res.tag = out.tag
+    return res, ""
+}
+
+stmt_query(st: *Stmt, args: Value[]) -> (*Rows, string) {
+    c, err = stmt_ready(st)
+    if err != "" { return null, err }
+    db = st.db
+    d = db.driver
+    rows = new_rows()
+    qerr = d.stmt_query(c.handle, st.handle, args, rows as ptr)
+    if qerr != "" {
+        after_error(db, c)
+        return null, qerr
+    }
+    return rows, ""
+}
+
+stmt_query_row(st: *Stmt, args: Value[]) -> (*Rows, string) {
+    rows, err = stmt_query(st, args)
+    return first_row(rows, err)
+}
+
+// Release the statement (Go's Stmt.Close). Null-safe.
+stmt_close(st: *Stmt) -> string {
+    if st == null { return "" }
+    if st.closed { return "" }
+    st.closed = true
+    db = st.db
+    c = db.conn
+    if c == null || c.bad || st.generation != db.generation { return "" }
+    d = db.driver
+    return d.stmt_close(c.handle, st.handle)
+}
+
+// ---- transactions ----
+
+// Start a transaction on the DB's connection (Go's DB.Begin). Until commit
+// or rollback, the DB's own exec/query/prepare refuse: with one connection
+// there is nothing else to run them on.
+begin(db: *DB) -> (*Tx, string) {
+    b = busy(db)
+    if b != "" { return null, b }
+    c, err = conn_of(db)
+    if err != "" { return null, err }
+    d = db.driver
+    berr = d.begin(c.handle)
+    if berr != "" {
+        after_error(db, c)
+        return null, berr
+    }
+    db.in_tx = true
+    tx = heap.new(Tx)
+    tx.db = db
+    tx.done = false
+    return tx, ""
+}
+
+fn tx_conn(tx: *Tx) -> (*Conn, string) {
+    if tx.done { return null, ERR_TX_DONE }
+    db = tx.db
+    if db.closed { return null, ERR_CONN_DONE }
+    c = db.conn
+    if c == null || c.bad { return null, "sql: the transaction's connection was lost" }
+    return c, ""
+}
+
+fn end_tx(tx: *Tx) {
+    tx.done = true
+    db = tx.db
+    db.in_tx = false
+    if db.conn != null && db.conn.bad { drop_conn(db) }
+}
+
+tx_exec(tx: *Tx, q: string, args: Value[]) -> (Result, string) {
+    _, err = tx_conn(tx)
+    if err != "" { return Result { rows_affected: 0, last_insert_id: 0, has_last_insert_id: false, tag: "" }, err }
+    return do_exec(tx.db, q, args)
+}
+
+tx_query(tx: *Tx, q: string, args: Value[]) -> (*Rows, string) {
+    _, err = tx_conn(tx)
+    if err != "" { return null, err }
+    return do_query(tx.db, q, args)
+}
+
+tx_query_row(tx: *Tx, q: string, args: Value[]) -> (*Rows, string) {
+    rows, err = tx_query(tx, q, args)
+    return first_row(rows, err)
+}
+
+tx_prepare(tx: *Tx, q: string) -> (*Stmt, string) {
+    _, err = tx_conn(tx)
+    if err != "" { return null, err }
+    return do_prepare(tx.db, tx, q)
+}
+
+commit(tx: *Tx) -> string {
+    c, err = tx_conn(tx)
+    if err != "" { return err }
+    db = tx.db
+    d = db.driver
+    cerr = d.commit(c.handle)
+    if cerr != "" { after_error(db, c) }
+    end_tx(tx)
+    return cerr
+}
+
+rollback(tx: *Tx) -> string {
+    c, err = tx_conn(tx)
+    if err != "" { return err }
+    db = tx.db
+    d = db.driver
+    rerr = d.rollback(c.handle)
+    if rerr != "" { after_error(db, c) }
+    end_tx(tx)
+    return rerr
+}
+
+// ---- results ----
+
+rows_affected(r: Result) -> long { return r.rows_affected }
+
+// (id, "") or (0, error) when the driver has none (Postgres: use RETURNING).
+last_insert_id(r: Result) -> (long, string) {
+    if r.has_last_insert_id { return r.last_insert_id, "" }
+    return 0, "LastInsertId is not supported by this driver"
+}
+
+// ---- rows ----
+
+// An empty *Rows, for a driver to fill.
+new_rows() -> *Rows {
+    r = heap.new(Rows)
+    r.ncols = 0
+    r.nrows = 0
+    r.cursor = -1
+    r.closed = false
+    r.err = ""
+    return r
+}
+
+// For a driver: the column names and the database's type names (types may
+// be shorter, missing ones are "").
+rows_set_columns(r: *Rows, names: string[], types: string[]) {
+    string[] cs = []
+    string[] ts = []
+    i = 0
+    for n in names {
+        cs.push(n)
+        if i < types.len { ts.push(types[i]) } else { ts.push("") }
+        i = i + 1
+    }
+    r.ncols = cs.len
+    r.columns = cs
+    r.types = ts
+}
+
+// For a driver: one row, a value and a null flag per column.
+rows_append(r: *Rows, values: string[], nulls: bool[]) {
+    i = 0
+    while i < r.ncols {
+        if i < values.len { r.cells.push(values[i]) } else { r.cells.push("") }
+        if i < nulls.len { r.nulls.push(nulls[i]) } else { r.nulls.push(true) }
+        i = i + 1
+    }
+    r.nrows = r.nrows + 1
+}
+
+// Advance to the next row (Go's Rows.Next): false at the end, and the rows
+// are closed then, as Go's are.
+next(r: *Rows) -> bool {
+    if r == null { return false }
+    if r.closed { return false }
+    if r.cursor + 1 >= r.nrows {
+        r.cursor = r.nrows
+        r.closed = true
+        return false
+    }
+    r.cursor = r.cursor + 1
+    return true
+}
+
+// Release the rows (Go's Rows.Close). Null-safe; harmless twice.
+close_rows(r: *Rows) {
+    if r == null { return }
+    r.closed = true
+}
+
+// The error met while iterating (Go's Rows.Err); "" with buffered rows.
+rows_err(r: *Rows) -> string { return r.err }
+
+column_names(r: *Rows) -> string[] {
+    string[] out = []
+    for c in r.columns { out.push(c) }
+    return out
+}
+
+column_types(r: *Rows) -> string[] {
+    string[] out = []
+    for c in r.types { out.push(c) }
+    return out
+}
+
+num_columns(r: *Rows) -> int { return r.ncols }
+
+// How many rows the result had (buffered rows know).
+row_count(r: *Rows) -> int { return r.nrows }
+
+fn cell(r: *Rows, col: int) -> (int, string) {
+    if r == null { return -1, "sql: Rows are nil" }
+    if r.cursor < 0 { return -1, "sql: Scan called without calling Next" }
+    if r.cursor >= r.nrows { return -1, "sql: Rows are closed" }
+    if col < 0 || col >= r.ncols {
+        return -1, "sql: column index ${col} out of range [0, ${r.ncols})"
+    }
+    return r.cursor * r.ncols + col, ""
+}
+
+is_null_at(r: *Rows, col: int) -> bool {
+    k, err = cell(r, col)
+    if err != "" { return false }
+    return r.nulls[k]
+}
+
+fn null_err(col: int, what: string) -> string {
+    return "sql: Scan error on column index ${col}: converting NULL to ${what} is unsupported"
+}
+
+// The column's value as text (Go scanning into a string). NULL is an error,
+// as in Go (check is_null_at first).
+string_at(r: *Rows, col: int) -> (string, string) {
+    k, err = cell(r, col)
+    if err != "" { return "", err }
+    if r.nulls[k] { return "", null_err(col, "string") }
+    return r.cells[k], ""
+}
+
+// The column as an integer (Go's convertAssign into int64: strconv.ParseInt).
+int_at(r: *Rows, col: int) -> (long, string) {
+    k, err = cell(r, col)
+    if err != "" { return 0, err }
+    if r.nulls[k] { return 0, null_err(col, "int64") }
+    s = r.cells[k]
+    v, perr = string.to_long(s)
+    if perr != "" {
+        return 0, "sql: Scan error on column index ${col}: converting driver.Value type string (\"${s}\") to a int64: invalid syntax"
+    }
+    return v, ""
+}
+
+// The column as a float (Go's strconv.ParseFloat).
+float_at(r: *Rows, col: int) -> (float, string) {
+    k, err = cell(r, col)
+    if err != "" { return 0.0, err }
+    if r.nulls[k] { return 0.0, null_err(col, "float64") }
+    s = r.cells[k]
+    v, perr = string.to_double(s)
+    if perr != "" {
+        return 0.0, "sql: Scan error on column index ${col}: converting driver.Value type string (\"${s}\") to a float64: invalid syntax"
+    }
+    return v, ""
+}
+
+// The column as a bool (Go's strconv.ParseBool: 1 t T TRUE true True, 0 f F
+// FALSE false False; Postgres sends t and f).
+bool_at(r: *Rows, col: int) -> (bool, string) {
+    k, err = cell(r, col)
+    if err != "" { return false, err }
+    if r.nulls[k] { return false, null_err(col, "bool") }
+    s = r.cells[k]
+    if s == "1" || s == "t" || s == "T" || s == "TRUE" || s == "true" || s == "True" { return true, "" }
+    if s == "0" || s == "f" || s == "F" || s == "FALSE" || s == "false" || s == "False" { return false, "" }
+    return false, "sql: Scan error on column index ${col}: sql/driver: couldn't convert \"${s}\" into type bool"
+}
+
+// The column's bytes, a copy (Go scanning into []byte; a NULL is a nil
+// slice there, the empty slice here: check is_null_at).
+bytes_at(r: *Rows, col: int) -> (byte[], string) {
+    byte[] out = []
+    k, err = cell(r, col)
+    if err != "" { return out, err }
+    if r.nulls[k] { return out, "" }
+    for c in string.bytes(r.cells[k]) { out.push(c as byte) }
+    return out, ""
+}

@@ -1,0 +1,99 @@
+// Ported from testcontainers-go modules/gcloud/examples/bigquery/examples_test.go (ExampleRun)
+// and modules/gcloud/bigquery/options_test.go (WithDataYAML)
+//
+// Compile-checked only. The engine-free cases check the module's request
+// defaults, options and the data-yaml duplicate check for real. The case that
+// starts the emulator runs only with TCAE_LIVE_BIGQUERY=1 and an engine.
+
+import std.spec
+import std.string
+import std.os
+import std.http.client
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.gcloud.bigquery
+
+const IMAGE = "ghcr.io/goccy/bigquery-emulator:0.6.1"
+
+// 1 when TCAE_LIVE_BIGQUERY=1 and an engine answers. The variable is read first
+// so that nothing touches an engine unless asked to.
+fn live_on() -> int {
+    if os.getenv("TCAE_LIVE_BIGQUERY") != "1" { return 0 }
+    return testing.engine_ok()
+}
+
+// One HTTP request with an optional JSON body: (status, body, error).
+fn http_do(method: string, url: string, body: string) -> (int, string, string) {
+    req = client.request(method, url)
+    client.set_timeout(req, 30s)
+    client.set_header(req, "Authorization", "Bearer owner")
+    if string.length(body) > 0 { client.set_body(req, string.bytes(body), "application/json") }
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    st = client.response_status(r)
+    b = client.response_body(r)
+    client.response_free(r)
+    return st, b, ""
+}
+
+main() {
+    fw = spec.init()
+    live = live_on()
+
+    spec.describe(fw, "modules/gcloud/bigquery") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("has the module's defaults and options (engine-free)") callback {
+            r = bigquery.bigquery_request_new()
+            spec.assert_str_eq(tc.req_setting(r, "bigquery.project_id"), "test-project", "default project id")
+            exposed = tc.req_exposed(r)
+            spec.assert_eq(exposed.len, 2, "REST and gRPC ports")
+            spec.assert_str_eq(exposed[0], "9050/tcp", "REST port")
+            spec.assert_str_eq(exposed[1], "9060/tcp", "gRPC port")
+            bigquery.project_id(r, "bigquery-project")
+            spec.assert_str_eq(tc.req_setting(r, "bigquery.project_id"), "bigquery-project", "project_id replaces it")
+            bigquery.bigquery_request_free(r)
+        }
+
+        spec.it("adds the data yaml once (WithDataYAML, engine-free)") callback {
+            r = bigquery.bigquery_request_new()
+            bigquery.data_yaml_content(r, "projects: []")
+            spec.assert_true(tc.req_has_cmd_arg(r, "--data-from-yaml"), "--data-from-yaml is on the command")
+            spec.assert_true(tc.req_has_cmd_arg(r, bigquery.DATA_YAML_PATH), "with the container path")
+            spec.assert_false(tc.req_has_setting(r, "bigquery.error"), "no error yet")
+            bigquery.data_yaml_content(r, "projects: []")
+            spec.assert_str_eq(tc.req_setting(r, "bigquery.error"), "data yaml already exists", "a second one is refused")
+            bigquery.bigquery_request_free(r)
+        }
+
+        spec.it("run reports the duplicate data yaml before starting anything (engine-free)") callback {
+            g, err = bigquery.run(IMAGE) {
+                data_yaml_content("projects: []")
+                data_yaml_content("projects: []")
+            }
+            spec.assert_null(g as ptr, "no container")
+            spec.assert_str_eq(err, "apply option: data yaml already exists", "the error")
+        }
+
+        spec.it_when(live, "starts the emulator and runs a query (ExampleRun)", "set TCAE_LIVE_BIGQUERY=1 and have an engine") callback {
+            g, err = bigquery.run(IMAGE) {
+                project_id("bigquery-project")
+            }
+            if g != null { testing.cleanup_container(g.container) }
+            spec.assert_ok(err, "bigquery starts")
+            if err != "" { return }
+            spec.assert_str_eq(bigquery.project_id_of(g), "bigquery-project", "project id")
+            spec.assert_true(string.starts_with(bigquery.uri(g), "http://") == 1, "an http:// URI: ${bigquery.uri(g)}")
+            // the example sums a struct array with a SQL function through the
+            // BigQuery SDK; the same query goes to the REST API here
+            q = "{\"query\":\"SELECT SUM(x) AS total FROM UNNEST([10, 20]) AS x\",\"useLegacySql\":false}"
+            st, body, herr = http_do("POST", "${bigquery.uri(g)}/bigquery/v2/projects/bigquery-project/queries", q)
+            spec.assert_ok(herr, "query")
+            spec.assert_eq(st, 200, "query answered: ${body}")
+            spec.assert_contains(body, "30", "the sum")
+        }
+    }
+    return spec.run_summary(fw)
+}

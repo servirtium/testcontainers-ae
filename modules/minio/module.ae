@@ -1,0 +1,87 @@
+// Ported from testcontainers-go modules/minio/minio.go
+//
+// modules.minio: a MinIO S3-compatible object store. `run` returns a struct
+// holding the container and the root credentials, as Go's MinioContainer.
+//
+//     import modules.minio
+//
+//     m, err = minio.run("quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z") {
+//         username("thisismyuser")
+//         password("thisismypassword")
+//     }
+//     defer tc.terminate(m.container)
+//     ep, _ = minio.connection_string(m)       // "localhost:32771" (S3 API, no scheme)
+//
+// Like Go, the credentials the container runs with (the request's
+// MINIO_ROOT_USER / MINIO_ROOT_PASSWORD after the caller's block) are the
+// ones in the struct, and `run` refuses an empty user or password before
+// creating anything. Go reads them back with an Inspect of the container;
+// here they are read from the request, which is the same data a step sooner.
+//
+// DEFAULT_IMAGE is the tag Go uses, but MinIO no longer publishes community
+// images (quay.io and Docker Hub both refuse the pull as of 2026-11); the test
+// runs cgr.dev/chainguard/minio:latest, which takes the same `server /data` command.
+//
+// Not ported: Go's RunContainer (deprecated).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    MinioContainer, run, connection_string, username, password,
+    PORT, DEFAULT_IMAGE, DEFAULT_USER, DEFAULT_PASSWORD,
+    minio_request_new, minio_request_free
+)
+
+const PORT = "9000/tcp"
+const DEFAULT_IMAGE = "quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z"
+const DEFAULT_USER = "minioadmin"
+const DEFAULT_PASSWORD = "minioadmin"
+
+struct MinioContainer {
+    container: *docker.Container
+    username: string
+    password: string
+}
+
+minio_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_http("/minio/health/live") { with_port("9000") })
+    tc.env(r, "MINIO_ROOT_USER", DEFAULT_USER)
+    tc.env(r, "MINIO_ROOT_PASSWORD", DEFAULT_PASSWORD)
+    tc.cmd(r, ["server", "/data"])
+    return r
+}
+
+minio_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithUsername / WithPassword.
+username(_ctx: ptr, name: string) { tc.env(_ctx, "MINIO_ROOT_USER", name) }
+password(_ctx: ptr, pw: string) { tc.env(_ctx, "MINIO_ROOT_PASSWORD", pw) }
+
+builder run(image: string) with minio_request_new -> (*MinioContainer, string) {
+    r = _builder
+    if r == null { r = minio_request_new() }
+    user = tc.req_env(r, "MINIO_ROOT_USER")
+    pw = tc.req_env(r, "MINIO_ROOT_PASSWORD")
+    if string.length(user) == 0 || string.length(pw) == 0 {
+        tc.request_free(r)
+        return null, "run minio: username or password has not been set"
+    }
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run minio: ${err}" }
+    m = heap.new(MinioContainer)
+    m.container = c
+    m.username = user
+    m.password = pw
+    if err != "" { return m, "run minio: ${err}" }
+    return m, ""
+}
+
+// "host:port" of the S3 API (Go's ConnectionString: no scheme).
+connection_string(m: *MinioContainer) -> (string, string) {
+    return tc.endpoint(m.container, PORT, "")
+}

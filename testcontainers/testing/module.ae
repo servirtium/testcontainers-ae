@@ -1,0 +1,106 @@
+// Ported from testcontainers-go testing.go
+//
+// testcontainers.testing: std.spec helpers.
+//
+//     fw = spec.init()
+//     if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+//     spec.describe(fw, "redis") {
+//         spec.after_each() callback { testing.cleanup_all() }
+//         spec.it("starts") callback {
+//             c, err = redis.run("redis:7-alpine")
+//             testing.cleanup_container(c)
+//             spec.assert_ok(err, "redis starts")
+//         }
+//     }
+//
+// Go registers cleanups with t.Cleanup; std.spec has after_each, so
+// cleanup_container / cleanup_network queue the resource and cleanup_all
+// (from an after_each, or at the end of main) removes everything queued, last
+// first. The reaper removes whatever a crashed run leaves.
+
+import std.spec
+import std.string
+import testcontainers as tc
+import testcontainers.docker
+
+exports(
+    skip_if_no_engine, skip_if_docker_desktop, skip_if_not_podman,
+    cleanup_container, cleanup_network, cleanup_all, require_exec, engine_ok
+)
+
+var queued_containers: ptr[] = []
+var queued_networks: ptr[] = []
+
+// 1 when an engine answers.
+engine_ok() -> int {
+    if tc.engine_available() { return 1 }
+    return 0
+}
+
+// Go's SkipIfProviderIsNotHealthy: skip the whole file (returns 1, and the
+// caller returns spec.run_summary(fw)) when no engine answers.
+skip_if_no_engine(fw: ptr) -> int {
+    _, err = docker.client()
+    if err == "" { return 0 }
+    return spec.skip_all_if(fw, 1, "no container engine: ${err}")
+}
+
+// Go's SkipIfDockerDesktop.
+skip_if_docker_desktop(fw: ptr) -> int {
+    cl, err = docker.client()
+    if err != "" { return spec.skip_all_if(fw, 1, "no container engine: ${err}") }
+    st, body, aerr = docker.api(cl, "GET", "/info", "")
+    if aerr == "" && st == 200 && string.contains(body, "\"OperatingSystem\":\"Docker Desktop\"") == 1 {
+        return spec.skip_all_if(fw, 1, "Docker Desktop")
+    }
+    return 0
+}
+
+skip_if_not_podman(fw: ptr) -> int {
+    cl, err = docker.client()
+    if err != "" { return spec.skip_all_if(fw, 1, "no container engine: ${err}") }
+    if docker.is_podman(cl) { return 0 }
+    return spec.skip_all_if(fw, 1, "the engine is not Podman")
+}
+
+// Go's CleanupContainer: terminate c at cleanup_all. Null-safe.
+cleanup_container(c: *docker.Container) {
+    if c == null { return }
+    queued_containers.push(c as ptr)
+}
+
+// Go's CleanupNetwork.
+cleanup_network(n: *docker.Network) {
+    if n == null { return }
+    queued_networks.push(n as ptr)
+}
+
+// Terminate every queued container, then remove every queued network, last
+// queued first. Returns the errors joined, "" when all went.
+cleanup_all() -> string {
+    errs = ""
+    i = queued_containers.len - 1
+    while i >= 0 {
+        e = tc.terminate(queued_containers[i] as *docker.Container)
+        if e != "" { errs = "${errs}${e}; " }
+        i = i - 1
+    }
+    queued_containers = []
+    j = queued_networks.len - 1
+    while j >= 0 {
+        e = docker.remove_network(queued_networks[j] as *docker.Network)
+        if e != "" { errs = "${errs}${e}; " }
+        j = j - 1
+    }
+    queued_networks = []
+    return errs
+}
+
+// Go's RequireContainerExec: exec and fail the current case unless it exits 0.
+// Returns the output.
+require_exec(c: *docker.Container, cmd: string[]) -> string {
+    code, out, err = tc.exec(c, cmd)
+    spec.assert_ok(err, "exec")
+    spec.assert_eq(code, 0, "exec exit code (output: ${out})")
+    return out
+}

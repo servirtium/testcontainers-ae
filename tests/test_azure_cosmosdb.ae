@@ -1,0 +1,70 @@
+// Ported from testcontainers-go modules/azure/cosmosdb/examples_test.go (ExampleRun)
+// and modules/azure/cosmosdb/cosmosdb_test.go (the connection string)
+//
+// Compile-checked only. The engine-free cases check the module's request
+// defaults and the connection string format for real. The case that starts
+// the emulator runs only with TCAE_LIVE_COSMOSDB=1 and an engine.
+// Not ported: the azcosmos SDK calls of examples/cosmosdb (database,
+// container and item create/read).
+
+import std.spec
+import std.string
+import std.os
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.azure.cosmosdb
+
+const IMAGE = "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview"
+
+// 1 when TCAE_LIVE_COSMOSDB=1 and an engine answers. The variable is read
+// first so that nothing touches an engine unless asked to.
+fn live_on() -> int {
+    if os.getenv("TCAE_LIVE_COSMOSDB") != "1" { return 0 }
+    return testing.engine_ok()
+}
+
+main() {
+    fw = spec.init()
+    live = live_on()
+
+    spec.describe(fw, "modules/azure/cosmosdb") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("has the module's defaults (engine-free)") callback {
+            r = cosmosdb.cosmosdb_request_new()
+            exposed = tc.req_exposed(r)
+            spec.assert_eq(exposed.len, 1, "one port")
+            spec.assert_str_eq(exposed[0], "8081/tcp", "the emulator port")
+            cmd = tc.req_cmd(r)
+            spec.assert_eq(cmd.len, 2, "two command args")
+            spec.assert_str_eq(cmd[0], "--enable-explorer", "explorer flag")
+            spec.assert_str_eq(cmd[1], "false", "turned off")
+            cosmosdb.cosmosdb_request_free(r)
+        }
+
+        spec.it("formats the connection string (engine-free)") callback {
+            cs = cosmosdb.connection_string_for("http://localhost:8081")
+            spec.assert_str_eq(cs, "AccountEndpoint=http://localhost:8081;AccountKey=${cosmosdb.ACCOUNT_KEY};", "AccountEndpoint=<endpoint>;AccountKey=<key>;")
+            spec.assert_true(string.starts_with(cosmosdb.ACCOUNT_KEY, "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM") == 1, "the documented emulator key")
+        }
+
+        spec.it_when(live, "starts the emulator (ExampleRun)", "set TCAE_LIVE_COSMOSDB=1 and have an engine") callback {
+            c, err = cosmosdb.run(IMAGE)
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "cosmosdb starts")
+            if err != "" { return }
+            st, serr = tc.state_of(c)
+            spec.assert_ok(serr, "state")
+            spec.assert_true(st.running, "state.Running")
+            cs, cerr = cosmosdb.connection_string(c)
+            spec.assert_ok(cerr, "connection string")
+            spec.assert_true(string.starts_with(cs, "AccountEndpoint=http://") == 1, "an http endpoint: ${cs}")
+            spec.assert_true(string.ends_with(cs, ";AccountKey=${cosmosdb.ACCOUNT_KEY};") == 1, "with the account key")
+            hp, herr = cosmosdb.host_port(c)
+            spec.assert_ok(herr, "host:port")
+            spec.assert_contains(cs, hp, "the same address")
+        }
+    }
+    return spec.run_summary(fw)
+}

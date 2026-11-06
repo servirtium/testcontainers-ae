@@ -1,0 +1,204 @@
+// Ported from testcontainers-go modules/postgres/postgres_test.go
+//
+// A real PostgreSQL: the server must accept a TCP connection at the mapped
+// port and answer a protocol-3 StartupMessage with an authentication
+// request (the wire-level check), and SQL runs through psql in the
+// container for the rest, as the module's own Snapshot/Restore do.
+// TestContainerWithWaitForSQL waits with wait.for_sql through this
+// repository's `sql` package and its PostgreSQL driver (tests/test_sql_*.ae
+// test those themselves).
+
+import std.spec
+import std.string
+import std.tcp
+import std.bytes
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import testcontainers.wait
+import modules.postgres
+import sql.postgres as pgsql   // the driver behind wait.for_sql's "postgres"
+
+const IMAGE = "postgres:16-alpine"
+
+// TestContainerWithWaitForSQL's dbURL.
+fn db_url(host: string, port: int) -> string {
+    return "postgres://postgres:password@${host}:${port}/test?sslmode=disable"
+}
+
+fn be32(buf: byte[], at: int, v: int) {
+    buf[at] = ((v >> 24) & 255) as byte
+    buf[at + 1] = ((v >> 16) & 255) as byte
+    buf[at + 2] = ((v >> 8) & 255) as byte
+    buf[at + 3] = (v & 255) as byte
+}
+
+// A protocol 3.0 StartupMessage for user and database.
+fn startup_message(user: string, db: string) -> string {
+    params = "user\x01${user}\x01database\x01${db}\x01\x01"
+    n = 8 + string.length(params)
+    buf = make([]byte, n)
+    be32(buf, 0, n)
+    be32(buf, 4, 196608)
+    pb = string.bytes(params)
+    i = 0
+    while i < pb.len {
+        b = pb[i]
+        if b == 1 { b = 0 }        // the NUL separators
+        buf[8 + i] = b as byte
+        i = i + 1
+    }
+    return bytes.string_from_slice(buf)
+}
+
+// Connect to the mapped port, send a StartupMessage, read the first answer:
+// the message type ('R' authentication, 'E' error) and the auth code.
+// (The container, not the *postgres.PostgresContainer: with sql.postgres
+// imported under an alias, Aether no longer resolves `postgres.` in a type,
+// README "Known gaps".)
+fn handshake(c: *docker.Container, user: string, db: string) -> (string, int, string) {
+    h, _ = tc.host(c)
+    port, perr = tc.mapped_port(c, postgres.PORT)
+    if perr != "" { return "", 0, perr }
+    sock, cerr = tcp.connect(h, port)
+    if cerr != "" { return "", 0, "connect ${h}:${port}: ${cerr}" }
+    // write_all: tcp.write takes a C string and would stop at the first NUL
+    _, werr = tcp.write_all(sock, string.bytes(startup_message(user, db)))
+    if werr != "" { tcp.tcp_close(sock); return "", 0, werr }
+    answer = ""
+    tries = 0
+    while string.length(answer) < 9 && tries < 50 {
+        chunk, rerr = tcp.read(sock, 256)
+        if rerr != "" && rerr != "timeout" { break }
+        answer = string.concat(answer, chunk)
+        tries = tries + 1
+    }
+    tcp.tcp_close(sock)
+    if string.length(answer) < 9 { return "", 0, "a short answer (${string.length(answer)} bytes)" }
+    b = string.bytes(answer)
+    kind = string.string_substring_n(answer, string.length(answer), 0, 1)
+    code = (b[5] << 24) | (b[6] << 16) | (b[7] << 8) | b[8]
+    return kind, code, ""
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    pgsql.register()
+
+    spec.describe(fw, "modules/postgres") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("waits with wait.for_sql: default query, custom query, bad query (TestContainerWithWaitForSQL)") callback {
+            pg1, e1 = postgres.run(IMAGE) {
+                database("test")
+                username("postgres")
+                password("password")
+                tc.additional_wait(wait.for_sql(postgres.PORT, "postgres", |h: string, p: int| -> db_url(h, p)))
+            }
+            if pg1 != null { testing.cleanup_container(pg1.container) }
+            spec.assert_ok(e1, "default query: SELECT 1 succeeds")
+            pg2, e2 = postgres.run(IMAGE) {
+                database("test")
+                username("postgres")
+                password("password")
+                tc.additional_wait(wait.with_query(wait.with_startup_timeout(wait.for_sql(postgres.PORT, "postgres", |h: string, p: int| -> db_url(h, p)), 5s), "SELECT 10"))
+            }
+            if pg2 != null { testing.cleanup_container(pg2.container) }
+            spec.assert_ok(e2, "custom query")
+            pg3, e3 = postgres.run(IMAGE) {
+                database("test")
+                username("postgres")
+                password("password")
+                tc.additional_wait(wait.with_query(wait.with_startup_timeout(wait.for_sql(postgres.PORT, "postgres", |h: string, p: int| -> db_url(h, p)), 5s), "SELECT 'a' from b"))
+            }
+            if pg3 != null { testing.cleanup_container(pg3.container) }
+            spec.assert_err_contains(e3, "SQL database on port 5432 using driver \"postgres\" with query \"SELECT 'a' from b\"", "custom bad query: the wait fails")
+        }
+
+        spec.it("accepts connections and speaks the protocol (TestPostgres)") callback {
+            pg, err = postgres.run(IMAGE) {
+                database("app")
+                username("appuser")
+                password("s3cret")
+                basic_wait_strategies()
+            }
+            if pg != null { testing.cleanup_container(pg.container) }
+            spec.assert_ok(err, "postgres starts")
+            if err != "" { return }
+            url, uerr = postgres.connection_string(pg, "sslmode=disable&application_name=test")
+            spec.assert_ok(uerr, "connection string")
+            port, _ = tc.mapped_port(pg.container, postgres.PORT)
+            spec.assert_str_eq(url, "postgres://appuser:s3cret@localhost:${port}/app?sslmode=disable&application_name=test", "Go's format")
+            kind, code, herr = handshake(pg.container, pg.user, pg.db_name)
+            spec.assert_ok(herr, "a answer to the StartupMessage")
+            spec.assert_str_eq(kind, "R", "an authentication request")
+            spec.assert_eq(code, 10, "SASL (scram-sha-256), the TCP default of postgres 16")
+            out, perr = postgres.psql(pg, "app", "SELECT current_user || ' ' || current_database()")
+            spec.assert_ok(perr, "psql")
+            spec.assert_str_eq(string.trim(out), "appuser app", "the user and database asked for")
+        }
+
+        spec.it("runs an init script (TestWithInitScript)") callback {
+            pg, err = postgres.run(IMAGE) {
+                init_script("modules/postgres/testdata/init-user-db.sh")
+                basic_wait_strategies()
+            }
+            if pg != null { testing.cleanup_container(pg.container) }
+            spec.assert_ok(err, "postgres starts")
+            if err != "" { return }
+            out, perr = postgres.psql(pg, "postgres", "SELECT id, name FROM testdb")
+            spec.assert_ok(perr, "the table the script made")
+            spec.assert_str_eq(string.trim(out), "1|test", "its row")
+        }
+
+        spec.it("runs init scripts in the order given (TestWithOrderedInitScript)") callback {
+            pg, err = postgres.run(IMAGE) {
+                // aaaa-insert-user.sql sorts first but needs the table the
+                // other script makes, so only the given order works.
+                ordered_init_scripts(["modules/postgres/testdata/init-user-db.sh", "modules/postgres/testdata/aaaa-insert-user.sql"])
+                basic_wait_strategies()
+            }
+            if pg != null { testing.cleanup_container(pg.container) }
+            spec.assert_ok(err, "postgres starts")
+            if err != "" { return }
+            out, perr = postgres.psql(pg, "postgres", "SELECT count(*) FROM testdb")
+            spec.assert_ok(perr, "query")
+            spec.assert_str_eq(string.trim(out), "2", "both scripts ran, in order")
+        }
+
+        spec.it("uses a config file (TestWithConfigFile)") callback {
+            pg, err = postgres.run(IMAGE) {
+                config_file("modules/postgres/testdata/my-postgres.conf")
+                basic_wait_strategies()
+            }
+            if pg != null { testing.cleanup_container(pg.container) }
+            spec.assert_ok(err, "postgres starts")
+            if err != "" { return }
+            out, _ = postgres.psql(pg, "postgres", "SHOW config_file")
+            spec.assert_str_eq(string.trim(out), "/etc/postgresql.conf", "the file given")
+        }
+
+        spec.it("snapshots and restores a database (TestSnapshot)") callback {
+            pg, err = postgres.run(IMAGE) {
+                database("shop")
+                basic_wait_strategies()
+            }
+            if pg != null { testing.cleanup_container(pg.container) }
+            spec.assert_ok(err, "postgres starts")
+            if err != "" { return }
+            _, e1 = postgres.psql(pg, "shop", "CREATE TABLE users (id int); INSERT INTO users VALUES (1)")
+            spec.assert_ok(e1, "migrate")
+            spec.assert_ok(postgres.snapshot(pg, ""), "snapshot")
+            _, e2 = postgres.psql(pg, "shop", "INSERT INTO users VALUES (2), (3)")
+            spec.assert_ok(e2, "change the data")
+            n1, _ = postgres.psql(pg, "shop", "SELECT count(*) FROM users")
+            spec.assert_str_eq(string.trim(n1), "3", "three rows before the restore")
+            spec.assert_ok(postgres.restore(pg, ""), "restore")
+            n2, _ = postgres.psql(pg, "shop", "SELECT count(*) FROM users")
+            spec.assert_str_eq(string.trim(n2), "1", "back to the snapshot")
+        }
+    }
+    return spec.run_summary(fw)
+}

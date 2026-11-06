@@ -1,0 +1,69 @@
+// Ported from testcontainers-go modules/solr/solr.go
+//
+// modules.solr: an Apache Solr container, optionally with a collection.
+//
+//     import modules.solr
+//
+//     c, err = solr.run("solr:9") { collection("my-collection") }
+//     defer tc.terminate(c)
+//     addr, _ = solr.address(c)                           // "http://localhost:32771/solr"
+//     url, _ = solr.collection_url(c, "my-collection")    // ".../solr/my-collection"
+//
+// collection is Go's WithCollection: a post-ready hook that runs
+// `solr create -c <name>`; call it several times for several collections.
+//
+// Not ported: nothing of the Go module's API (its tests use a Go Solr client).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, collection, address, collection_url,
+    HTTP_PORT, DEFAULT_IMAGE, solr_request_new, solr_request_free
+)
+
+const HTTP_PORT = "8983/tcp"
+const DEFAULT_IMAGE = "solr:9"
+
+solr_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, HTTP_PORT)
+    tc.wait_for(r, wait.for_http("/solr/admin/info/system?wt=json") { with_port(HTTP_PORT); with_status(200) })
+    return r
+}
+
+solr_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithCollection.
+collection(_ctx: ptr, coll: string) {
+    tc.on_post_ready(_ctx, |c: *docker.Container| {
+        code, out, err = tc.exec(c, ["solr", "create", "-c", coll])
+        if err != "" { return "create solr collection \"${coll}\": ${err}" }
+        if code != 0 { return "create solr collection \"${coll}\": exit code ${code}: ${out}" }
+        return ""
+    })
+}
+
+builder run(image: string) with solr_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = solr_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run solr: ${err}" }
+    return c, ""
+}
+
+// "http://host:port/solr" (Go's Address).
+address(c: *docker.Container) -> (string, string) {
+    ep, err = tc.endpoint(c, HTTP_PORT, "http")
+    if err != "" { return "", "mapped port: ${err}" }
+    return "${ep}/solr", ""
+}
+
+// "http://host:port/solr/<collection>" (Go's CollectionURL).
+collection_url(c: *docker.Container, name: string) -> (string, string) {
+    addr, err = address(c)
+    if err != "" { return "", err }
+    return "${addr}/${name}", ""
+}

@@ -1,0 +1,1659 @@
+// Ported from jackc/pgx v5.9.2 pgconn/{config.go,defaults.go,pgconn.go,auth_scram.go,errors.go}
+// Copyright (c) 2013-2021 Jack Christensen. MIT License: see sql/LICENSE.
+//
+// sql.postgres.pgconn: one PostgreSQL connection, below database/sql (pgx's
+// pgconn): parsing a connection string the way libpq does, connecting (TCP
+// or a Unix socket, TLS by SSLRequest), authenticating (cleartext, MD5,
+// SCRAM-SHA-256), and running SQL with the simple query protocol (exec) and
+// the extended protocol (exec_params, prepare, exec_prepared), text format.
+//
+//     c, err = pgconn.connect("postgres://app:secret@localhost:5432/app?sslmode=disable")
+//     results, err = pgconn.exec(c, "CREATE TABLE t (n int); INSERT INTO t VALUES (1)")
+//     r, err = pgconn.exec_params(c, "SELECT n FROM t WHERE n > $1", ["0"], [false])
+//     pgconn.close(c)
+//
+// What is ported, and how it differs:
+//
+//  - ParseConfig: URL and keyword/value forms, the PG* environment
+//    variables, libpq's defaults (port 5432, the OS user, the default host
+//    probe: a Unix socket directory if one exists, else localhost), several
+//    hosts (host=a,b port=1,2) tried in order, sslmode
+//    disable/allow/prefer/require/verify-ca/verify-full with their
+//    fallbacks, sslrootcert (a file, or "system"), sslsni, sslnegotiation,
+//    connect_timeout, target_session_attrs, min/max_protocol_version,
+//    channel_binding, and every other key as a run-time parameter. Not
+//    ported: .pgpass, the service file, sslcert/sslkey/sslpassword (client
+//    certificates: a parse error says so), Kerberos, the DialFunc /
+//    LookupFunc / BuildFrontend hooks (the host is dialled by name, so one
+//    FallbackConfig is one dial, not one per resolved address).
+//  - TLS is std.cryptography.tls13_client over the same socket after the
+//    SSLRequest: TLS 1.3 only, and the server is always verified, chain and
+//    host name, against sslrootcert or the system store
+//    (tls13_client.connect_socket has no "skip verification" mode). So
+//    verify-full is exact; verify-ca also checks the host name; require
+//    without sslrootcert is refused at connect with that reason; prefer and
+//    allow try a verified TLS connection and fall back to plain text when it
+//    fails (pgx's prefer would get an unverified TLS connection instead).
+//    sslnegotiation=direct is not supported. No channel binding: SCRAM
+//    sends the "n,," header, as libpq does with channel_binding=disable
+//    (channel_binding=require is an error).
+//  - Authentication: cleartext, MD5, SCRAM-SHA-256 (no SASLprep: the
+//    password is used as given, which PostgreSQL itself allows). No GSS,
+//    SSPI or OAUTHBEARER.
+//  - Protocol 3.0 only (a request for 3.2 is a parse-time error), no
+//    pipelines, batches, COPY, LISTEN/NOTIFY delivery (notifications are
+//    read and dropped), cancel requests or context watching. Deadlines are
+//    connect_timeout over the whole connection attempt; after that the
+//    socket's own 30 s read timeout.
+//  - Results are read whole (every row of every statement) before a call
+//    returns, not streamed through a ResultReader.
+
+import std.string
+import std.bytes
+import std.os
+import std.fs
+import std.tcp
+import std.url
+import std.encoding
+import std.cryptography
+import std.cryptography.sha2
+import std.cryptography.hmac
+import std.cryptography.pbkdf2
+import std.cryptography.md5
+import std.cryptography.ct
+import std.cryptography.tls13_client
+import sql.postgres.pgproto3
+
+exports(
+    Config, FallbackConfig, TLSConfig, PgConn, PgError, Result, StatementDescription,
+    ScramClient,
+    DEFAULT_PORT, SCRAM_SHA_256, SCRAM_SHA_256_PLUS,
+    // config
+    parse_config, network_address, is_absolute_path, redact_pw, default_host,
+    runtime_param, fallback_count, fallback_at,
+    // errors
+    pg_error_from, pg_error_string, sqlstate_of,
+    // connections
+    connect, connect_config, close, is_closed, ping, exec, exec_params,
+    prepare, exec_prepared, deallocate, parameter_status, tx_status, pid,
+    last_pg_error, rows_affected, escape_string,
+    // auth (pure, for tests)
+    hex_md5, md5_password, new_scram_client, scram_client_first_message,
+    scram_recv_server_first_message, scram_client_final_message,
+    scram_recv_server_final_message, scram_compute_server_signature,
+    scram_set_nonce, scram_set_username
+)
+
+const DEFAULT_PORT = 5432
+const SCRAM_SHA_256 = "SCRAM-SHA-256"
+const SCRAM_SHA_256_PLUS = "SCRAM-SHA-256-PLUS"
+const CLIENT_NONCE_LEN = 18
+
+// ===================================================================
+// settings: the map[string]string ParseConfig merges
+// ===================================================================
+
+struct Settings {
+    keys: string[]
+    vals: string[]
+}
+
+fn settings_new() -> *Settings { return heap.new(Settings) }
+
+fn sget(s: *Settings, k: string) -> string {
+    i = 0
+    while i < s.keys.len {
+        if s.keys[i] == k { return s.vals[i] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn shas(s: *Settings, k: string) -> bool {
+    for x in s.keys {
+        if x == k { return true }
+    }
+    return false
+}
+
+fn sset(s: *Settings, k: string, v: string) {
+    i = 0
+    while i < s.keys.len {
+        if s.keys[i] == k {
+            s.vals[i] = v
+            return
+        }
+        i = i + 1
+    }
+    s.keys.push(k)
+    s.vals.push(v)
+}
+
+fn smerge(dst: *Settings, src: *Settings) {
+    i = 0
+    while i < src.keys.len {
+        sset(dst, src.keys[i], src.vals[i])
+        i = i + 1
+    }
+}
+
+// ===================================================================
+// Config (config.go)
+// ===================================================================
+
+// What Go keeps in a *tls.Config, as configTLS sets it. A null *TLSConfig
+// is Go's nil: no TLS.
+struct TLSConfig {
+    insecure_skip_verify: bool   // allow, prefer, require without a root cert
+    verify_ca: bool              // the chain only, not the host name (verify-ca)
+    server_name: string          // the name verified, and the SNI ("" none)
+    root_cert: string            // a PEM file to trust, "" the system store
+    direct: bool                 // sslnegotiation=direct
+    mode: string                 // the sslmode it was made for
+}
+
+struct FallbackConfig {
+    host: string
+    port: int
+    tls: *TLSConfig
+}
+
+struct Config {
+    host: string
+    port: int
+    database: string
+    user: string
+    password: string
+    tls: *TLSConfig
+    fallbacks: ptr[]                 // *FallbackConfig each
+    connect_timeout_ms: long         // 0: none
+    runtime_params: string[]         // name, value, name, value ... sorted by name
+    ssl_negotiation: string
+    target_session_attrs: string
+    min_protocol_version: string
+    max_protocol_version: string
+    channel_binding: string
+}
+
+fn getenv(name: string) -> string {
+    v = os.os_getenv(name)
+    if v == null { return "" }
+    return v
+}
+
+// isAbsolutePath: "/..." or a Windows drive path "C:\...".
+is_absolute_path(p: string) -> bool {
+    if string.starts_with(p, "/") == 1 { return true }
+    if string.length(p) < 3 { return false }
+    b = string.bytes(p)
+    return b[0] >= 65 && b[0] <= 90 && b[1] == 58 && b[2] == 92
+}
+
+// NetworkAddress: ("unix", "<dir>/.s.PGSQL.<port>") for a socket directory,
+// else ("tcp", "host:port", IPv6 bracketed).
+network_address(host: string, port: int) -> (string, string) {
+    if is_absolute_path(host) {
+        sep = "/"
+        if string.ends_with(host, "/") == 1 { sep = "" }
+        return "unix", "${host}${sep}.s.PGSQL.${port}"
+    }
+    if string.contains(host, ":") == 1 { return "tcp", "[${host}]:${port}" }
+    return "tcp", "${host}:${port}"
+}
+
+// defaultHost: the first of libpq's socket directories that exists, else
+// localhost.
+default_host() -> string {
+    for p in ["/var/run/postgresql", "/private/tmp", "/tmp"] {
+        if fs.exists(p) == 1 { return p }
+    }
+    return "localhost"
+}
+
+fn default_settings() -> *Settings {
+    s = settings_new()
+    sset(s, "host", default_host())
+    sset(s, "port", "5432")
+    u = getenv("USER")
+    if string.length(u) == 0 { u = getenv("LOGNAME") }
+    if string.length(u) > 0 { sset(s, "user", u) }
+    sset(s, "target_session_attrs", "any")
+    return s
+}
+
+fn env_settings() -> *Settings {
+    s = settings_new()
+    names = ["PGHOST", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSWORD", "PGPASSFILE",
+             "PGAPPNAME", "PGCONNECT_TIMEOUT", "PGSSLMODE", "PGSSLKEY", "PGSSLCERT",
+             "PGSSLSNI", "PGSSLROOTCERT", "PGSSLPASSWORD", "PGSSLNEGOTIATION",
+             "PGTARGETSESSIONATTRS", "PGSERVICE", "PGSERVICEFILE", "PGTZ", "PGOPTIONS",
+             "PGMINPROTOCOLVERSION", "PGMAXPROTOCOLVERSION"]
+    keys = ["host", "port", "database", "user", "password", "passfile",
+            "application_name", "connect_timeout", "sslmode", "sslkey", "sslcert",
+            "sslsni", "sslrootcert", "sslpassword", "sslnegotiation",
+            "target_session_attrs", "service", "servicefile", "timezone", "options",
+            "min_protocol_version", "max_protocol_version"]
+    i = 0
+    while i < names.len {
+        v = getenv(names[i])
+        if string.length(v) > 0 { sset(s, keys[i], v) }
+        i = i + 1
+    }
+    return s
+}
+
+// Percent-decoding as Go's url.Parse does for the user info and path ('+'
+// stays '+'); query values decode '+' as a space.
+fn unescape(s: string, plus_is_space: bool) -> (string, string) {
+    t = s
+    if !plus_is_space { t = string.replace_all(s, "+", "%2B") }
+    v, err = url.decode(t)
+    if err != "" { return "", "invalid URL escape in \"${s}\"" }
+    return v, ""
+}
+
+fn split(s: string, sep: string) -> string[] {
+    string[] out = []
+    rest = s
+    i = string.index_of(rest, sep)
+    while i >= 0 {
+        out.push(string.substring(rest, 0, i))
+        rest = string.substring(rest, i + string.length(sep), string.length(rest))
+        i = string.index_of(rest, sep)
+    }
+    out.push(rest)
+    return out
+}
+
+fn join(xs: string[], sep: string) -> string {
+    out = ""
+    i = 0
+    for x in xs {
+        if i > 0 { out = "${out}${sep}" }
+        out = "${out}${x}"
+        i = i + 1
+    }
+    return out
+}
+
+fn last_index_of(s: string, c: string) -> int {
+    i = string.index_of(s, c)
+    last = -1
+    while i >= 0 {
+        last = i
+        i = string.index_of_from(s, c, i + 1)
+    }
+    return last
+}
+
+fn is_ip_only(host: string) -> bool {
+    h = string.trim(host)
+    if string.starts_with(h, "[") == 1 && string.ends_with(h, "]") == 1 { return true }
+    return string.contains(h, ":") == 0
+}
+
+// net.SplitHostPort for "host:port", "[v6]:port", ":port".
+fn split_host_port(hp: string) -> (string, string, string) {
+    if string.starts_with(hp, "[") == 1 {
+        close_br = string.index_of(hp, "]")
+        if close_br < 0 { return "", "", "address ${hp}: missing ']' in address" }
+        h = string.substring(hp, 1, close_br)
+        rest = string.substring(hp, close_br + 1, string.length(hp))
+        if string.length(rest) == 0 { return h, "", "" }
+        if string.starts_with(rest, ":") == 0 { return "", "", "address ${hp}: missing port in address" }
+        return h, string.substring(rest, 1, string.length(rest)), ""
+    }
+    i = last_index_of(hp, ":")
+    if i < 0 { return "", "", "address ${hp}: missing port in address" }
+    h = string.substring(hp, 0, i)
+    if string.contains(h, ":") == 1 { return "", "", "address ${hp}: too many colons in address" }
+    return h, string.substring(hp, i + 1, string.length(hp)), ""
+}
+
+fn parse_url_settings(cs: string) -> (*Settings, string) {
+    s = settings_new()
+    rest = cs
+    scheme_end = string.index_of(rest, "://")
+    rest = string.substring(rest, scheme_end + 3, string.length(rest))
+    // the query
+    query = ""
+    qi = string.index_of(rest, "?")
+    if qi >= 0 {
+        query = string.substring(rest, qi + 1, string.length(rest))
+        rest = string.substring(rest, 0, qi)
+    }
+    fi = string.index_of(query, "#")
+    if fi >= 0 { query = string.substring(query, 0, fi) }
+    // authority and path
+    path = ""
+    pi = string.index_of(rest, "/")
+    authority = rest
+    if pi >= 0 {
+        authority = string.substring(rest, 0, pi)
+        path = string.substring(rest, pi, string.length(rest))
+    }
+    hostpart = authority
+    at = last_index_of(authority, "@")
+    if at >= 0 {
+        userinfo = string.substring(authority, 0, at)
+        hostpart = string.substring(authority, at + 1, string.length(authority))
+        ci = string.index_of(userinfo, ":")
+        uname = userinfo
+        if ci >= 0 {
+            uname = string.substring(userinfo, 0, ci)
+            pw, perr = unescape(string.substring(userinfo, ci + 1, string.length(userinfo)), false)
+            if perr != "" { return null, perr }
+            sset(s, "password", pw)
+        }
+        u, uerr = unescape(uname, false)
+        if uerr != "" { return null, uerr }
+        if string.length(u) > 0 { sset(s, "user", u) }
+    }
+    string[] hosts = []
+    string[] ports = []
+    for h in split(hostpart, ",") {
+        if string.length(h) == 0 { continue }
+        if is_ip_only(h) {
+            t = h
+            if string.starts_with(t, "[") == 1 { t = string.substring(t, 1, string.length(t) - 1) }
+            hosts.push(t)
+            continue
+        }
+        hh, pp, herr = split_host_port(h)
+        if herr != "" { return null, "failed to split host:port in '${h}', err: ${herr}" }
+        if string.length(hh) > 0 { hosts.push(hh) }
+        if string.length(pp) > 0 { ports.push(pp) }
+    }
+    if hosts.len > 0 { sset(s, "host", join(hosts, ",")) }
+    if ports.len > 0 { sset(s, "port", join(ports, ",")) }
+    db, derr = unescape(path, false)
+    if derr != "" { return null, derr }
+    while string.starts_with(db, "/") == 1 { db = string.substring(db, 1, string.length(db)) }
+    if string.length(db) > 0 { sset(s, "database", db) }
+    // url.Values: the first value of each key wins (Go's v[0])
+    string[] seen = []
+    if string.length(query) > 0 {
+        for kv in split(query, "&") {
+            if string.length(kv) == 0 { continue }
+            eq = string.index_of(kv, "=")
+            k = kv
+            v = ""
+            if eq >= 0 {
+                k = string.substring(kv, 0, eq)
+                v = string.substring(kv, eq + 1, string.length(kv))
+            }
+            kd, kerr = unescape(k, true)
+            if kerr != "" { return null, kerr }
+            vd, verr = unescape(v, true)
+            if verr != "" { return null, verr }
+            if kd == "dbname" { kd = "database" }
+            dup = false
+            for x in seen {
+                if x == kd { dup = true }
+            }
+            if dup { continue }
+            seen.push(kd)
+            sset(s, kd, vd)
+        }
+    }
+    return s, ""
+}
+
+fn is_space(c: int) -> bool { return c == 32 || c == 9 || c == 10 || c == 11 || c == 12 || c == 13 }
+
+fn trim_spaces(s: string) -> string {
+    b = string.bytes(s)
+    i = 0
+    j = b.len
+    while i < j && is_space(b[i] as int) { i = i + 1 }
+    while j > i && is_space(b[j - 1] as int) { j = j - 1 }
+    return string.substring(s, i, j)
+}
+
+fn unbackslash(s: string) -> string {
+    return string.replace_all(string.replace_all(s, "\\\\", "\\"), "\\'", "'")
+}
+
+fn parse_keyword_value_settings(src: string) -> (*Settings, string) {
+    s = settings_new()
+    rest = src
+    while string.length(rest) > 0 {
+        eq = string.index_of(rest, "=")
+        if eq < 0 { return null, "invalid keyword/value" }
+        key = trim_spaces(string.substring(rest, 0, eq))
+        rest = string.substring(rest, eq + 1, string.length(rest))
+        // TrimLeft the spaces
+        b0 = string.bytes(rest)
+        i0 = 0
+        while i0 < b0.len && is_space(b0[i0] as int) { i0 = i0 + 1 }
+        rest = string.substring(rest, i0, string.length(rest))
+        val = ""
+        b = string.bytes(rest)
+        if b.len == 0 {
+            val = ""
+        } else if b[0] != 39 {
+            end = 0
+            while end < b.len {
+                if is_space(b[end] as int) { break }
+                if b[end] == 92 {
+                    end = end + 1
+                    if end == b.len { return null, "invalid backslash" }
+                }
+                end = end + 1
+            }
+            val = unbackslash(string.substring(rest, 0, end))
+            if end == b.len { rest = "" } else { rest = string.substring(rest, end + 1, b.len) }
+        } else {
+            rest = string.substring(rest, 1, b.len)
+            bq = string.bytes(rest)
+            end = 0
+            while end < bq.len {
+                if bq[end] == 39 { break }
+                if bq[end] == 92 { end = end + 1 }
+                end = end + 1
+            }
+            if end >= bq.len { return null, "unterminated quoted string in connection info string" }
+            val = unbackslash(string.substring(rest, 0, end))
+            rest = string.substring(rest, end + 1, bq.len)
+        }
+        if key == "dbname" { key = "database" }
+        if string.length(key) == 0 { return null, "invalid keyword/value" }
+        if key == "user" && string.length(val) == 0 { continue }
+        sset(s, key, val)
+    }
+    return s, ""
+}
+
+fn parse_port(p: string) -> (int, string) {
+    v, err = string.to_long(p)
+    if err != "" { return 0, "strconv.ParseUint: parsing \"${p}\": invalid syntax" }
+    if v < 1 || v > 65535 { return 0, "outside range" }
+    return v as int, ""
+}
+
+fn is_ip_literal(h: string) -> bool {
+    if string.contains(h, ":") == 1 { return true }
+    parts = split(h, ".")
+    if parts.len != 4 { return false }
+    for p in parts {
+        if string.length(p) == 0 || string.length(p) > 3 { return false }
+        for c in string.bytes(p) {
+            if c < 48 || c > 57 { return false }
+        }
+    }
+    return true
+}
+
+// configTLS: the TLS configs to try for one host: [null] (disable),
+// [tls, null] (prefer), [null, tls] (allow), [tls] (require, verify-*).
+fn config_tls(s: *Settings, host: string) -> (ptr[], string) {
+    let out: ptr[] = []
+    sslmode = sget(s, "sslmode")
+    rootcert = sget(s, "sslrootcert")
+    sslsni = sget(s, "sslsni")
+    negotiation = sget(s, "sslnegotiation")
+    if string.length(sslmode) == 0 { sslmode = "prefer" }
+    if string.length(sslsni) == 0 { sslsni = "1" }
+    t = heap.new(TLSConfig)
+    t.server_name = ""
+    t.root_cert = ""
+    t.mode = sslmode
+    if negotiation == "direct" {
+        t.direct = true
+        if sslmode == "prefer" { sslmode = "require" }
+    }
+    t.mode = sslmode
+    if string.length(rootcert) > 0 {
+        if rootcert == "system" {
+            sslmode = "verify-full"
+            t.mode = sslmode
+        } else {
+            data, rerr = fs.read(rootcert)
+            if rerr != "" { return out, "unable to read CA file: ${rerr}" }
+            if string.contains(data, "-----BEGIN CERTIFICATE-----") == 0 { return out, "unable to add CA to cert pool" }
+            t.root_cert = rootcert
+        }
+    }
+    if sslmode == "disable" {
+        out.push(null)
+        return out, ""
+    }
+    if sslmode == "allow" || sslmode == "prefer" {
+        t.insecure_skip_verify = true
+    } else if sslmode == "require" {
+        if string.length(rootcert) > 0 {
+            t.insecure_skip_verify = true
+            t.verify_ca = true
+        } else {
+            t.insecure_skip_verify = true
+        }
+    } else if sslmode == "verify-ca" {
+        t.insecure_skip_verify = true
+        t.verify_ca = true
+    } else if sslmode == "verify-full" {
+        t.server_name = host
+    } else {
+        return out, "sslmode is invalid"
+    }
+    sslcert = sget(s, "sslcert")
+    sslkey = sget(s, "sslkey")
+    if (string.length(sslcert) > 0) != (string.length(sslkey) > 0) {
+        return out, "both \"sslcert\" and \"sslkey\" are required"
+    }
+    if string.length(sslcert) > 0 {
+        return out, "sslcert/sslkey (TLS client certificates) are not supported: std.cryptography.tls13_client.connect_socket presents none"
+    }
+    if sslsni == "1" && !is_ip_literal(host) { t.server_name = host }
+    if sslmode == "allow" {
+        out.push(null)
+        out.push(t as ptr)
+    } else if sslmode == "prefer" {
+        out.push(t as ptr)
+        out.push(null)
+    } else {
+        out.push(t as ptr)
+    }
+    return out, ""
+}
+
+fn parse_protocol_version(s: string) -> (int, string) {
+    if s == "" || s == "3.0" { return 30, "" }
+    if s == "3.2" || s == "latest" { return 32, "" }
+    return 0, "invalid protocol version: \"${s}\""
+}
+
+fn parse_err(cs: string, msg: string, err: string) -> string {
+    if string.length(err) == 0 { return "cannot parse `${redact_pw(cs)}`: ${msg}" }
+    return "cannot parse `${redact_pw(cs)}`: ${msg} (${err})"
+}
+
+fn not_runtime_param(k: string) -> bool {
+    for n in ["host", "port", "database", "user", "password", "passfile",
+              "connect_timeout", "sslmode", "sslkey", "sslcert", "sslrootcert",
+              "sslnegotiation", "sslpassword", "sslsni", "krbspn", "krbsrvname",
+              "target_session_attrs", "service", "servicefile", "min_protocol_version",
+              "max_protocol_version", "channel_binding"] {
+        if n == k { return true }
+    }
+    return false
+}
+
+// ParseConfig: a *Config from a URL ("postgres://" or "postgresql://") or a
+// keyword/value connection string, over the PG* environment and libpq's
+// defaults; "" reads only the environment. Errors are Go's "cannot parse
+// `<redacted>`: <why>".
+parse_config(cs: string) -> (*Config, string) {
+    settings = default_settings()
+    smerge(settings, env_settings())
+    if string.length(cs) > 0 {
+        if string.starts_with(cs, "postgres://") == 1 || string.starts_with(cs, "postgresql://") == 1 {
+            u, uerr = parse_url_settings(cs)
+            if uerr != "" { return null, parse_err(cs, "failed to parse as URL", uerr) }
+            smerge(settings, u)
+        } else {
+            kv, kerr = parse_keyword_value_settings(cs)
+            if kerr != "" { return null, parse_err(cs, "failed to parse as keyword/value", kerr) }
+            smerge(settings, kv)
+        }
+    }
+    if shas(settings, "service") { return null, parse_err(cs, "failed to read service", "service files are not supported") }
+
+    cfg = heap.new(Config)
+    cfg.database = sget(settings, "database")
+    cfg.user = sget(settings, "user")
+    cfg.password = sget(settings, "password")
+    cfg.connect_timeout_ms = 0
+    if shas(settings, "connect_timeout") {
+        t, terr = string.to_long(sget(settings, "connect_timeout"))
+        if terr != "" { return null, parse_err(cs, "invalid connect_timeout", "strconv.ParseInt: parsing \"${sget(settings, "connect_timeout")}\": invalid syntax") }
+        if t < 0 { return null, parse_err(cs, "invalid connect_timeout", "negative timeout") }
+        cfg.connect_timeout_ms = t * 1000
+    }
+    // run-time parameters, sorted by name (Go's map has no order)
+    string[] names = []
+    for k in settings.keys {
+        if !not_runtime_param(k) { names.push(k) }
+    }
+    i = 1
+    while i < names.len {
+        j = i
+        while j > 0 && string.compare(names[j - 1], names[j]) > 0 {
+            tmp = names[j - 1]
+            names[j - 1] = names[j]
+            names[j] = tmp
+            j = j - 1
+        }
+        i = i + 1
+    }
+    for k in names {
+        cfg.runtime_params.push(k)
+        cfg.runtime_params.push(sget(settings, k))
+    }
+
+    hosts = split(sget(settings, "host"), ",")
+    ports = split(sget(settings, "port"), ",")
+    let fbs: ptr[] = []
+    hi = 0
+    while hi < hosts.len {
+        h = hosts[hi]
+        ps = ports[0]
+        if hi < ports.len { ps = ports[hi] }
+        port, perr = parse_port(ps)
+        if perr != "" { return null, parse_err(cs, "invalid port", perr) }
+        let tlss: ptr[] = []
+        network, _ = network_address(h, port)
+        if network == "unix" {
+            tlss.push(null)
+        } else {
+            tc, terr = config_tls(settings, h)
+            if terr != "" { return null, parse_err(cs, "failed to configure TLS", terr) }
+            tlss = tc
+        }
+        for tp in tlss {
+            fb = heap.new(FallbackConfig)
+            fb.host = h
+            fb.port = port
+            fb.tls = tp as *TLSConfig
+            fbs.push(fb as ptr)
+        }
+        hi = hi + 1
+    }
+    first = fbs[0] as *FallbackConfig
+    cfg.host = first.host
+    cfg.port = first.port
+    cfg.tls = first.tls
+    fi = 1
+    while fi < fbs.len {
+        cfg.fallbacks.push(fbs[fi])
+        fi = fi + 1
+    }
+    cfg.ssl_negotiation = sget(settings, "sslnegotiation")
+
+    tsa = sget(settings, "target_session_attrs")
+    if tsa != "read-write" && tsa != "read-only" && tsa != "primary" && tsa != "standby" && tsa != "prefer-standby" && tsa != "any" {
+        return null, parse_err(cs, "unknown target_session_attrs value: ${tsa}", "")
+    }
+    cfg.target_session_attrs = tsa
+
+    minv, merr = parse_protocol_version(sget(settings, "min_protocol_version"))
+    if merr != "" { return null, parse_err(cs, "invalid min_protocol_version: \"${sget(settings, "min_protocol_version")}\"", merr) }
+    maxv, xerr = parse_protocol_version(sget(settings, "max_protocol_version"))
+    if xerr != "" { return null, parse_err(cs, "invalid max_protocol_version: \"${sget(settings, "max_protocol_version")}\"", xerr) }
+    cfg.min_protocol_version = sget(settings, "min_protocol_version")
+    cfg.max_protocol_version = sget(settings, "max_protocol_version")
+    if string.length(cfg.min_protocol_version) == 0 { cfg.min_protocol_version = "3.0" }
+    if string.length(cfg.max_protocol_version) == 0 {
+        if minv > 30 { cfg.max_protocol_version = "latest" } else { cfg.max_protocol_version = "3.0" }
+    }
+    if minv > maxv && string.length(sget(settings, "max_protocol_version")) > 0 {
+        return null, parse_err(cs, "min_protocol_version cannot be greater than max_protocol_version", "")
+    }
+    cb = sget(settings, "channel_binding")
+    if cb == "" || cb == "prefer" { cfg.channel_binding = "prefer" }
+    else if cb == "disable" { cfg.channel_binding = "disable" }
+    else if cb == "require" { cfg.channel_binding = "require" }
+    else { return null, parse_err(cs, "unknown channel_binding value: ${cb}", "") }
+    return cfg, ""
+}
+
+// A run-time parameter of the config ("" when absent).
+runtime_param(cfg: *Config, name: string) -> string {
+    i = 0
+    while i + 1 < cfg.runtime_params.len {
+        if cfg.runtime_params[i] == name { return cfg.runtime_params[i + 1] }
+        i = i + 2
+    }
+    return ""
+}
+
+fallback_count(cfg: *Config) -> int { return cfg.fallbacks.len }
+fallback_at(cfg: *Config, i: int) -> *FallbackConfig { return cfg.fallbacks[i] as *FallbackConfig }
+
+// redactPW: the password replaced by xxxxx, in either form.
+redact_pw(cs: string) -> string {
+    if string.starts_with(cs, "postgres://") == 1 || string.starts_with(cs, "postgresql://") == 1 {
+        se = string.index_of(cs, "://") + 3
+        rest = string.substring(cs, se, string.length(cs))
+        slash = string.index_of(rest, "/")
+        auth = rest
+        if slash >= 0 { auth = string.substring(rest, 0, slash) }
+        at = last_index_of(auth, "@")
+        if at < 0 { return cs }
+        userinfo = string.substring(auth, 0, at)
+        ci = string.index_of(userinfo, ":")
+        if ci < 0 { return cs }
+        return "${string.substring(cs, 0, se)}${string.substring(userinfo, 0, ci)}:xxxxx${string.substring(rest, at, string.length(rest))}"
+    }
+    out = ""
+    rest = cs
+    i = string.index_of(rest, "password=")
+    while i >= 0 {
+        out = "${out}${string.substring(rest, 0, i)}password=xxxxx"
+        rest = string.substring(rest, i + 9, string.length(rest))
+        if string.starts_with(rest, "'") == 1 {
+            q = string.index_of_from(rest, "'", 1)
+            if q < 0 { rest = "" } else { rest = string.substring(rest, q + 1, string.length(rest)) }
+        } else {
+            sp = string.index_of(rest, " ")
+            if sp < 0 { rest = "" } else { rest = string.substring(rest, sp, string.length(rest)) }
+        }
+        i = string.index_of(rest, "password=")
+    }
+    return "${out}${rest}"
+}
+
+// ===================================================================
+// errors (errors.go)
+// ===================================================================
+
+struct PgError {
+    severity: string
+    severity_unlocalized: string
+    code: string
+    text: string           // Go's Message
+    detail: string
+    hint: string
+    position: int
+    internal_position: int
+    internal_query: string
+    where_: string
+    schema_name: string
+    table_name: string
+    column_name: string
+    data_type_name: string
+    constraint_name: string
+    file: string
+    line: int
+    routine: string
+}
+
+// ErrorResponseToPgError.
+pg_error_from(m: *pgproto3.Msg) -> *PgError {
+    e = heap.new(PgError)
+    e.severity = m.severity
+    e.severity_unlocalized = m.severity_unlocalized
+    e.code = m.code
+    e.text = m.text
+    e.detail = m.detail
+    e.hint = m.hint
+    e.position = m.position
+    e.internal_position = m.internal_position
+    e.internal_query = m.internal_query
+    e.where_ = m.where_
+    e.schema_name = m.schema_name
+    e.table_name = m.table_name
+    e.column_name = m.column_name
+    e.data_type_name = m.data_type_name
+    e.constraint_name = m.constraint_name
+    e.file = m.file
+    e.line = m.line
+    e.routine = m.routine
+    return e
+}
+
+// PgError.Error(): "SEVERITY: message (SQLSTATE code)", then, beyond Go,
+// the detail and the position when the server sent them, so a string error
+// carries them: "... (SQLSTATE 42601) position=8".
+pg_error_string(e: *PgError) -> string {
+    s = "${e.severity}: ${e.text} (SQLSTATE ${e.code})"
+    if string.length(e.detail) > 0 { s = "${s} detail=${e.detail}" }
+    if e.position > 0 { s = "${s} position=${e.position}" }
+    return s
+}
+
+// The SQLSTATE in an error string from this package ("" if none).
+sqlstate_of(err: string) -> string {
+    i = string.index_of(err, "(SQLSTATE ")
+    if i < 0 { return "" }
+    return string.substring(err, i + 10, i + 15)
+}
+
+// ===================================================================
+// the connection (pgconn.go)
+// ===================================================================
+
+struct PgConn {
+    config: *Config
+    sock: ptr
+    tls: ptr                // a tls13_client connection, or null
+    dec: *pgproto3.Decoder
+    wbuf: *pgproto3.Buf
+    rbuf: byte[]
+    pid: long
+    secret_key: byte[]
+    tx_status: int
+    param_keys: string[]
+    param_vals: string[]
+    closed: bool
+    deadline_ms: long       // 0: none
+    last_error: *PgError    // the last ErrorResponse, or null
+    address: string
+    host: string
+}
+
+// A statement's result, read whole: the columns, the rows (row-major
+// values with null flags) and the command tag.
+struct Result {
+    fields: pgproto3.FieldDescription[]
+    values: string[]
+    nulls: bool[]
+    nrows: int
+    tag: string
+}
+
+struct StatementDescription {
+    name: string
+    sql: string
+    param_oids: long[]
+    fields: pgproto3.FieldDescription[]
+}
+
+fn new_result() -> *Result {
+    r = heap.new(Result)
+    r.nrows = 0
+    r.tag = ""
+    return r
+}
+
+// CommandTag.RowsAffected: the number at the end of the tag ("INSERT 0 3": 3).
+rows_affected(tag: string) -> long {
+    b = string.bytes(tag)
+    let n: long = 0
+    let mult: long = 1
+    i = b.len - 1
+    while i >= 0 {
+        c = b[i] as int
+        if c >= 48 && c <= 57 {
+            n = n + ((c - 48) as long) * mult
+            mult = mult * 10
+        } else {
+            break
+        }
+        i = i - 1
+    }
+    return n
+}
+
+fn now_ms() -> long { return os.now_monotonic_ms() }
+
+fn mark_closed(c: *PgConn) {
+    if c.closed { return }
+    c.closed = true
+    if c.tls != null {
+        tls13_client.close_conn(c.tls)
+        c.tls = null
+        c.sock = null
+    } else if c.sock != null {
+        tcp.tcp_close(c.sock)
+        c.sock = null
+    }
+}
+
+// Write what is buffered (pgx's flush).
+fn flush_out(c: *PgConn) -> string {
+    if c.closed { return "conn closed" }
+    data = pgproto3.buf_bytes(c.wbuf)
+    if data.len == 0 { return "" }
+    err = ""
+    if c.tls != null {
+        err = tls13_client.conn_send(c.tls, data)
+    } else {
+        _, werr = tcp.write_all(c.sock, data)
+        err = werr
+    }
+    pgproto3.buf_reset(c.wbuf)
+    if err != "" {
+        mark_closed(c)
+        return "write failed: ${err}"
+    }
+    return ""
+}
+
+// One read from the connection into the decoder.
+fn fill(c: *PgConn) -> string {
+    if c.closed { return "conn closed" }
+    if c.tls != null {
+        p, n, err = tls13_client.conn_recv(c.tls)
+        if err != "" {
+            mark_closed(c)
+            return "read failed: ${err}"
+        }
+        if p == null || n <= 0 {
+            mark_closed(c)
+            return "unexpected EOF"
+        }
+        pgproto3.feed(c.dec, bytes.view(p)[0..n])
+        bytes.free(p)
+        return ""
+    }
+    if c.deadline_ms > 0 {
+        left = c.deadline_ms - now_ms()
+        if left <= 0 {
+            mark_closed(c)
+            return "timeout: context deadline exceeded"
+        }
+        ready, perr = tcp.poll(c.sock, left as int)
+        if perr != "" {
+            mark_closed(c)
+            return "read failed: ${perr}"
+        }
+        if !ready {
+            mark_closed(c)
+            return "timeout: context deadline exceeded"
+        }
+    }
+    n, rerr = tcp.read_into(c.sock, c.rbuf)
+    if rerr != "" {
+        mark_closed(c)
+        if rerr == "timeout" { return "timeout: i/o timeout" }
+        return "unexpected EOF"
+    }
+    pgproto3.feed(c.dec, c.rbuf[0..n])
+    return ""
+}
+
+// receiveMessage: the next message, with ParameterStatus kept, notices and
+// notifications dropped, and a FATAL error closing the connection (Go's
+// default OnPgError).
+fn recv(c: *PgConn) -> (*pgproto3.Msg, string) {
+    while true {
+        m, err = pgproto3.next_message(c.dec)
+        if err != "" {
+            mark_closed(c)
+            return null, err
+        }
+        if m == null {
+            ferr = fill(c)
+            if ferr != "" { return null, ferr }
+            continue
+        }
+        k = m.kind
+        if k == 83 {                       // S ParameterStatus
+            set_param(c, m.name, m.value)
+            continue
+        }
+        if k == 78 || k == 65 { continue } // N notice, A notification
+        if k == 69 {                       // E
+            e = pg_error_from(m)
+            c.last_error = e
+            if string.to_upper(e.severity) == "FATAL" || string.to_upper(e.severity_unlocalized) == "FATAL" {
+                mark_closed(c)
+            }
+        }
+        return m, ""
+    }
+}
+
+fn set_param(c: *PgConn, k: string, v: string) {
+    i = 0
+    while i < c.param_keys.len {
+        if c.param_keys[i] == k {
+            c.param_vals[i] = v
+            return
+        }
+        i = i + 1
+    }
+    c.param_keys.push(k)
+    c.param_vals.push(v)
+}
+
+// The value of a server ParameterStatus (server_version, TimeZone, ...).
+parameter_status(c: *PgConn, k: string) -> string {
+    i = 0
+    while i < c.param_keys.len {
+        if c.param_keys[i] == k { return c.param_vals[i] }
+        i = i + 1
+    }
+    return ""
+}
+
+// 'I' idle, 'T' in a transaction, 'E' in a failed transaction.
+tx_status(c: *PgConn) -> int { return c.tx_status }
+pid(c: *PgConn) -> long { return c.pid }
+last_pg_error(c: *PgConn) -> *PgError { return c.last_error }
+is_closed(c: *PgConn) -> bool { return c == null || c.closed }
+
+// hexMD5.
+hex_md5(s: string) -> string { return md5.md5_hex(string.bytes(s)) }
+
+// The MD5 password message: "md5" + md5(md5(password + user) + salt).
+md5_password(user: string, password: string, salt: byte[]) -> string {
+    inner = hex_md5("${password}${user}")
+    byte[] buf = []
+    for b in string.bytes(inner) { buf.push(b as byte) }
+    for b in salt { buf.push(b) }
+    return "md5${md5.md5_hex(buf)}"
+}
+
+fn per_dial(c: *PgConn, msg: string, err: string) -> string {
+    return "${c.address} (${c.host}): ${msg}: ${err}"
+}
+
+// startTLS: the SSLRequest, the server's one-byte answer, then the TLS 1.3
+// handshake over the same socket.
+fn start_tls(c: *PgConn, t: *TLSConfig) -> string {
+    if t.direct { return "sslnegotiation=direct is not supported" }
+    if t.mode == "require" && string.length(t.root_cert) == 0 {
+        return "sslmode=require without sslrootcert asks for TLS without certificate verification, which std.cryptography.tls13_client.connect_socket cannot do (it always verifies); give sslrootcert=<CA file> or sslmode=verify-full"
+    }
+    pgproto3.ssl_request(c.wbuf)
+    ferr = flush_out(c)
+    if ferr != "" { return ferr }
+    one = make([]byte, 1)
+    got = 0
+    while got == 0 {
+        if c.deadline_ms > 0 {
+            left = c.deadline_ms - now_ms()
+            if left <= 0 { return "timeout: context deadline exceeded" }
+            ready, _ = tcp.poll(c.sock, left as int)
+            if !ready { return "timeout: context deadline exceeded" }
+        }
+        n, rerr = tcp.read_into(c.sock, one)
+        if rerr != "" { return "unexpected EOF" }
+        got = n
+    }
+    if one[0] != 83 { return "server refused TLS connection" }
+    name = t.server_name
+    if string.length(name) == 0 { name = c.host }
+    conn, err = tls13_client.connect_socket(c.sock, name, t.root_cert)
+    if err != "" {
+        c.sock = null
+        c.closed = true
+        return err
+    }
+    c.tls = conn
+    return ""
+}
+
+fn dial(c: *PgConn, host: string, port: int) -> string {
+    network, address = network_address(host, port)
+    c.address = address
+    if network == "unix" {
+        s, err = tcp.connect_unix(address)
+        if err != "" { return err }
+        c.sock = s
+        return ""
+    }
+    s, err = tcp.connect(host, port)
+    if err != "" { return "dial tcp ${address}: ${err}" }
+    c.sock = s
+    return ""
+}
+
+fn new_conn(cfg: *Config) -> *PgConn {
+    c = heap.new(PgConn)
+    c.config = cfg
+    c.sock = null
+    c.tls = null
+    c.dec = pgproto3.new_decoder()
+    c.wbuf = pgproto3.new_buf()
+    c.rbuf = make([]byte, 16384)
+    c.closed = false
+    c.tx_status = 0
+    c.deadline_ms = 0
+    c.last_error = null
+    c.address = ""
+    c.host = ""
+    return c
+}
+
+// connectOne: one attempt at one host with one TLS choice. (conn, "") or
+// (null, the perDialConnectError text), and whether the error came from
+// the server (a PgError) with its code.
+fn connect_one(cfg: *Config, host: string, port: int, t: *TLSConfig, deadline: long) -> (*PgConn, string, string) {
+    c = new_conn(cfg)
+    c.host = host
+    c.deadline_ms = deadline
+    if parse_protocol_version_only(cfg.max_protocol_version) > 30 {
+        c.address = network_address_text(host, port)
+        return null, per_dial(c, "invalid max_protocol_version", "protocol 3.2 is not supported"), ""
+    }
+    derr = dial(c, host, port)
+    if derr != "" { return null, per_dial(c, "dial error", derr), "" }
+    if t != null {
+        terr = start_tls(c, t)
+        if terr != "" {
+            mark_closed(c)
+            return null, per_dial(c, "tls error", terr), ""
+        }
+    }
+    // StartupMessage: the run-time parameters, user, database
+    string[] params = []
+    for p in cfg.runtime_params { params.push(p) }
+    params.push("user")
+    params.push(cfg.user)
+    if string.length(cfg.database) > 0 {
+        params.push("database")
+        params.push(cfg.database)
+    }
+    pgproto3.startup_message(c.wbuf, params)
+    ferr = flush_out(c)
+    if ferr != "" { return null, per_dial(c, "failed to write startup message", ferr), "" }
+
+    while true {
+        m, rerr = recv(c)
+        if rerr != "" {
+            mark_closed(c)
+            return null, per_dial(c, "failed to receive message", rerr), ""
+        }
+        k = m.kind
+        if k == 75 {                                    // K
+            c.pid = m.pid
+            c.secret_key = m.secret_key
+        } else if k == 82 {                             // R
+            at = m.auth_type
+            if at == pgproto3.AUTH_CLEARTEXT_PASSWORD {
+                pgproto3.password_message(c.wbuf, cfg.password)
+                werr = flush_out(c)
+                if werr != "" { return null, per_dial(c, "failed to write password message", werr), "" }
+            } else if at == pgproto3.AUTH_MD5_PASSWORD {
+                pgproto3.password_message(c.wbuf, md5_password(cfg.user, cfg.password, m.salt))
+                werr = flush_out(c)
+                if werr != "" { return null, per_dial(c, "failed to write password message", werr), "" }
+            } else if at == pgproto3.AUTH_SASL {
+                serr, scode = scram_auth(c, m.mechanisms)
+                if serr != "" {
+                    mark_closed(c)
+                    return null, per_dial(c, "failed SASL auth", serr), scode
+                }
+            }
+        } else if k == 90 {                             // Z
+            c.tx_status = m.tx_status
+            c.deadline_ms = 0
+            verr = validate_connect(c, cfg.target_session_attrs)
+            if verr != "" {
+                mark_closed(c)
+                return null, per_dial(c, "ValidateConnect failed", verr), ""
+            }
+            return c, "", ""
+        } else if k == 118 {                            // v NegotiateProtocolVersion
+            continue
+        } else if k == 69 {                             // E
+            mark_closed(c)
+            e = pg_error_from(m)
+            return null, per_dial(c, "server error", pg_error_string(e)), e.code
+        } else {
+            mark_closed(c)
+            return null, per_dial(c, "received unexpected message", "${string.from_char(k)}"), ""
+        }
+    }
+}
+
+fn parse_protocol_version_only(s: string) -> int {
+    v, _ = parse_protocol_version(s)
+    return v
+}
+
+fn network_address_text(host: string, port: int) -> string {
+    _, a = network_address(host, port)
+    return a
+}
+
+// target_session_attrs (ValidateConnectTargetSessionAttrs*); prefer-standby
+// is treated as any.
+fn validate_connect(c: *PgConn, tsa: string) -> string {
+    if tsa == "any" || tsa == "" || tsa == "prefer-standby" { return "" }
+    q = "show transaction_read_only"
+    if tsa == "primary" || tsa == "standby" { q = "select pg_is_in_recovery()" }
+    rs, err = exec(c, q)
+    if err != "" { return err }
+    if rs.len == 0 { return "no result" }
+    r = rs[0] as *Result
+    if r.nrows == 0 { return "no result" }
+    v = r.values[0]
+    if tsa == "read-write" && v == "on" { return "read only connection" }
+    if tsa == "read-only" && v != "on" { return "connection is not read only" }
+    if tsa == "standby" && v != "t" { return "server is not in hot standby mode" }
+    if tsa == "primary" && v == "t" { return "server is in standby mode" }
+    return ""
+}
+
+// Connect with a connection string (pgconn.Connect).
+connect(cs: string) -> (*PgConn, string) {
+    cfg, err = parse_config(cs)
+    if err != "" { return null, err }
+    return connect_config(cfg)
+}
+
+// ConnectConfig: try the host and each fallback in order; stop early on a
+// wrong password, a missing database or no connect privilege, as pgx does.
+connect_config(cfg: *Config) -> (*PgConn, string) {
+    if cfg.channel_binding == "require" {
+        return null, "failed to connect to `user=${cfg.user} database=${cfg.database}`: channel binding required but not supported here (std.cryptography.tls13_client does not expose the server certificate)"
+    }
+    let hosts: ptr[] = []
+    fb0 = heap.new(FallbackConfig)
+    fb0.host = cfg.host
+    fb0.port = cfg.port
+    fb0.tls = cfg.tls
+    hosts.push(fb0 as ptr)
+    for f in cfg.fallbacks { hosts.push(f) }
+    string[] errs = []
+    let deadline: long = 0
+    last_addr = ""
+    for hp in hosts {
+        fb = hp as *FallbackConfig
+        addr = network_address_text(fb.host, fb.port)
+        if cfg.connect_timeout_ms > 0 && addr != last_addr { deadline = now_ms() + cfg.connect_timeout_ms }
+        last_addr = addr
+        c, err, code = connect_one(cfg, fb.host, fb.port, fb.tls, deadline)
+        if c != null { return c, "" }
+        errs.push(err)
+        if code == "28P01" || code == "3D000" || code == "42501" { break }
+    }
+    prefix = "failed to connect to `user=${cfg.user} database=${cfg.database}`:"
+    if errs.len == 1 { return null, "${prefix} ${errs[0]}" }
+    return null, "${prefix}\n\t${join(errs, "\n\t")}"
+}
+
+// Close: Terminate, then the socket (pgconn.Close). Null-safe.
+close(c: *PgConn) -> string {
+    if c == null || c.closed { return "" }
+    pgproto3.terminate(c.wbuf)
+    _ = flush_out(c)
+    mark_closed(c)
+    return ""
+}
+
+fn pg_err_text(c: *PgConn) -> string {
+    if c.last_error == null { return "server error" }
+    return pg_error_string(c.last_error)
+}
+
+// Exec with the simple query protocol (pgconn.Exec(...).ReadAll()): every
+// statement's *Result, in order (a ptr[] of *Result). An error stops the
+// statements after it; the results before it are dropped and the error is
+// the server's.
+exec(c: *PgConn, sql: string) -> (ptr[], string) {
+    let results: ptr[] = []
+    if c.closed { return results, "conn closed" }
+    c.last_error = null
+    pgproto3.query(c.wbuf, sql)
+    ferr = flush_out(c)
+    if ferr != "" { return results, ferr }
+    cur = new_result()
+    has_cur = false
+    err = ""
+    while true {
+        m, rerr = recv(c)
+        if rerr != "" { return results, rerr }
+        k = m.kind
+        if k == 84 {                 // T
+            cur = new_result()
+            has_cur = true
+            for f in m.fields { cur.fields.push(f) }
+        } else if k == 68 {          // D
+            if !has_cur {
+                cur = new_result()
+                has_cur = true
+            }
+            add_row(cur, m)
+        } else if k == 67 {          // C
+            if !has_cur { cur = new_result() }
+            cur.tag = m.tag
+            results.push(cur as ptr)
+            has_cur = false
+        } else if k == 73 {          // I EmptyQueryResponse
+            results.push(new_result() as ptr)
+            has_cur = false
+        } else if k == 69 {          // E
+            err = pg_err_text(c)
+            if c.closed { return results, err }
+        } else if k == 90 {          // Z
+            c.tx_status = m.tx_status
+            if err != "" {
+                let none_: ptr[] = []
+                return none_, err
+            }
+            return results, ""
+        }
+    }
+}
+
+fn add_row(r: *Result, m: *pgproto3.Msg) {
+    i = 0
+    while i < m.values.len {
+        r.values.push(m.values[i])
+        r.nulls.push(m.nulls[i])
+        i = i + 1
+    }
+    r.nrows = r.nrows + 1
+}
+
+// Ping: an empty statement round trip (pgconn.Ping).
+ping(c: *PgConn) -> string {
+    _, err = exec(c, "-- ping")
+    return err
+}
+
+// Read the answer to an extended-protocol flight up to ReadyForQuery.
+fn read_extended(c: *PgConn, fields: pgproto3.FieldDescription[], have_fields: bool) -> (*Result, string) {
+    r = new_result()
+    if have_fields {
+        for f in fields { r.fields.push(f) }
+    }
+    err = ""
+    while true {
+        m, rerr = recv(c)
+        if rerr != "" { return null, rerr }
+        k = m.kind
+        if k == 84 {
+            for f in m.fields { r.fields.push(f) }
+        } else if k == 68 {
+            add_row(r, m)
+        } else if k == 67 {
+            r.tag = m.tag
+        } else if k == 69 {
+            err = pg_err_text(c)
+            if c.closed { return null, err }
+        } else if k == 90 {
+            c.tx_status = m.tx_status
+            if err != "" { return null, err }
+            return r, ""
+        }
+        // 1 ParseComplete, 2 BindComplete, n NoData, I, s: nothing to keep
+    }
+}
+
+// ExecParams: Parse (unnamed), Bind (text values, null where nulls[i]),
+// Describe portal, Execute, Sync; the one statement's result.
+exec_params(c: *PgConn, sql: string, values: string[], nulls: bool[]) -> (*Result, string) {
+    if c.closed { return null, "conn closed" }
+    if values.len > 65535 { return null, "extended protocol limited to 65535 parameters" }
+    c.last_error = null
+    let oids: long[] = []
+    e1 = pgproto3.parse(c.wbuf, "", sql, oids)
+    if e1 != "" { return null, e1 }
+    e2 = pgproto3.bind(c.wbuf, "", "", values, nulls)
+    if e2 != "" { return null, e2 }
+    pgproto3.describe(c.wbuf, 80, "")
+    pgproto3.execute(c.wbuf, "", 0)
+    pgproto3.sync(c.wbuf)
+    ferr = flush_out(c)
+    if ferr != "" { return null, ferr }
+    let none_: pgproto3.FieldDescription[] = []
+    return read_extended(c, none_, false)
+}
+
+// Prepare: Parse (named), Describe statement, Sync (pgconn.Prepare).
+prepare(c: *PgConn, name: string, sql: string) -> (*StatementDescription, string) {
+    if c.closed { return null, "conn closed" }
+    c.last_error = null
+    let oids: long[] = []
+    pgproto3.parse(c.wbuf, name, sql, oids)
+    pgproto3.describe(c.wbuf, 83, name)
+    pgproto3.sync(c.wbuf)
+    ferr = flush_out(c)
+    if ferr != "" { return null, ferr }
+    sd = heap.new(StatementDescription)
+    sd.name = name
+    sd.sql = sql
+    parse_complete = false
+    err = ""
+    while true {
+        m, rerr = recv(c)
+        if rerr != "" { return null, rerr }
+        k = m.kind
+        if k == 49 { parse_complete = true }
+        else if k == 116 { for o in m.param_oids { sd.param_oids.push(o) } }
+        else if k == 84 { for f in m.fields { sd.fields.push(f) } }
+        else if k == 69 {
+            err = pg_err_text(c)
+            if c.closed { return null, err }
+        }
+        else if k == 90 {
+            c.tx_status = m.tx_status
+            if err != "" {
+                if parse_complete { return null, "prepare failed after ParseComplete: ${err}" }
+                return null, err
+            }
+            return sd, ""
+        }
+    }
+}
+
+// ExecStatement: Bind a prepared statement, Execute, Sync, with the result
+// columns its description gave.
+exec_prepared(c: *PgConn, sd: *StatementDescription, values: string[], nulls: bool[]) -> (*Result, string) {
+    if c.closed { return null, "conn closed" }
+    c.last_error = null
+    e2 = pgproto3.bind(c.wbuf, "", sd.name, values, nulls)
+    if e2 != "" { return null, e2 }
+    pgproto3.execute(c.wbuf, "", 0)
+    pgproto3.sync(c.wbuf)
+    ferr = flush_out(c)
+    if ferr != "" { return null, ferr }
+    return read_extended(c, sd.fields, true)
+}
+
+// Deallocate: Close statement, Sync.
+deallocate(c: *PgConn, name: string) -> string {
+    if c.closed { return "conn closed" }
+    c.last_error = null
+    pgproto3.close(c.wbuf, 83, name)
+    pgproto3.sync(c.wbuf)
+    ferr = flush_out(c)
+    if ferr != "" { return ferr }
+    err = ""
+    while true {
+        m, rerr = recv(c)
+        if rerr != "" { return rerr }
+        if m.kind == 69 { err = pg_err_text(c) }
+        if m.kind == 90 {
+            c.tx_status = m.tx_status
+            return err
+        }
+    }
+}
+
+// EscapeString with standard_conforming_strings on: quotes doubled.
+escape_string(c: *PgConn, s: string) -> (string, string) {
+    if parameter_status(c, "standard_conforming_strings") != "on" {
+        return "", "EscapeString must be run with standard_conforming_strings=on"
+    }
+    if parameter_status(c, "client_encoding") != "UTF8" {
+        return "", "EscapeString must be run with client_encoding=UTF8"
+    }
+    return string.replace_all(s, "'", "''"), ""
+}
+
+// ===================================================================
+// SCRAM-SHA-256 (auth_scram.go)
+// ===================================================================
+
+struct ScramClient {
+    server_auth_mechanisms: string[]
+    password: string
+    username: string                 // "" for Postgres (the startup user counts); RFC examples set one
+    client_nonce: string
+    auth_mechanism: string
+    has_tls: bool
+    client_first_message_bare: string
+    client_gs2_header: string
+    server_first_message: string
+    client_and_server_nonce: string
+    salt: byte[]
+    iterations: int
+    salted_password: byte[]
+    auth_message: string
+}
+
+fn handle_bytes(h: ptr) -> byte[] {
+    byte[] out = []
+    if h == null { return out }
+    for b in bytes.view(h) { out.push(b) }
+    bytes.free(h)
+    return out
+}
+
+fn str_bytes(s: string) -> byte[] {
+    byte[] out = []
+    for b in string.bytes(s) { out.push(b as byte) }
+    return out
+}
+
+// newScramClient: refuses a server without SCRAM-SHA-256, makes an 18-byte
+// random nonce, base64 without padding.
+new_scram_client(mechanisms: string[], password: string) -> (*ScramClient, string) {
+    sc = heap.new(ScramClient)
+    found = false
+    for m in mechanisms {
+        sc.server_auth_mechanisms.push(m)
+        if m == SCRAM_SHA_256 { found = true }
+    }
+    if !found { return null, "server does not support SCRAM-SHA-256" }
+    sc.auth_mechanism = SCRAM_SHA_256
+    sc.password = password
+    sc.username = ""
+    sc.has_tls = false
+    rb, rerr = cryptography.random_buffer(CLIENT_NONCE_LEN)
+    if rerr != "" { return null, rerr }
+    raw = handle_bytes(rb)
+    sc.client_nonce = encoding.base64_encode(raw)
+    sc.client_first_message_bare = ""
+    sc.client_gs2_header = ""
+    sc.server_first_message = ""
+    sc.client_and_server_nonce = ""
+    sc.auth_message = ""
+    return sc, ""
+}
+
+// For tests: a fixed nonce (the RFC 7677 example's) and user name.
+scram_set_nonce(sc: *ScramClient, nonce: string) { sc.client_nonce = nonce }
+scram_set_username(sc: *ScramClient, user: string) { sc.username = user }
+
+// The GS2 header is "n,,": no channel binding (see the module header).
+scram_client_first_message(sc: *ScramClient) -> string {
+    sc.client_first_message_bare = "n=${sc.username},r=${sc.client_nonce}"
+    if sc.auth_mechanism == SCRAM_SHA_256_PLUS {
+        sc.client_gs2_header = "p=tls-server-end-point,,"
+    } else if sc.has_tls {
+        sc.client_gs2_header = "y,,"
+    } else {
+        sc.client_gs2_header = "n,,"
+    }
+    return "${sc.client_gs2_header}${sc.client_first_message_bare}"
+}
+
+scram_recv_server_first_message(sc: *ScramClient, msg: string) -> string {
+    sc.server_first_message = msg
+    buf = msg
+    if string.starts_with(buf, "r=") == 0 {
+        return "invalid SCRAM server-first-message received from server: did not include r="
+    }
+    buf = string.substring(buf, 2, string.length(buf))
+    idx = string.index_of(buf, ",")
+    if idx < 0 { return "invalid SCRAM server-first-message received from server: did not include s=" }
+    sc.client_and_server_nonce = string.substring(buf, 0, idx)
+    buf = string.substring(buf, idx + 1, string.length(buf))
+    if string.starts_with(buf, "s=") == 0 {
+        return "invalid SCRAM server-first-message received from server: did not include s="
+    }
+    buf = string.substring(buf, 2, string.length(buf))
+    idx = string.index_of(buf, ",")
+    if idx < 0 { return "invalid SCRAM server-first-message received from server: did not include i=" }
+    salt_str = string.substring(buf, 0, idx)
+    buf = string.substring(buf, idx + 1, string.length(buf))
+    if string.starts_with(buf, "i=") == 0 {
+        return "invalid SCRAM server-first-message received from server: did not include i="
+    }
+    iter_str = string.substring(buf, 2, string.length(buf))
+    salt, serr = encoding.base64_decode(salt_str)
+    if serr != "" || !valid_b64(salt_str) { return "invalid SCRAM salt received from server: ${serr}" }
+    sc.salt = str_bytes(salt)
+    it, ierr = string.to_int(iter_str)
+    if ierr != "" || it <= 0 {
+        return "invalid SCRAM iteration count received from server: strconv.Atoi: parsing \"${iter_str}\": invalid syntax"
+    }
+    sc.iterations = it
+    if string.starts_with(sc.client_and_server_nonce, sc.client_nonce) == 0 {
+        return "invalid SCRAM nonce: did not start with client nonce"
+    }
+    if string.length(sc.client_and_server_nonce) <= string.length(sc.client_nonce) {
+        return "invalid SCRAM nonce: did not include server nonce"
+    }
+    return ""
+}
+
+fn valid_b64(s: string) -> bool {
+    for c in string.bytes(s) {
+        ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 43 || c == 47 || c == 61
+        if !ok { return false }
+    }
+    return string.length(s) % 4 == 0
+}
+
+fn hmac256(key: byte[], msg: byte[]) -> byte[] {
+    return handle_bytes(hmac.hmac_sha256(key, msg))
+}
+
+fn compute_client_proof(salted: byte[], auth_message: string) -> string {
+    client_key = hmac256(salted, str_bytes("Client Key"))
+    stored_key = handle_bytes(sha2.sha256_bytes(client_key))
+    sig = hmac256(stored_key, str_bytes(auth_message))
+    byte[] proof = []
+    i = 0
+    while i < sig.len {
+        proof.push(((client_key[i] as int) ^ (sig[i] as int)) as byte)
+        i = i + 1
+    }
+    return encoding.base64_encode_padded(proof)
+}
+
+// computeServerSignature, base64.
+scram_compute_server_signature(sc: *ScramClient) -> string {
+    server_key = hmac256(sc.salted_password, str_bytes("Server Key"))
+    return encoding.base64_encode_padded(hmac256(server_key, str_bytes(sc.auth_message)))
+}
+
+scram_client_final_message(sc: *ScramClient) -> string {
+    cbind = encoding.base64_encode_padded(str_bytes(sc.client_gs2_header))
+    without_proof = "c=${cbind},r=${sc.client_and_server_nonce}"
+    sc.salted_password = handle_bytes(pbkdf2.pbkdf2("sha256", str_bytes(sc.password), sc.salt, sc.iterations, 32))
+    sc.auth_message = "${sc.client_first_message_bare},${sc.server_first_message},${without_proof}"
+    proof = compute_client_proof(sc.salted_password, sc.auth_message)
+    return "${without_proof},p=${proof}"
+}
+
+scram_recv_server_final_message(sc: *ScramClient, msg: string) -> string {
+    if string.starts_with(msg, "v=") == 0 { return "invalid SCRAM server-final-message received from server" }
+    got = str_bytes(string.substring(msg, 2, string.length(msg)))
+    want = str_bytes(scram_compute_server_signature(sc))
+    if got.len != want.len || ct.bytes_eq_slice(got, want) != 1 {
+        return "invalid SCRAM ServerSignature received from server"
+    }
+    return ""
+}
+
+// scramAuth over the connection; (error, the server's SQLSTATE if it sent one).
+fn scram_auth(c: *PgConn, mechanisms: string[]) -> (string, string) {
+    sc, err = new_scram_client(mechanisms, c.config.password)
+    if err != "" { return err, "" }
+    pgproto3.sasl_initial_response(c.wbuf, sc.auth_mechanism, scram_client_first_message(sc))
+    ferr = flush_out(c)
+    if ferr != "" { return ferr, "" }
+    m, rerr = recv(c)
+    if rerr != "" { return rerr, "" }
+    if m.kind == 69 {
+        e = pg_error_from(m)
+        return pg_error_string(e), e.code
+    }
+    if m.kind != 82 || m.auth_type != pgproto3.AUTH_SASL_CONTINUE {
+        return "expected AuthenticationSASLContinue message but received unexpected message ${string.from_char(m.kind)}", ""
+    }
+    serr = scram_recv_server_first_message(sc, m.data)
+    if serr != "" { return serr, "" }
+    pgproto3.sasl_response(c.wbuf, scram_client_final_message(sc))
+    ferr2 = flush_out(c)
+    if ferr2 != "" { return ferr2, "" }
+    m2, rerr2 = recv(c)
+    if rerr2 != "" { return rerr2, "" }
+    if m2.kind == 69 {
+        e2 = pg_error_from(m2)
+        return pg_error_string(e2), e2.code
+    }
+    if m2.kind != 82 || m2.auth_type != pgproto3.AUTH_SASL_FINAL {
+        return "expected AuthenticationSASLFinal message but received unexpected message ${string.from_char(m2.kind)}", ""
+    }
+    return scram_recv_server_final_message(sc, m2.data), ""
+}

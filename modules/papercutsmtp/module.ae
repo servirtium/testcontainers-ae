@@ -1,0 +1,54 @@
+// Ported from testcontainers-go modules/papercutsmtp/papercutsmtp.go
+//
+// modules.papercutsmtp: a Papercut SMTP container (SMTP on 2525, web UI and
+// REST API on 8080).
+//
+//     import modules.papercutsmtp
+//
+//     c, err = papercutsmtp.run("changemakerstudiosus/papercut-smtp:latest")
+//     defer tc.terminate(c)
+//     smtp, _ = papercutsmtp.smtp_endpoint(c)   // "localhost:32771"
+//     api, _  = papercutsmtp.http_url(c)        // "http://localhost:32772"
+//
+// Nothing is left out.
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, smtp_endpoint, http_url, SMTP_PORT, HTTP_PORT, DEFAULT_IMAGE,
+    papercutsmtp_request_new, papercutsmtp_request_free
+)
+
+const SMTP_PORT = "2525/tcp"
+const HTTP_PORT = "8080/tcp"
+const DEFAULT_IMAGE = "changemakerstudiosus/papercut-smtp:latest"
+
+papercutsmtp_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, SMTP_PORT)
+    tc.expose(r, HTTP_PORT)
+    tc.wait_for(r, wait.for_http("/") { with_port(HTTP_PORT); with_status(200) })
+    return r
+}
+
+papercutsmtp_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with papercutsmtp_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = papercutsmtp_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run papercutsmtp: ${err}" }
+    return c, ""
+}
+
+// "host:port" of the SMTP server (Go's SMTPEndpoint).
+smtp_endpoint(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, SMTP_PORT, "")
+}
+
+// "http://host:port" of the web UI and REST API (Go's HTTPURL).
+http_url(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, HTTP_PORT, "http")
+}

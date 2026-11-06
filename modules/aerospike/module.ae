@@ -1,0 +1,55 @@
+// Ported from testcontainers-go modules/aerospike/aerospike.go
+//
+// modules.aerospike: an Aerospike container.
+//
+//     import modules.aerospike
+//
+//     c, err = aerospike.run("aerospike/aerospike-server:latest")
+//     defer tc.terminate(c)
+//     ep, _ = tc.endpoint(c, aerospike.PORT, "")      // "localhost:32771"
+//
+// Like the Go module this is the option-less Run: the four Aerospike ports
+// exposed, AEROSPIKE_CONFIG_FILE set, and the wait for "migrations: complete"
+// plus the client, fabric and heartbeat ports listening. Nothing is left out
+// (the Go module has no other helpers).
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, PORT, FABRIC_PORT, HEARTBEAT_PORT, INFO_PORT, DEFAULT_IMAGE,
+    aerospike_request_new, aerospike_request_free
+)
+
+const PORT = "3000/tcp"            // client connections
+const FABRIC_PORT = "3001/tcp"     // intra-cluster replica writes, migrations
+const HEARTBEAT_PORT = "3002/tcp"
+const INFO_PORT = "3003/tcp"
+const DEFAULT_IMAGE = "aerospike/aerospike-server:latest"
+
+aerospike_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.expose(r, FABRIC_PORT)
+    tc.expose(r, HEARTBEAT_PORT)
+    tc.expose(r, INFO_PORT)
+    tc.env(r, "AEROSPIKE_CONFIG_FILE", "/etc/aerospike/aerospike.conf")
+    tc.wait_for(r, wait.for_all([
+        wait.for_log("migrations: complete"),
+        wait.for_listening_port(PORT) { with_startup_timeout(10s) },
+        wait.for_listening_port(FABRIC_PORT) { with_startup_timeout(10s) },
+        wait.for_listening_port(HEARTBEAT_PORT) { with_startup_timeout(10s) }
+    ]))
+    return r
+}
+
+aerospike_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with aerospike_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = aerospike_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run aerospike: ${err}" }
+    return c, ""
+}

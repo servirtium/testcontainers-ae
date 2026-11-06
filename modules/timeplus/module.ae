@@ -1,0 +1,54 @@
+// Ported from testcontainers-go modules/timeplus/timeplus.go
+//
+// modules.timeplus: a Timeplus (timeplusd) server, HTTP on 8123 and the
+// native protocol on 8463.
+//
+//     import modules.timeplus
+//
+//     c, err = timeplus.run("timeplus/timeplusd:2.3.37")
+//     defer tc.terminate(c)
+//     url, _ = timeplus.http_endpoint(c)    // "http://localhost:32771"
+//
+// Ready (within 120s) when GET /timeplusd/ping answers 200. Nothing is left
+// out; the Go tests' timeplus-go driver is replaced by the REST ping.
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, http_endpoint, HTTP_PORT, NATIVE_PORT, DEFAULT_IMAGE,
+    timeplus_request_new, timeplus_request_free
+)
+
+const HTTP_PORT = "8123/tcp"
+const NATIVE_PORT = "8463/tcp"
+const DEFAULT_IMAGE = "timeplus/timeplusd:2.3.37"
+
+timeplus_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, NATIVE_PORT)
+    tc.wait_for(r, wait.for_http("/timeplusd/ping") {
+        with_port(HTTP_PORT)
+        with_status(200)
+        with_startup_timeout(120s)
+    })
+    tc.wait_deadline(r, 120s)
+    return r
+}
+
+timeplus_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with timeplus_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = timeplus_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run timeplus: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" of the HTTP interface (Go's HTTPEndpoint).
+http_endpoint(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, HTTP_PORT, "http")
+}

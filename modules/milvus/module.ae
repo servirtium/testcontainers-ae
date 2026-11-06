@@ -1,0 +1,71 @@
+// Ported from testcontainers-go modules/milvus/milvus.go (and
+// mounts/embedEtcd.yaml.tpl)
+//
+// modules.milvus: a Milvus standalone container with the embedded etcd and
+// local storage (adapted in Go from milvus's standalone_embed.sh), so one
+// container is the whole deployment, as Go's default Run. The embedded-etcd
+// config Go renders from a template (port 2379) is written out here.
+//
+//     import modules.milvus
+//
+//     c, err = milvus.run("milvusdb/milvus:v2.3.9")
+//     defer tc.terminate(c)
+//     addr, _ = milvus.connection_string(c)      // "localhost:32771" (gRPC)
+//
+// Not ported: the Go examples that use the Milvus Go SDK client, and the
+// deprecated RunContainer. Go's Run has no multi-container (etcd/minio)
+// variant either, so nothing is left out there.
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, connection_string, GRPC_PORT, HTTP_PORT, ETCD_PORT, DEFAULT_IMAGE,
+    EMBED_ETCD_PATH, milvus_request_new, milvus_request_free
+)
+
+const GRPC_PORT = "19530/tcp"
+const HTTP_PORT = "9091/tcp"
+const ETCD_PORT = "2379/tcp"
+const DEFAULT_IMAGE = "milvusdb/milvus:v2.3.9"
+const EMBED_ETCD_PATH = "/milvus/configs/embedEtcd.yaml"
+const DEFAULT_CLIENT_PORT = 2379
+
+milvus_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, GRPC_PORT)
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, ETCD_PORT)
+    tc.env(r, "ETCD_USE_EMBED", "true")
+    tc.env(r, "ETCD_DATA_DIR", "/var/lib/milvus/etcd")
+    tc.env(r, "ETCD_CONFIG_PATH", EMBED_ETCD_PATH)
+    tc.env(r, "COMMON_STORAGETYPE", "local")
+    tc.env(r, "DEPLOY_MODE", "STANDALONE")
+    tc.cmd(r, ["milvus", "run", "standalone"])
+    // Go's rendered mounts/embedEtcd.yaml.tpl
+    tc.file_content(r,
+        "listen-client-urls: http://0.0.0.0:${DEFAULT_CLIENT_PORT}\nadvertise-client-urls: http://0.0.0.0:${DEFAULT_CLIENT_PORT}\n",
+        EMBED_ETCD_PATH, 420)
+    tc.wait_for(r, wait.for_all([
+        wait.for_http("/healthz") { with_port(HTTP_PORT); with_startup_timeout(60s); with_poll_interval(1s) },
+        wait.for_listening_port(HTTP_PORT) { with_startup_timeout(60s) },
+        wait.for_listening_port(GRPC_PORT) { with_startup_timeout(60s) }
+    ]))
+    return r
+}
+
+milvus_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with milvus_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = milvus_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run milvus: ${err}" }
+    return c, ""
+}
+
+// "host:port" of the gRPC port 19530 (Go's ConnectionString).
+connection_string(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, GRPC_PORT, "")
+}

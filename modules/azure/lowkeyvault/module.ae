@@ -1,0 +1,152 @@
+// Ported from testcontainers-go modules/azure/lowkeyvault/lowkeyvault.go
+//
+// modules.azure.lowkeyvault: the Lowkey Vault Azure Key Vault emulator.
+//
+//     import modules.azure.lowkeyvault
+//
+//     c, err = lowkeyvault.run("nagyesta/lowkey-vault:7.3.48-ubi10-minimal")
+//     defer tc.terminate(c)
+//     url, _ = lowkeyvault.connection_url(c, lowkeyvault.LOCAL)     // "https://localhost:32771"
+//
+// For other containers on a network, give the vault an alias:
+//
+//     c, err = lowkeyvault.run(img) { lowkey_network_alias("lowkey-vault", net.name) }
+//     url, _ = lowkeyvault.connection_url(c, lowkeyvault.NETWORK)   // "https://lowkey-vault:8443"
+//     ep, _ = lowkeyvault.identity_endpoint(c, lowkeyvault.NETWORK) // IDENTITY_ENDPOINT
+//     lowkeyvault.identity_header()                                 // IDENTITY_HEADER ("header")
+//
+// Go's WithNetworkAlias(alias, network) is lowkey_network_alias(alias,
+// network name): a plain `network_alias` would clash with the core setter of
+// that name inside a block. It attaches the container to the network under
+// the alias and adds the alias as a vault alias of the default "localhost"
+// vault (LOWKEY_VAULT_ALIASES=localhost=<alias>:<port>).
+//
+// Added, for the half of Go's Client that does not need a PKCS#12 decoder:
+// default_cert_password and default_cert_p12 fetch the emulator's default
+// certificate (password and keystore) over its metadata port.
+//
+// Status: compile-checked only (alpha; no engine was used to port it).
+//
+// Not ported: Client (it decodes the PKCS#12 keystore into an http.Client
+// that trusts it; no PKCS#12 in Aether's std) and the Azure SDK code of
+// Go's examples (testdata/ is that Go client, built into a container by the
+// network example).
+
+import std.string
+import std.http.client
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, lowkey_network_alias, connection_url, identity_endpoint, identity_header,
+    default_cert_password, default_cert_p12, host_authority,
+    LOCAL, NETWORK, API_PORT, METADATA_PORT, DEFAULT_IMAGE,
+    lowkeyvault_request_new, lowkeyvault_request_free
+)
+
+// access modes (Go's Local, Network)
+const LOCAL = 0
+const NETWORK = 1
+
+const API_PORT = "8443/tcp"
+const METADATA_PORT = "8080/tcp"
+const DEFAULT_IMAGE = "nagyesta/lowkey-vault:7.3.48-ubi10-minimal"
+
+lowkeyvault_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, API_PORT)
+    tc.expose(r, METADATA_PORT)
+    tc.env(r, "LOWKEY_VAULT_RELAXED_PORTS", "true")
+    tc.wait_for(r, wait.for_log("Started LowkeyVaultApp in "))
+    return r
+}
+
+lowkeyvault_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithNetworkAlias: join the network under the alias, and name the
+// default vault by it too. The <port> placeholder is filled in by Lowkey Vault.
+lowkey_network_alias(_ctx: ptr, alias: string, network: string) {
+    tc.network_alias(_ctx, network, alias)
+    tc.env(_ctx, "LOWKEY_VAULT_ALIASES", "localhost=${alias}:<port>")
+}
+
+builder run(image: string) with lowkeyvault_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = lowkeyvault_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run lowkeyvault: ${err}" }
+    return c, ""
+}
+
+// "host:port" a client reaches the port at: from the host (LOCAL: the mapped
+// port) or from another container on the network (NETWORK: the container's
+// single network alias and the port itself).
+host_authority(c: *docker.Container, port: string, mode: int) -> (string, string) {
+    if mode == LOCAL {
+        ep, err = tc.endpoint(c, port, "")
+        if err != "" { return "", "host: ${err}" }
+        return ep, ""
+    }
+    if mode == NETWORK {
+        nets, nerr = tc.networks(c)
+        if nerr != "" { return "", "host: networks: ${nerr}" }
+        if nets.len != 1 { return "", "host: the container must have exactly one network, but it has ${nets.len}" }
+        aliases, aerr = tc.network_aliases(c, nets[0])
+        if aerr != "" { return "", "host: network aliases: ${aerr}" }
+        if aliases.len == 0 { return "", "host: no network aliases found in the Lowkey Vault container" }
+        if aliases.len != 1 { return "", "host: the container must have exactly one network alias, but it has ${aliases.len}" }
+        slash = string.index_of(port, "/")
+        pnum = port
+        if slash >= 0 { pnum = string.substring(port, 0, slash) }
+        return "${aliases[0]}:${pnum}", ""
+    }
+    return "", "unsupported access mode: ${mode}"
+}
+
+// The URL of the Key Vault API (Go's ConnectionURL).
+connection_url(c: *docker.Container, mode: int) -> (string, string) {
+    auth, err = host_authority(c, API_PORT, mode)
+    if err != "" { return "", "host authority: ${err}" }
+    return "https://${auth}", ""
+}
+
+// The value of IDENTITY_ENDPOINT for the managed identity simulation.
+identity_endpoint(c: *docker.Container, mode: int) -> (string, string) {
+    auth, err = host_authority(c, METADATA_PORT, mode)
+    if err != "" { return "", "host authority: ${err}" }
+    return "http://${auth}/metadata/identity/oauth2/token", ""
+}
+
+// The value of IDENTITY_HEADER for the managed identity simulation.
+identity_header() -> string { return "header" }
+
+fn fetch(url: string) -> (string, string) {
+    req = client.request("GET", url)
+    client.set_timeout(req, 30s)
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return "", "get content: ${err}" }
+    st = client.response_status(r)
+    body = client.response_body(r)
+    client.response_free(r)
+    if st != 200 { return "", "content not found" }
+    return body, ""
+}
+
+// The password of the default certificate keystore (from the metadata port,
+// reached from the host).
+default_cert_password(c: *docker.Container) -> (string, string) {
+    auth, err = host_authority(c, METADATA_PORT, LOCAL)
+    if err != "" { return "", "host authority: ${err}" }
+    pw, ferr = fetch("http://${auth}/metadata/default-cert/password")
+    if ferr != "" { return "", "default cert password: ${ferr}" }
+    return pw, ""
+}
+
+// The default certificate keystore (PKCS#12) as the response body.
+default_cert_p12(c: *docker.Container) -> (string, string) {
+    auth, err = host_authority(c, METADATA_PORT, LOCAL)
+    if err != "" { return "", "host authority: ${err}" }
+    return fetch("http://${auth}/metadata/default-cert/lowkey-vault.p12")
+}

@@ -1,0 +1,77 @@
+// testcontainers.miniyaml: the compose-file YAML subset, read in pure Aether
+// (std.yaml needs libfyaml, which the released toolchains lack).
+
+import std.spec
+import std.string
+import std.fs
+import testcontainers.miniyaml as y
+
+fn read(path: string) -> string {
+    t, _ = fs.read(path)
+    // the testdata are templates (Go's text/template): fill them in
+    t = string.replace_all(t, "{{ .ServiceType }}", "local")
+    t = string.replace_all(t, "{{ .Port_0 }}", "8081")
+    return string.replace_all(t, "{{ .Port_1 }}", "8082")
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "testcontainers.miniyaml") {
+        spec.it("reads the compose subset") callback {
+            d, err = y.parse("services:\n  web: &web\n    image: 'nginx:stable'\n    command: [\"sh\", \"-c\", \"echo # not a comment\"]\n    ports:\n      - \"8080:80\"\n      - 9090:90\n    environment:\n      A: 1\n      URL: http://h:1/p#frag\n    healthcheck: {test: [CMD, true], interval: 5s}\n    script: |\n      line one\n      line two\n    profiles: [dev, test]\n  db:\n    image: postgres\n    environment:\n      - POSTGRES_PASSWORD=x\n      -   K=V\n    depends_on:\n    - web\n    - redis\nvolumes:\n  data:\n  ext:\n    external: true\n")
+            spec.assert_ok(err, "parses")
+            r = y.root(d)
+            svcs = y.lookup(d, r, "services")
+            spec.assert_eq(y.size(d, svcs), 2, "two services")
+            spec.assert_str_eq(y.key(d, svcs, 0), "web", "first key")
+            web = y.lookup(d, svcs, "web")
+            spec.assert_str_eq(y.scalar(d, y.lookup(d, web, "image")), "nginx:stable", "single quoted")
+            cmd = y.lookup(d, web, "command")
+            spec.assert_eq(y.size(d, cmd), 3, "flow sequence")
+            spec.assert_str_eq(y.scalar(d, y.item(d, cmd, 2)), "echo # not a comment", "# inside quotes")
+            ports = y.lookup(d, web, "ports")
+            spec.assert_str_eq(y.scalar(d, y.item(d, ports, 0)), "8080:80", "quoted port")
+            spec.assert_str_eq(y.scalar(d, y.item(d, ports, 1)), "9090:90", "plain port")
+            env = y.lookup(d, web, "environment")
+            spec.assert_str_eq(y.scalar(d, y.lookup(d, env, "A")), "1", "scalar text")
+            spec.assert_str_eq(y.scalar(d, y.lookup(d, env, "URL")), "http://h:1/p#frag", "# without a blank before is text")
+            hc = y.lookup(d, web, "healthcheck")
+            spec.assert_str_eq(y.scalar(d, y.lookup(d, hc, "interval")), "5s", "flow mapping")
+            spec.assert_eq(y.size(d, y.lookup(d, hc, "test")), 2, "nested flow")
+            spec.assert_str_eq(y.scalar(d, y.lookup(d, web, "script")), "line one\nline two", "block scalar")
+            spec.assert_eq(y.size(d, y.lookup(d, web, "profiles")), 2, "profiles")
+            db = y.lookup(d, svcs, "db")
+            denv = y.lookup(d, db, "environment")
+            spec.assert_str_eq(y.scalar(d, y.item(d, denv, 1)), "K=V", "item with extra blanks")
+            dep = y.lookup(d, db, "depends_on")
+            spec.assert_eq(y.size(d, dep), 2, "sequence at its key's indent")
+            vols = y.lookup(d, r, "volumes")
+            spec.assert_eq(y.size(d, vols), 2, "two volumes")
+            spec.assert_eq(y.kind(d, y.lookup(d, vols, "data")), y.SCALAR, "empty value is an empty scalar")
+            spec.assert_str_eq(y.scalar(d, y.lookup(d, y.lookup(d, vols, "ext"), "external")), "true", "external")
+            y.free(d)
+        }
+
+        spec.it("reads a mapping inside a sequence item") callback {
+            d, err = y.parse("items:\n  - name: a\n    size: 1\n  - name: b\n    size: 2\n")
+            spec.assert_ok(err, "parses")
+            items = y.lookup(d, y.root(d), "items")
+            spec.assert_eq(y.size(d, items), 2, "two items")
+            b = y.item(d, items, 1)
+            spec.assert_str_eq(y.scalar(d, y.lookup(d, b, "name")), "b", "name")
+            spec.assert_str_eq(y.scalar(d, y.lookup(d, b, "size")), "2", "size")
+            y.free(d)
+        }
+
+        spec.it("reads every compose testdata file with its services") callback {
+            files = ["docker-compose-simple.yml", "docker-compose-complex.yml", "docker-compose-override.yml", "docker-compose-postgres.yml", "docker-compose-profiles.yml", "docker-compose-short-lifespan.yml", "docker-compose-volume.yml"]
+            for f in files {
+                d, err = y.parse(read("modules/compose/testdata/${f}"))
+                spec.assert_ok(err, f)
+                spec.assert_true(y.size(d, y.lookup(d, y.root(d), "services")) > 0, "${f} has services")
+                y.free(d)
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

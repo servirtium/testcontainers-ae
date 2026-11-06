@@ -1,0 +1,101 @@
+// Ported from testcontainers-go modules/gcloud/spanner/spanner.go and options.go
+// (WithProjectID is internal/shared/shared.go's)
+//
+// modules.gcloud.spanner: the Google Cloud Spanner emulator.
+//
+//     import modules.gcloud.spanner
+//
+//     c, err = spanner.run("gcr.io/cloud-spanner-emulator/emulator:1.5.40") {
+//         project_id("spanner-project")
+//     }
+//     defer spanner.terminate(c)
+//     spanner.uri(c)                    // "localhost:32771" (host:port, no scheme)
+//     spanner.project_id_of(c)          // "spanner-project"
+//     spanner.emulator_env(c)           // ("SPANNER_EMULATOR_HOST", "localhost:32771")
+//
+// The Spanner image starts the emulator by itself, so there is no command.
+// emulator_env is added: the variable the Google client libraries read to
+// talk to the emulator instead of the real service.
+//
+// Status: compile-checked only (alpha; no engine was used to port it).
+//
+// Not ported: Go's old flat gcloud.spanner constructor (deprecated, replaced by
+// this module) and the Google Cloud client SDK code of Go's examples (no
+// such SDK in Aether; the test drives the emulator over its REST interface or
+// a TCP connect instead).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    SpannerContainer, run, terminate, project_id, project_id_of, uri, emulator_env,
+    emulator_env_entry, PORT, DEFAULT_PROJECT_ID, DEFAULT_IMAGE, EMULATOR_HOST_VAR,
+    spanner_request_new, spanner_request_free
+)
+
+const PORT = "9010/tcp"
+const DEFAULT_PROJECT_ID = "test-project"
+const DEFAULT_IMAGE = "gcr.io/cloud-spanner-emulator/emulator:1.5.40"
+const EMULATOR_HOST_VAR = "SPANNER_EMULATOR_HOST"
+
+const SET_PROJECT = "spanner.project_id"
+
+struct SpannerContainer {
+    container: *docker.Container
+    pid: string
+    addr: string
+}
+
+spanner_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(PORT),
+        wait.for_log("Cloud Spanner emulator running")
+    ]))
+    tc.set_setting(r, SET_PROJECT, DEFAULT_PROJECT_ID)
+    return r
+}
+
+spanner_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithProjectID.
+project_id(_ctx: ptr, id: string) { tc.set_setting(_ctx, SET_PROJECT, id) }
+
+// "NAME=host:port" for an emulator address.
+emulator_env_entry(addr: string) -> string { return "${EMULATOR_HOST_VAR}=${addr}" }
+
+builder run(image: string) with spanner_request_new -> (*SpannerContainer, string) {
+    r = _builder
+    if r == null { r = spanner_request_new() }
+    pid = tc.req_setting(r, SET_PROJECT)
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run spanner: ${err}" }
+    g = heap.new(SpannerContainer)
+    g.container = c
+    g.pid = pid
+    g.addr = ""
+    if err != "" { return g, "run spanner: ${err}" }
+    // the URI uses the empty string as the protocol: host:port
+    ep, eerr = tc.endpoint(c, PORT, "")
+    if eerr != "" { return g, "port endpoint: ${eerr}" }
+    g.addr = ep
+    return g, ""
+}
+
+// Terminate the container (null-safe).
+terminate(g: *SpannerContainer) -> string {
+    if g == null { return "" }
+    return tc.terminate(g.container)
+}
+
+// The project id the emulator was started with (Go's ProjectID).
+project_id_of(g: *SpannerContainer) -> string { return g.pid }
+
+// "host:port" of the emulator (Go's URI).
+uri(g: *SpannerContainer) -> string { return g.addr }
+
+// The environment variable (name, value) the Google client libraries read.
+emulator_env(g: *SpannerContainer) -> (string, string) { return EMULATOR_HOST_VAR, g.addr }

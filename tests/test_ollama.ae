@@ -1,0 +1,54 @@
+// Ported from testcontainers-go modules/ollama (ollama_test.go TestOllama,
+// "ConnectionString"): the server answers GET / with 200, and /api/version
+// reports a version. Go's model pull, `ollama run` and commit-to-image cases
+// are not run (a model is multiple GB).
+
+import std.spec
+import std.string
+import std.http.client
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.ollama
+
+const IMAGE = "ollama/ollama:0.5.7"
+
+fn get(url: string) -> (int, string, string) {
+    req = client.request("GET", url)
+    client.set_timeout(req, 30s)
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    st = client.response_status(r)
+    body = client.response_body(r)
+    client.response_free(r)
+    return st, body, ""
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/ollama") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("serves its API on the connection string (TestOllama/ConnectionString)") callback {
+            c, err = ollama.run(IMAGE)
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "ollama starts")
+            if err == "" {
+                url, uerr = ollama.connection_string(c)
+                spec.assert_ok(uerr, "connection string")
+                st, body, gerr = get(url)
+                spec.assert_ok(gerr, "GET /")
+                spec.assert_eq(st, 200, "root is 200")
+                spec.assert_contains(body, "Ollama is running", "banner")
+                vs, vb, verr = get("${url}/api/version")
+                spec.assert_ok(verr, "GET /api/version")
+                spec.assert_eq(vs, 200, "version is 200")
+                spec.assert_contains(vb, "0.5.7", "the image's version")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

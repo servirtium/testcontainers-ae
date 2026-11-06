@@ -1,0 +1,117 @@
+// Ported from testcontainers-go modules/gcloud/firestore/firestore.go and
+// options.go (WithProjectID is internal/shared/shared.go's)
+//
+// modules.gcloud.firestore: the Google Cloud Firestore emulator.
+//
+//     import modules.gcloud.firestore
+//
+//     c, err = firestore.run("gcr.io/google.com/cloudsdktool/cloud-sdk:emulators") {
+//         project_id("firestore-project")
+//         datastore_mode()                // needs cloud-sdk 465.0.0 or higher
+//     }
+//     defer firestore.terminate(c)
+//     firestore.uri(c)                    // "localhost:32771" (host:port)
+//     firestore.emulator_env(c)           // ("FIRESTORE_EMULATOR_HOST", "localhost:32771")
+//
+// The emulator command is set in run (it needs the project and the mode)
+// unless the caller's block gave a cmd. emulator_env is added: the variable
+// the Google client libraries read to find the emulator.
+//
+// Status: compile-checked only (alpha; no engine was used to port it).
+//
+// Not ported: Go's old flat gcloud.RunFirestore (deprecated, replaced by this
+// module) and the cloud.google.com/go/firestore client of Go's examples (no
+// such SDK in Aether; the test uses the emulator's REST API).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    FirestoreContainer, run, terminate, project_id, datastore_mode,
+    project_id_of, uri, emulator_env, emulator_env_entry, emulator_command,
+    PORT, DEFAULT_PROJECT_ID, DEFAULT_IMAGE, EMULATOR_HOST_VAR,
+    firestore_request_new, firestore_request_free
+)
+
+const PORT = "8080/tcp"
+const DEFAULT_PROJECT_ID = "test-project"
+const DEFAULT_IMAGE = "gcr.io/google.com/cloudsdktool/cloud-sdk:emulators"
+const EMULATOR_HOST_VAR = "FIRESTORE_EMULATOR_HOST"
+
+const SET_PROJECT = "firestore.project_id"
+const SET_DS_MODE = "firestore.datastore_mode"
+
+struct FirestoreContainer {
+    container: *docker.Container
+    pid: string
+    addr: string
+}
+
+firestore_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(PORT),
+        wait.for_log("running")
+    ]))
+    tc.set_setting(r, SET_PROJECT, DEFAULT_PROJECT_ID)
+    return r
+}
+
+firestore_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithProjectID.
+project_id(_ctx: ptr, id: string) { tc.set_setting(_ctx, SET_PROJECT, id) }
+
+// Go's WithDatastoreMode: run the emulator in Datastore mode.
+datastore_mode(_ctx: ptr) { tc.set_setting(_ctx, SET_DS_MODE, "1") }
+
+// The shell command the cloud-sdk image runs.
+emulator_command(project: string, datastore: bool) -> string[] {
+    line = "gcloud beta emulators firestore start --host-port 0.0.0.0:8080 --project=${project}"
+    if datastore { line = "${line} --database-mode=datastore-mode" }
+    string[] out = []
+    out.push("/bin/sh")
+    out.push("-c")
+    out.push(line)
+    return out
+}
+
+// "NAME=host:port" for an emulator address.
+emulator_env_entry(addr: string) -> string { return "${EMULATOR_HOST_VAR}=${addr}" }
+
+builder run(image: string) with firestore_request_new -> (*FirestoreContainer, string) {
+    r = _builder
+    if r == null { r = firestore_request_new() }
+    pid = tc.req_setting(r, SET_PROJECT)
+    given = tc.req_cmd(r)
+    if given.len == 0 { tc.cmd(r, emulator_command(pid, tc.req_has_setting(r, SET_DS_MODE))) }
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run firestore: ${err}" }
+    g = heap.new(FirestoreContainer)
+    g.container = c
+    g.pid = pid
+    g.addr = ""
+    if err != "" { return g, "run firestore: ${err}" }
+    ep, eerr = tc.endpoint(c, PORT, "")
+    if eerr != "" { return g, "port endpoint: ${eerr}" }
+    g.addr = ep
+    return g, ""
+}
+
+// Terminate the container (null-safe).
+terminate(g: *FirestoreContainer) -> string {
+    if g == null { return "" }
+    return tc.terminate(g.container)
+}
+
+// The project id the emulator was started with (Go's ProjectID).
+project_id_of(g: *FirestoreContainer) -> string { return g.pid }
+
+// "host:port" of the emulator (Go's URI).
+uri(g: *FirestoreContainer) -> string { return g.addr }
+
+// The environment variable (name, value) the Google client libraries read.
+emulator_env(g: *FirestoreContainer) -> (string, string) { return EMULATOR_HOST_VAR, g.addr }

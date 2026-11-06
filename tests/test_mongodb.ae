@@ -1,0 +1,246 @@
+// Ported from testcontainers-go modules/mongodb/mongodb_test.go
+//
+// A real MongoDB, spoken to over std.tcp at the mapped port with an OP_MSG
+// `hello` command, built as BSON by hand (one tiny document): the reply must
+// say ok: 1, and for a replica set isWritablePrimary: true and setName. For
+// the authenticated cases a command that needs a login (`listDatabases`)
+// must be refused without credentials ("Unauthorized"/code 13), and the
+// in-image shell, given the credentials, must run it (Aether's std has no
+// MongoDB client, so the SCRAM handshake is left to mongosh).
+//
+// Go's table runs mongo:4/6/7 and the community and enterprise server
+// images; this runs mongo:6 and mongo:7 (what an arm64 Podman machine pulls
+// quickly and reliably).
+
+import std.spec
+import std.string
+import std.tcp
+import std.bytes
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.mongodb
+
+// OP_MSG with one kind-0 section holding {<cmd>: 1, $db: "admin"}.
+fn build_command(request_id: int, cmd: string) -> ptr {
+    // BSON: int32 size; 0x10 cmd\0 int32 1; 0x02 $db\0 int32 6 "admin\0"; 0x00
+    cl = string.length(cmd) + 1
+    elem1 = 1 + cl + 4
+    elem2 = 1 + 4 + 4 + 6
+    doc_len = 4 + elem1 + elem2 + 1
+    total = 16 + 4 + 1 + doc_len
+    b = bytes.new(total)
+    bytes.set_le32(b, 0, total)
+    bytes.set_le32(b, 4, request_id)
+    bytes.set_le32(b, 8, 0)
+    bytes.set_le32(b, 12, 2013)
+    bytes.set_le32(b, 16, 0)
+    bytes.set(b, 20, 0)
+    p = 21
+    bytes.set_le32(b, p, doc_len)
+    p = p + 4
+    bytes.set(b, p, 16)
+    p = p + 1
+    bytes.copy_from_string(b, p, cmd, cl - 1)
+    p = p + cl - 1
+    bytes.set(b, p, 0)
+    p = p + 1
+    bytes.set_le32(b, p, 1)
+    p = p + 4
+    bytes.set(b, p, 2)
+    p = p + 1
+    bytes.copy_from_string(b, p, "$db", 3)
+    p = p + 3
+    bytes.set(b, p, 0)
+    p = p + 1
+    bytes.set_le32(b, p, 6)
+    p = p + 4
+    bytes.copy_from_string(b, p, "admin", 5)
+    p = p + 5
+    bytes.set(b, p, 0)
+    p = p + 1
+    bytes.set(b, p, 0)
+    bytes.set_length(b, total)
+    return b
+}
+
+// Send an OP_MSG command and read the whole reply (it starts with its own
+// length): (reply bytes as a length-aware string, length, error).
+fn roundtrip(h: string, port: int, cmd: string) -> (string, int, string) {
+    sock, cerr = tcp.connect(h, port)
+    if cerr != "" { return "", 0, cerr }
+    b = build_command(1, cmd)
+    _, werr = tcp.write_all(sock, bytes.view(b))
+    bytes.free(b)
+    if werr != "" { tcp.tcp_close(sock); return "", 0, werr }
+    buf = ""
+    total = 0
+    want = -1
+    tries = 0
+    while tries < 200 {
+        chunk, n, rerr = tcp.read_n(sock, 65536)
+        if rerr != "" && rerr != "timeout" { tcp.tcp_close(sock); return "", 0, rerr }
+        if n > 0 {
+            if total == 0 { buf = chunk } else { buf = string.concat(buf, chunk) }
+            total = total + n
+            if total >= 4 && want < 0 {
+                want = string.char_at_n(buf, total, 0) + 256 * string.char_at_n(buf, total, 1) + 65536 * string.char_at_n(buf, total, 2)
+            }
+            if want > 0 && total >= want { tcp.tcp_close(sock); return buf, total, "" }
+        }
+        tries = tries + 1
+    }
+    tcp.tcp_close(sock)
+    return buf, total, "incomplete reply (${total} of ${want} bytes)"
+}
+
+// Find the NUL-terminated needle in the reply (bytes), returns its offset or -1.
+fn find(buf: string, len: int, needle: string) -> int {
+    nl = string.length(needle)
+    i = 0
+    while i + nl <= len {
+        j = 0
+        while j < nl && string.char_at_n(buf, len, i + j) == string.char_at_n(needle, nl, j) { j = j + 1 }
+        if j == nl { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ok: 1.0 is the double 0x3FF0000000000000 after the element name "ok\0".
+fn reply_ok(buf: string, len: int) -> bool {
+    at = find(buf, len, "ok")
+    if at < 0 { return false }
+    // type byte (0x01) before "ok", NUL after, then the little-endian double
+    if string.char_at_n(buf, len, at - 1) != 1 { return false }
+    d = at + 3
+    return string.char_at_n(buf, len, d + 6) == 240 && string.char_at_n(buf, len, d + 7) == 63
+}
+
+fn check_hello(m: *mongodb.MongoDBContainer, want_set: string) {
+    h, _ = tc.host(m.container)
+    port, perr = tc.mapped_port(m.container, mongodb.PORT)
+    spec.assert_ok(perr, "mapped port")
+    // a node that has just become primary may drop connections for a moment
+    buf, n, err = roundtrip(h, port, "hello")
+    tries = 0
+    while err != "" && tries < 10 {
+        sleep(500)
+        buf, n, err = roundtrip(h, port, "hello")
+        tries = tries + 1
+    }
+    spec.assert_ok(err, "hello over OP_MSG to ${h}:${port}")
+    if err != "" { return }
+    spec.assert_eq(string.char_at_n(buf, n, 12) + 256 * string.char_at_n(buf, n, 13), 2013, "the reply is an OP_MSG")
+    spec.assert_true(reply_ok(buf, n), "hello says ok: 1")
+    spec.assert_true(find(buf, n, "maxWireVersion") > 0, "and describes the wire versions")
+    if string.length(want_set) > 0 {
+        spec.assert_true(find(buf, n, "setName") > 0 && find(buf, n, want_set) > 0, "setName is ${want_set}")
+        spec.assert_true(find(buf, n, "isWritablePrimary") > 0, "isWritablePrimary is reported")
+    } else {
+        spec.assert_true(find(buf, n, "setName") < 0, "no replica set")
+    }
+}
+
+fn mongosh(m: *mongodb.MongoDBContainer, js: string) -> (string, string) {
+    code, out, err = tc.exec(m.container, ["sh", "-c",
+        "mongosh --username ${m.username} --password ${m.password} --quiet --eval \"${js}\""])
+    if err != "" { return "", err }
+    if code != 0 { return out, "mongosh exited ${code}: ${out}" }
+    return out, ""
+}
+
+// Two lines of Go's mount/entrypoint-tc.sh (heredocs are literal).
+const KEYFILE_LINE = <<SH
+openssl rand -base64 756 > "${MONGO_KEYFILE}"
+SH
+const LAST_LINE = <<SH
+${ENTRYPOINT} "$@"
+SH
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/mongodb") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("answers hello (TestMongoDB, From Docker Hub)") callback {
+            m, err = mongodb.run("mongo:6")
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "mongodb starts")
+            if err == "" {
+                url, uerr = mongodb.connection_string(m)
+                spec.assert_ok(uerr, "connection string")
+                spec.assert_true(string.starts_with(url, "mongodb://") == 1 && string.ends_with(url, "/") == 1, "mongodb://host:port/ : ${url}")
+                spec.assert_true(string.contains(url, "@") == 0, "no credentials by default: ${url}")
+                check_hello(m, "")
+            }
+        }
+
+        spec.it("rejects half a login (username without password)") callback {
+            m, err = mongodb.run("mongo:6") { username("tester") }
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_contains(err, "you must provide both of them", "the check")
+            spec.assert_true(m == null, "no container was started")
+        }
+
+        spec.it("creates a single-node replica set (with-replica/mongo:6)") callback {
+            m, err = mongodb.run("mongo:6") { replica_set("rs") }
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "mongodb starts")
+            if err == "" {
+                url, _ = mongodb.connection_string(m)
+                spec.assert_true(string.ends_with(url, "/?replicaSet=rs") == 1, "replicaSet in the URL: ${url}")
+                check_hello(m, "rs")
+            }
+        }
+
+        spec.it("requires a login with a username and password (with-auth/mongo:6)") callback {
+            m, err = mongodb.run("mongo:6") {
+                username("tester")
+                password("testerpass")
+            }
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "mongodb starts")
+            if err == "" {
+                url, _ = mongodb.connection_string(m)
+                spec.assert_true(string.contains(url, "mongodb://tester:testerpass@") == 1, "credentials in the URL: ${url}")
+                check_hello(m, "")
+                // an unauthenticated listDatabases is refused ...
+                code, out, eerr = tc.exec(m.container, ["mongosh", "--quiet", "--eval", "db.adminCommand({listDatabases:1}).ok"])
+                spec.assert_ok(eerr, "exec")
+                spec.assert_true(code != 0 && string.contains(out, "Unauthorized") + string.contains(out, "requires authentication") > 0, "without a login: ${out}")
+                // ... and works with the credentials
+                ok, serr = mongosh(m, "db.getSiblingDB('admin').runCommand({listDatabases:1}).ok")
+                spec.assert_ok(serr, "mongosh with the credentials")
+                spec.assert_str_eq(string.trim(ok), "1", "listDatabases works for tester")
+            }
+        }
+
+        spec.it("replica set with auth (with-auth/replica/mongo:7)") callback {
+            m, err = mongodb.run("mongo:7") {
+                replica_set("rs")
+                username("tester")
+                password("testerpass")
+            }
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "mongodb starts")
+            if err == "" {
+                url, _ = mongodb.connection_string(m)
+                spec.assert_true(string.contains(url, "tester:testerpass@") == 1 && string.ends_with(url, "?replicaSet=rs") == 1, "credentials and replica set: ${url}")
+                check_hello(m, "rs")
+                ok, serr = mongosh(m, "rs.status().ok")
+                spec.assert_ok(serr, "rs.status as tester")
+                spec.assert_str_eq(string.trim(ok), "1", "rs.status().ok")
+                code, out, _ = tc.exec(m.container, ["sh", "-c", "ls -l /tmp/mongo_keyfile"])
+                spec.assert_eq(code, 0, "the entrypoint wrapper made the key file: ${out}")
+                script, cerr = tc.copy_file_from_container(m.container, mongodb.ENTRYPOINT_PATH)
+                spec.assert_ok(cerr, "the entrypoint wrapper is in the container")
+                spec.assert_contains(script, "${KEYFILE_LINE}\n", "Go's script, braces and all")
+                spec.assert_true(string.ends_with(script, "${LAST_LINE}\n") == 1, "ending as Go's file does, with its newline")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

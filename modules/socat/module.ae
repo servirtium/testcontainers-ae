@@ -1,0 +1,112 @@
+// Ported from testcontainers-go modules/socat/socat.go, modules/socat/options.go
+//
+// modules.socat: a socat container used as a TCP proxy, exposing a port of
+// another container (reachable by name on a shared network) on a mapped port
+// of its own.
+//
+//     import modules.socat
+//
+//     c, err = socat.run(socat.DEFAULT_IMAGE) {
+//         target(8080, "helloworld")                 // socat 8080 -> helloworld:8080
+//         target_with_internal_port(9000, 80, "web") // socat 9000 -> web:80
+//         tc.with_network(n.name)
+//     }
+//     defer tc.terminate(c)
+//     url, _ = socat.target_url(c, 8080)             // "http://localhost:32771"
+//
+// Go's Target value (NewTarget, NewTargetWithInternalPort) and WithTarget
+// become the two setters above; each call adds one `socat TCP-LISTEN:...`
+// listener, joined with " & " into the `sh -c` command, and exposes the port.
+// Go keeps the targets by exposed port, so a later target on the same port
+// replaces the earlier one in the exposed ports but, as in Go, both listeners
+// stay in the command.
+//
+// Not ported: Go's Container.TargetURL returns a *url.URL; here target_url
+// returns the URL string (the container is a plain *docker.Container, the
+// mapped URLs are computed on demand). The deprecated RunContainer.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, target, target_with_internal_port, target_url,
+    DEFAULT_IMAGE, socat_request_new, socat_request_free
+)
+
+const DEFAULT_IMAGE = "alpine/socat:1.8.0.1"
+
+const SET_CMD = "socat.targets_cmd"
+const SET_PORTS = "socat.ports"
+
+socat_request_new() -> ptr {
+    r = tc.request_new()
+    tc.entrypoint(r, ["/bin/sh"])
+    return r
+}
+
+socat_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithTarget(NewTarget(exposed_port, host)): the socat container
+// listens on exposed_port and forwards to host:exposed_port. The host is
+// without a port. Calling it again adds a target.
+target(_ctx: ptr, exposed_port: int, host: string) {
+    target_with_internal_port(_ctx, exposed_port, exposed_port, host)
+}
+
+// Go's WithTarget(NewTargetWithInternalPort(exposed_port, internal_port, host)).
+// An internal_port of 0 is the exposed port.
+target_with_internal_port(_ctx: ptr, exposed_port: int, internal_port: int, host: string) {
+    if exposed_port == 0 {
+        // Go: "exposed port cannot be 0"; the setter has no error to give,
+        // so the request carries it to run.
+        tc.set_setting(_ctx, "socat.error", "exposed port cannot be 0")
+        return
+    }
+    ip = internal_port
+    if ip == 0 { ip = exposed_port }
+    one = "socat TCP-LISTEN:${exposed_port},fork,reuseaddr TCP:${host}:${ip}"
+    if !tc.req_has_setting(_ctx, SET_CMD) {
+        tc.set_setting(_ctx, SET_CMD, one)
+    } else {
+        tc.set_setting(_ctx, SET_CMD, "${tc.req_setting(_ctx, SET_CMD)} & ${one}")
+    }
+    tc.expose(_ctx, "${exposed_port}/tcp")
+    if !tc.req_has_setting(_ctx, SET_PORTS) {
+        tc.set_setting(_ctx, SET_PORTS, "${exposed_port}")
+    } else {
+        tc.set_setting(_ctx, SET_PORTS, "${tc.req_setting(_ctx, SET_PORTS)},${exposed_port}")
+    }
+}
+
+// Run a socat container (Go's socat.Run). With targets the command is
+// `/bin/sh -c "socat ... & socat ..."` and, once running, the socat binary is
+// checked (`socat -V`), as in Go; with none the image exits at once, as Go's does.
+builder run(image: string) with socat_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = socat_request_new() }
+    if tc.req_has_setting(r, "socat.error") {
+        e = tc.req_setting(r, "socat.error")
+        socat_request_free(r)
+        return null, "run socat: ${e}"
+    }
+    has_targets = tc.req_has_setting(r, SET_CMD)
+    if has_targets {
+        tc.cmd_arg(r, "-c")
+        tc.cmd_arg(r, tc.req_setting(r, SET_CMD))
+    }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run socat: ${err}" }
+    if has_targets {
+        werr = wait.until_ready(wait.for_exec(["socat", "-V"]) { with_exit_code(0) }, c)
+        if werr != "" { return c, "wait for exec: ${werr}" }
+    }
+    return c, ""
+}
+
+// "http://host:port" the exposed port of a target is mapped to (Go's
+// TargetURL, as a string). An error if the port is not a target's.
+target_url(c: *docker.Container, exposed_port: int) -> (string, string) {
+    return tc.endpoint(c, "${exposed_port}/tcp", "http")
+}

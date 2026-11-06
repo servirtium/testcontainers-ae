@@ -1,0 +1,77 @@
+// Ported from testcontainers-go modules/cratedb/cratedb.go
+//
+// modules.cratedb: a single-node CrateDB container (HTTP 4200, PostgreSQL
+// wire 5432).
+//
+//     import modules.cratedb
+//
+//     c, err = cratedb.run("crate:5.7") { heap_size("1g") }
+//     defer tc.terminate(c)
+//     url, _ = cratedb.http_endpoint(c)                       // "http://localhost:32771"
+//     dsn, _ = cratedb.pg_connection_string(c, ["sslmode=disable"])
+//
+// Not ported: nothing of the Go module's API (its tests use pgx; the test
+// here posts SQL to the HTTP endpoint).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, heap_size, http_endpoint, pg_connection_string,
+    HTTP_PORT, PG_PORT, DEFAULT_HEAP_SIZE, DEFAULT_IMAGE,
+    cratedb_request_new, cratedb_request_free
+)
+
+const HTTP_PORT = "4200/tcp"
+const PG_PORT = "5432/tcp"
+const DEFAULT_HEAP_SIZE = "512m"
+const DEFAULT_IMAGE = "crate:5.7"
+
+cratedb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.cmd(r, ["crate", "-Cdiscovery.type=single-node"])
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, PG_PORT)
+    tc.env(r, "CRATE_HEAP_SIZE", DEFAULT_HEAP_SIZE)
+    tc.wait_for(r, wait.for_all([
+        wait.for_http("/") { with_port(HTTP_PORT); with_status(200) },
+        wait.for_listening_port(PG_PORT)
+    ]))
+    return r
+}
+
+cratedb_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithHeapSize: CRATE_HEAP_SIZE ("1g", "512m").
+heap_size(_ctx: ptr, size: string) { tc.env(_ctx, "CRATE_HEAP_SIZE", size) }
+
+builder run(image: string) with cratedb_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = cratedb_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run cratedb: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" (Go's HTTPEndpoint).
+http_endpoint(c: *docker.Container) -> (string, string) {
+    ep, err = tc.endpoint(c, HTTP_PORT, "http")
+    if err != "" { return "", "http endpoint: ${err}" }
+    return ep, ""
+}
+
+// "postgres://crate@host:port/doc?a&b" (Go's PGConnectionString; args are
+// joined with &, e.g. "sslmode=disable").
+pg_connection_string(c: *docker.Container, args: string[]) -> (string, string) {
+    ep, err = tc.endpoint(c, PG_PORT, "")
+    if err != "" { return "", "mapped port: ${err}" }
+    extra = ""
+    for a in args {
+        if string.length(extra) > 0 { extra = "${extra}&" }
+        extra = "${extra}${a}"
+    }
+    if string.length(extra) > 0 { extra = "?${extra}" }
+    return "postgres://crate@${ep}/doc${extra}", ""
+}

@@ -1,0 +1,83 @@
+// Ported from testcontainers-go modules/arangodb/arangodb.go, modules/arangodb/options.go
+//
+// modules.arangodb: an ArangoDB container with a root password. The
+// password travels with the container in a struct (Go's Container.password).
+//
+//     import modules.arangodb
+//
+//     a, err = arangodb.run("arangodb:3.11.5") { root_password("secret") }
+//     defer tc.terminate(a.container)
+//     url, _ = arangodb.http_endpoint(a)       // "http://localhost:32771"
+//     user, pw = arangodb.credentials(a)       // "root", "secret"
+//
+// As in Go, the wait adds an authenticated GET /_admin/status = 200 to the
+// listening-port wait, after the caller's block, so the password it uses is
+// the effective ARANGO_ROOT_PASSWORD (also one set by tc.env in the block).
+// Not ported: nothing of the Go module's API (its tests use the ArangoDB Go
+// driver; the test here calls the HTTP API).
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    ArangoContainer, run, http_endpoint, credentials, root_password,
+    PORT, DEFAULT_USER, DEFAULT_PASSWORD, DEFAULT_IMAGE,
+    arangodb_request_new, arangodb_request_free
+)
+
+const PORT = "8529/tcp"
+const DEFAULT_USER = "root"
+const DEFAULT_PASSWORD = "root"
+const DEFAULT_IMAGE = "arangodb:3.11.5"
+const PASSWORD_ENV = "ARANGO_ROOT_PASSWORD"
+
+struct ArangoContainer {
+    container: *docker.Container
+    password: string
+}
+
+arangodb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.env(r, PASSWORD_ENV, DEFAULT_PASSWORD)
+    tc.wait_for(r, wait.for_listening_port(PORT))
+    return r
+}
+
+arangodb_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithRootPassword.
+root_password(_ctx: ptr, password: string) { tc.env(_ctx, PASSWORD_ENV, password) }
+
+builder run(image: string) with arangodb_request_new -> (*ArangoContainer, string) {
+    r = _builder
+    if r == null { r = arangodb_request_new() }
+    pw = tc.req_env(r, PASSWORD_ENV)
+    // Go's withWaitStrategy, last: ForAll(existing, authenticated status).
+    tc.additional_wait(r, wait.for_http("/_admin/status") {
+        with_port(PORT)
+        with_basic_auth(DEFAULT_USER, pw)
+        with_header("Accept", "application/json")
+        with_status(200)
+    })
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run arangodb: ${err}" }
+    a = heap.new(ArangoContainer)
+    a.container = c
+    a.password = pw
+    if err != "" { return a, "run arangodb: ${err}" }
+    return a, ""
+}
+
+// (user, password) of the root account (Go's Credentials).
+credentials(a: *ArangoContainer) -> (string, string) {
+    return DEFAULT_USER, a.password
+}
+
+// "http://host:port" (Go's HTTPEndpoint).
+http_endpoint(a: *ArangoContainer) -> (string, string) {
+    ep, err = tc.endpoint(a.container, PORT, "http")
+    if err != "" { return "", "port endpoint: ${err}" }
+    return ep, ""
+}

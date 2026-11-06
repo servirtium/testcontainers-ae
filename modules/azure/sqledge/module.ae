@@ -1,0 +1,131 @@
+// Ported from testcontainers-go modules/azure/sqledge/sqledge.go
+//
+// modules.azure.sqledge: Azure SQL Edge (SQL Server for edge/IoT, amd64/arm64).
+//
+//     import modules.azure.sqledge
+//
+//     s, err = sqledge.run("mcr.microsoft.com/azure-sql-edge:1.0.7") {
+//         accept_eula()
+//         password("Strong!Passw0rd")
+//     }
+//     defer tc.terminate(s.container)
+//     url, _ = sqledge.connection_string(s, ["encrypt=false", "TrustServerCertificate=true"])
+//     // "sqlserver://sa:Strong%21Passw0rd@localhost:32771?database=master&encrypt=false&TrustServerCertificate=true"
+//
+// The EULA is required: without accept_eula() `run` returns "EULA not
+// accepted ..." before starting anything. password("") means the default
+// password. The sa password is read back from the request's environment, so
+// what the block set is what the connection string uses (Go inspects the
+// container for it). The password in the URL is percent-encoded the way Go's
+// url.UserPassword does it.
+//
+// Status: compile-checked only (alpha; no engine was used to port it).
+//
+// Not ported: the go-mssqldb check of the connection string in Go's tests
+// (no SQL client in Aether's std).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    SQLEdgeContainer, run, connection_string, connection_string_for, escape_userinfo,
+    accept_eula, password, PORT, DEFAULT_USERNAME, DEFAULT_PASSWORD, DEFAULT_IMAGE,
+    sqledge_request_new, sqledge_request_free
+)
+
+const PORT = "1433/tcp"
+const DEFAULT_USERNAME = "sa"
+const DEFAULT_PASSWORD = "Strong!Passw0rd"
+const DEFAULT_IMAGE = "mcr.microsoft.com/azure-sql-edge:1.0.7"
+
+struct SQLEdgeContainer {
+    container: *docker.Container
+    pass: string
+}
+
+sqledge_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.env(r, "MSSQL_SA_PASSWORD", DEFAULT_PASSWORD)
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(PORT) { with_startup_timeout(120s) },
+        wait.for_log("Recovery is complete.")
+    ]))
+    return r
+}
+
+sqledge_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithAcceptEULA: ACCEPT_EULA=Y (required).
+accept_eula(_ctx: ptr) { tc.env(_ctx, "ACCEPT_EULA", "Y") }
+
+// Go's WithPassword: MSSQL_SA_PASSWORD ("" is the default password). It must
+// meet SQL Server's complexity rules.
+password(_ctx: ptr, pw: string) {
+    p = pw
+    if string.length(p) == 0 { p = DEFAULT_PASSWORD }
+    tc.env(_ctx, "MSSQL_SA_PASSWORD", p)
+}
+
+builder run(image: string) with sqledge_request_new -> (*SQLEdgeContainer, string) {
+    r = _builder
+    if r == null { r = sqledge_request_new() }
+    if string.to_upper(tc.req_env(r, "ACCEPT_EULA")) != "Y" {
+        sqledge_request_free(r)
+        return null, "run sqledge: EULA not accepted: use accept_eula() to accept the Azure SQL Edge license agreement"
+    }
+    pw = tc.req_env(r, "MSSQL_SA_PASSWORD")
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run sqledge: ${err}" }
+    s = heap.new(SQLEdgeContainer)
+    s.container = c
+    s.pass = pw
+    if err != "" { return s, "run sqledge: ${err}" }
+    return s, ""
+}
+
+fn hex_digit(n: int) -> string {
+    return string.substring("0123456789ABCDEF", n, n + 1)
+}
+
+// Percent-encode a user or password for a URL's userinfo as Go's
+// url.UserPassword does: letters, digits and - _ . ~ $ & + , ; = stay,
+// everything else (including ! @ / ? :) becomes %XX.
+escape_userinfo(s: string) -> string {
+    out = ""
+    n = string.length(s)
+    i = 0
+    while i < n {
+        ch = string.char_at(s, i)
+        keep = false
+        if ch >= 48 && ch <= 57 { keep = true }
+        if ch >= 65 && ch <= 90 { keep = true }
+        if ch >= 97 && ch <= 122 { keep = true }
+        if ch == 45 || ch == 95 || ch == 46 || ch == 126 { keep = true }
+        if ch == 36 || ch == 38 || ch == 43 || ch == 44 || ch == 59 || ch == 61 { keep = true }
+        if keep {
+            out = "${out}${string.substring(s, i, i + 1)}"
+        } else {
+            out = "${out}%${hex_digit(ch / 16)}${hex_digit(ch % 16)}"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// "sqlserver://sa:password@host:port?database=master[&arg...]".
+connection_string_for(pass: string, host_port: string, args: string[]) -> string {
+    q = "database=master"
+    for a in args { q = "${q}&${a}" }
+    return "sqlserver://${DEFAULT_USERNAME}:${escape_userinfo(pass)}@${host_port}?${q}"
+}
+
+// Go's ConnectionString: the extra query parameters (like "encrypt=false")
+// are joined with &.
+connection_string(s: *SQLEdgeContainer, args: string[]) -> (string, string) {
+    ep, err = tc.endpoint(s.container, PORT, "")
+    if err != "" { return "", "port endpoint: ${err}" }
+    return connection_string_for(s.pass, ep, args), ""
+}

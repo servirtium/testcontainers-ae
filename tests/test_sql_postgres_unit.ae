@@ -1,0 +1,517 @@
+// Ported from jackc/pgx v5.9.2 pgproto3/{frontend_test.go,backend_test.go,bind_test.go,query_test.go},
+// pgconn/{auth_scram_test.go,config_test.go}, pgtype/bytea_test.go (text cases)
+//
+// The PostgreSQL driver's pure parts, no engine: the bytes of every frontend
+// message, backend messages decoded (whole, split across reads, malformed),
+// SCRAM-SHA-256 against RFC 7677's example and pgx's cases, the MD5
+// password, connection-string parsing, parameter encoding and bytea.
+
+import std.spec
+import std.string
+import std.os
+import std.bytes
+import sql
+import sql.postgres as pgsql
+import sql.postgres.pgproto3
+import sql.postgres.pgconn
+
+fn bs(xs: int[]) -> byte[] {
+    byte[] out = []
+    for x in xs { out.push((x & 255) as byte) }
+    return out
+}
+
+fn sb(s: string) -> byte[] {
+    byte[] out = []
+    for c in string.bytes(s) { out.push(c as byte) }
+    return out
+}
+
+// "a,b,c" of the bytes, for comparing.
+fn show(b: byte[]) -> string {
+    out = ""
+    i = 0
+    for x in b {
+        if i > 0 { out = "${out}," }
+        out = "${out}${x as int}"
+        i = i + 1
+    }
+    return out
+}
+
+fn cat(a: byte[], b: byte[]) -> byte[] {
+    byte[] out = []
+    for x in a { out.push(x) }
+    for x in b { out.push(x) }
+    return out
+}
+
+fn decode_one(raw: byte[]) -> (*pgproto3.Msg, string) {
+    d = pgproto3.new_decoder()
+    pgproto3.feed(d, raw)
+    return pgproto3.next_message(d)
+}
+
+fn clear_pg_env() {
+    for n in ["PGHOST", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSWORD", "PGPASSFILE",
+              "PGAPPNAME", "PGCONNECT_TIMEOUT", "PGSSLMODE", "PGSSLKEY", "PGSSLCERT",
+              "PGSSLSNI", "PGSSLROOTCERT", "PGSSLPASSWORD", "PGSSLNEGOTIATION",
+              "PGTARGETSESSIONATTRS", "PGSERVICE", "PGSERVICEFILE", "PGTZ", "PGOPTIONS",
+              "PGMINPROTOCOLVERSION", "PGMAXPROTOCOLVERSION"] {
+        os.unsetenv(n)
+    }
+}
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "pgproto3: frontend messages, byte for byte") {
+        spec.it("StartupMessage: length, protocol 3.0, NUL-separated pairs, a final NUL") callback {
+            w = pgproto3.new_buf()
+            spec.assert_ok(pgproto3.startup_message(w, ["user", "jack", "database", "db"]), "encode")
+            want = cat(bs([0, 0, 0, 31, 0, 3, 0, 0]), cat(sb("user"), cat(bs([0]), cat(sb("jack"), cat(bs([0]), cat(sb("database"), cat(bs([0]), cat(sb("db"), bs([0, 0])))))))))
+            spec.assert_str_eq(show(pgproto3.buf_bytes(w)), show(want), "the bytes")
+        }
+        spec.it("SSLRequest is 8 bytes: length and 80877103") callback {
+            w = pgproto3.new_buf()
+            pgproto3.ssl_request(w)
+            spec.assert_str_eq(show(pgproto3.buf_bytes(w)), "0,0,0,8,4,210,22,47", "the bytes")
+        }
+        spec.it("PasswordMessage, Query, Sync, Terminate, Flush") callback {
+            w = pgproto3.new_buf()
+            pgproto3.password_message(w, "pw")
+            spec.assert_str_eq(show(pgproto3.buf_bytes(w)), "112,0,0,0,7,112,119,0", "p len 7 'pw' NUL")
+            pgproto3.buf_reset(w)
+            pgproto3.query(w, "SELECT 1")
+            spec.assert_str_eq(show(pgproto3.buf_bytes(w)), show(cat(bs([81, 0, 0, 0, 13]), cat(sb("SELECT 1"), bs([0])))), "Q")
+            pgproto3.buf_reset(w)
+            pgproto3.sync(w)
+            pgproto3.terminate(w)
+            pgproto3.flush(w)
+            spec.assert_str_eq(show(pgproto3.buf_bytes(w)), "83,0,0,0,4,88,0,0,0,4,72,0,0,0,4", "S, X, H with no body")
+        }
+        spec.it("SASLInitialResponse and SASLResponse") callback {
+            w = pgproto3.new_buf()
+            pgproto3.sasl_initial_response(w, "SCRAM-SHA-256", "n,,n=,r=abc")
+            want = cat(bs([112, 0, 0, 0, 33]), cat(sb("SCRAM-SHA-256"), cat(bs([0, 0, 0, 0, 11]), sb("n,,n=,r=abc"))))
+            spec.assert_str_eq(show(pgproto3.buf_bytes(w)), show(want), "mechanism NUL, int32 length, data")
+            pgproto3.buf_reset(w)
+            pgproto3.sasl_response(w, "c=biws")
+            spec.assert_str_eq(show(pgproto3.buf_bytes(w)), show(cat(bs([112, 0, 0, 0, 10]), sb("c=biws"))), "just the data")
+        }
+        spec.it("Parse, Bind (text, a NULL), Describe portal, Execute") callback {
+            w = pgproto3.new_buf()
+            let oids: long[] = []
+            pgproto3.parse(w, "", "SELECT $1", oids)
+            spec.assert_str_eq(show(pgproto3.buf_bytes(w)), show(cat(bs([80, 0, 0, 0, 17, 0]), cat(sb("SELECT $1"), bs([0, 0, 0])))), "P: name, query, 0 types")
+            pgproto3.buf_reset(w)
+            pgproto3.bind(w, "", "s1", ["ab", "", "x"], [false, true, false])
+            spec.assert_str_eq(show(pgproto3.buf_bytes(w)), "66,0,0,0,29,0,115,49,0,0,0,0,3,0,0,0,2,97,98,255,255,255,255,0,0,0,1,120,0,0", "B: portal, stmt, 0 formats, 3 values (NULL is -1), 0 result formats")
+            pgproto3.buf_reset(w)
+            pgproto3.describe(w, 80, "")
+            pgproto3.execute(w, "", 0)
+            spec.assert_str_eq(show(pgproto3.buf_bytes(w)), "68,0,0,0,6,80,0,69,0,0,0,9,0,0,0,0,0", "D 'P' and E with max rows 0")
+        }
+        spec.it("refuses a Bind with more than 65535 parameters (TestBindBiggerThanMaxMessageBodyLen's limit)") callback {
+            string[] vals = []
+            i = 0
+            while i < 65536 {
+                vals.push("")
+                i = i + 1
+            }
+            w = pgproto3.new_buf()
+            bool[] nulls = []
+            spec.assert_err_contains(pgproto3.bind(w, "", "", vals, nulls), "too many parameters", "the count is a uint16")
+        }
+    }
+
+    spec.describe(fw, "pgproto3: backend messages decoded") {
+        spec.it("ErrorResponse, every field (TestErrorResponse)") callback {
+            raw = cat(bs([69, 0, 0, 0, 102]), cat(bs([83]), cat(sb("ERROR"), cat(bs([0, 86]), cat(sb("ERROR"), cat(bs([0, 67]), cat(sb("42703"), cat(bs([0, 77]), cat(sb("column \"foo\" does not exist"), cat(bs([0, 80, 56, 0, 70]), cat(sb("parse_relation.c"), cat(bs([0, 76]), cat(sb("3513"), cat(bs([0, 82]), cat(sb("errorMissingColumn"), bs([0, 0]))))))))))))))))
+            m, err = decode_one(raw)
+            spec.assert_ok(err, "decodes")
+            spec.assert_eq(m.kind, 69, "E")
+            spec.assert_str_eq(m.severity, "ERROR", "S")
+            spec.assert_str_eq(m.severity_unlocalized, "ERROR", "V")
+            spec.assert_str_eq(m.code, "42703", "C")
+            spec.assert_str_eq(m.text, "column \"foo\" does not exist", "M")
+            spec.assert_eq(m.position, 8, "P")
+            spec.assert_str_eq(m.file, "parse_relation.c", "F")
+            spec.assert_eq(m.line, 3513, "L")
+            spec.assert_str_eq(m.routine, "errorMissingColumn", "R")
+            e = pgconn.pg_error_from(m)
+            spec.assert_str_eq(pgconn.pg_error_string(e), "ERROR: column \"foo\" does not exist (SQLSTATE 42703) position=8", "PgError.Error() plus the position")
+            spec.assert_str_eq(sql.sqlstate(pgconn.pg_error_string(e)), "42703", "sql.sqlstate reads it back")
+        }
+        spec.it("a message split across reads, even in its header (TestFrontendReceiveInterrupted)") callback {
+            d = pgproto3.new_decoder()
+            pgproto3.feed(d, bs([90, 0, 0, 0, 5]))
+            m1, e1 = pgproto3.next_message(d)
+            spec.assert_ok(e1, "no error yet")
+            spec.assert_true(m1 == null, "no message yet")
+            pgproto3.feed(d, bs([73]))
+            m2, e2 = pgproto3.next_message(d)
+            spec.assert_ok(e2, "whole now")
+            spec.assert_eq(m2.kind, 90, "ReadyForQuery")
+            spec.assert_eq(m2.tx_status, 73, "idle")
+            d2 = pgproto3.new_decoder()
+            pgproto3.feed(d2, bs([67, 0]))
+            m3, _ = pgproto3.next_message(d2)
+            spec.assert_true(m3 == null, "two bytes of a header")
+            pgproto3.feed(d2, cat(bs([0, 0, 13]), cat(sb("SELECT 1"), bs([0]))))
+            m4, e4 = pgproto3.next_message(d2)
+            spec.assert_ok(e4, "CommandComplete")
+            spec.assert_str_eq(m4.tag, "SELECT 1", "its tag")
+            spec.assert_eq_long(pgconn.rows_affected(m4.tag), 1, "RowsAffected")
+        }
+        spec.it("refuses a body longer than the maximum (TestFrontendReceiveExceededMaxBodyLen)") callback {
+            d = pgproto3.new_decoder()
+            pgproto3.set_max_body_len(d, 5)
+            pgproto3.feed(d, bs([68, 0, 0, 10, 10]))
+            _, err = pgproto3.next_message(d)
+            spec.assert_err_contains(err, "invalid body length: expected at most 5, but got 2566", "pgx's error")
+            _, e2 = decode_one(bs([90, 0, 0, 0, 3]))
+            spec.assert_err_contains(e2, "invalid message length: 3", "a length below 4")
+            _, e3 = decode_one(bs([68, 0, 0, 0, 10, 0, 1, 255, 255, 255, 254]))
+            spec.assert_err_contains(e3, "DataRow body is invalid", "a negative length other than -1")
+            _, e4 = decode_one(bs([71, 0, 0, 0, 4]))
+            spec.assert_err_contains(e4, "COPY protocol is not supported", "CopyInResponse")
+            _, e5 = decode_one(bs([126, 0, 0, 0, 4]))
+            spec.assert_err_contains(e5, "unknown message type: ~", "an unknown type")
+        }
+        spec.it("round-trips RowDescription and a DataRow with NULLs") callback {
+            w = pgproto3.new_buf()
+            let fields: pgproto3.FieldDescription[] = []
+            fields.push(pgproto3.new_field("id", 23))
+            fields.push(pgproto3.new_field("name", 25))
+            fields.push(pgproto3.new_field("data", 17))
+            pgproto3.row_description(w, fields)
+            pgproto3.data_row(w, ["1", "", "\\x00ff"], [false, true, false])
+            pgproto3.command_complete(w, "SELECT 1")
+            pgproto3.ready_for_query(w, 84)
+            d = pgproto3.new_decoder()
+            pgproto3.feed(d, pgproto3.buf_bytes(w))
+            t, e1 = pgproto3.next_message(d)
+            spec.assert_ok(e1, "T")
+            spec.assert_eq(t.fields.len, 3, "three fields")
+            spec.assert_str_eq(t.fields[1].name, "name", "a name")
+            spec.assert_eq_long(t.fields[2].data_type_oid, 17, "bytea's OID")
+            spec.assert_eq(t.fields[0].data_type_size, -1, "a negative int16 decoded")
+            spec.assert_eq_long(t.fields[0].type_modifier, -1, "a negative int32 decoded")
+            r, e2 = pgproto3.next_message(d)
+            spec.assert_ok(e2, "D")
+            spec.assert_str_eq(r.values[0], "1", "a value")
+            spec.assert_true(r.nulls[1], "a NULL (length -1)")
+            spec.assert_false(r.nulls[2], "not NULL")
+            c, _ = pgproto3.next_message(d)
+            spec.assert_str_eq(c.tag, "SELECT 1", "C")
+            z, _ = pgproto3.next_message(d)
+            spec.assert_eq(z.tx_status, 84, "Z in a transaction")
+            last, _ = pgproto3.next_message(d)
+            spec.assert_true(last == null, "nothing more")
+        }
+        spec.it("decodes the authentication requests and the startup chatter") callback {
+            w = pgproto3.new_buf()
+            pgproto3.authentication_ok(w)
+            pgproto3.authentication_md5_password(w, bs([1, 2, 3, 4]))
+            pgproto3.authentication_sasl(w, ["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"])
+            pgproto3.authentication_sasl_continue(w, "r=abc,s=c2FsdA==,i=4096")
+            pgproto3.authentication_sasl_final(w, "v=xyz")
+            pgproto3.parameter_status(w, "server_version", "16.4")
+            pgproto3.backend_key_data(w, 1234, 5678)
+            d = pgproto3.new_decoder()
+            pgproto3.feed(d, pgproto3.buf_bytes(w))
+            ok, _ = pgproto3.next_message(d)
+            spec.assert_eq(ok.auth_type, pgproto3.AUTH_OK, "AuthenticationOk")
+            md, _ = pgproto3.next_message(d)
+            spec.assert_eq(md.auth_type, pgproto3.AUTH_MD5_PASSWORD, "MD5")
+            spec.assert_str_eq(show(md.salt), "1,2,3,4", "its salt")
+            sa, _ = pgproto3.next_message(d)
+            spec.assert_eq(sa.mechanisms.len, 2, "two mechanisms")
+            spec.assert_str_eq(sa.mechanisms[1], "SCRAM-SHA-256", "in order")
+            sc, _ = pgproto3.next_message(d)
+            spec.assert_str_eq(sc.data, "r=abc,s=c2FsdA==,i=4096", "SASLContinue data")
+            sf, _ = pgproto3.next_message(d)
+            spec.assert_eq(sf.auth_type, pgproto3.AUTH_SASL_FINAL, "SASLFinal")
+            spec.assert_str_eq(sf.data, "v=xyz", "its data")
+            ps, _ = pgproto3.next_message(d)
+            spec.assert_str_eq(ps.name, "server_version", "ParameterStatus name")
+            spec.assert_str_eq(ps.value, "16.4", "and value")
+            k, _ = pgproto3.next_message(d)
+            spec.assert_eq_long(k.pid, 1234, "BackendKeyData pid")
+            spec.assert_eq(k.secret_key.len, 4, "a 4-byte key")
+            _, gerr = decode_one(bs([82, 0, 0, 0, 8, 0, 0, 0, 7]))
+            spec.assert_err_contains(gerr, "GSS authentication is not supported", "GSS")
+        }
+    }
+
+    spec.describe(fw, "pgconn: SCRAM-SHA-256") {
+        spec.it("computes RFC 7677's example (user, pencil)") callback {
+            sc, err = pgconn.new_scram_client([pgconn.SCRAM_SHA_256], "pencil")
+            spec.assert_ok(err, "client")
+            pgconn.scram_set_nonce(sc, "rOprNGfwEbeRWgbNEkqO")
+            pgconn.scram_set_username(sc, "user")
+            spec.assert_str_eq(pgconn.scram_client_first_message(sc), "n,,n=user,r=rOprNGfwEbeRWgbNEkqO", "client-first-message")
+            spec.assert_ok(pgconn.scram_recv_server_first_message(sc, "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"), "server-first-message")
+            spec.assert_str_eq(pgconn.scram_client_final_message(sc), "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=", "client-final-message and its proof")
+            spec.assert_ok(pgconn.scram_recv_server_final_message(sc, "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="), "the server's signature verifies")
+            spec.assert_err_contains(pgconn.scram_recv_server_final_message(sc, "v=AAAATRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="), "invalid SCRAM ServerSignature", "a wrong one does not")
+        }
+        spec.it("makes a fresh 24-character nonce and sends n,, (TestScramClientFirstMessage)") callback {
+            a, _ = pgconn.new_scram_client([pgconn.SCRAM_SHA_256], "secret")
+            b, _ = pgconn.new_scram_client([pgconn.SCRAM_SHA_256], "secret")
+            fa = pgconn.scram_client_first_message(a)
+            fb = pgconn.scram_client_first_message(b)
+            spec.assert_true(string.starts_with(fa, "n,,n=,r=") == 1, "GS2 header, empty user")
+            spec.assert_eq(string.length(fa), 32, "8 + 24 nonce characters (18 random bytes, base64)")
+            spec.assert_true(fa != fb, "a new nonce each time")
+        }
+        spec.it("refuses a server without SCRAM-SHA-256 (TestScramClientMechanismValidation)") callback {
+            _, e1 = pgconn.new_scram_client([pgconn.SCRAM_SHA_256_PLUS, pgconn.SCRAM_SHA_256], "password")
+            spec.assert_ok(e1, "both offered")
+            _, e2 = pgconn.new_scram_client(["MD5"], "password")
+            spec.assert_err_contains(e2, "server does not support SCRAM-SHA-256", "only MD5")
+        }
+        spec.it("checks the server-first-message (TestScramClientRecvServerFirstMessage)") callback {
+            sc, _ = pgconn.new_scram_client([pgconn.SCRAM_SHA_256], "secret")
+            pgconn.scram_set_nonce(sc, "testnonce")
+            salt = "dGVzdHNhbHQ="
+            spec.assert_ok(pgconn.scram_recv_server_first_message(sc, "r=testnonceservernonce,s=${salt},i=4096"), "valid")
+            spec.assert_str_eq(sc.client_and_server_nonce, "testnonceservernonce", "the nonce")
+            spec.assert_str_eq(bytes.string_from_slice(sc.salt), "testsalt", "the salt, decoded")
+            spec.assert_eq(sc.iterations, 4096, "the iterations")
+            spec.assert_err_contains(pgconn.scram_recv_server_first_message(sc, "s=${salt},i=4096"), "did not include r=", "no nonce")
+            spec.assert_err_contains(pgconn.scram_recv_server_first_message(sc, "r=testnonceservernonce,i=4096"), "did not include s=", "no salt")
+            spec.assert_err_contains(pgconn.scram_recv_server_first_message(sc, "r=testnonceservernonce,s=${salt}"), "did not include i=", "no iterations")
+            spec.assert_err_contains(pgconn.scram_recv_server_first_message(sc, "r=testnonceservernonce,s=%%%invalid,i=4096"), "invalid SCRAM salt", "bad base64")
+            spec.assert_err_contains(pgconn.scram_recv_server_first_message(sc, "r=testnonceservernonce,s=${salt},i=notanumber"), "invalid SCRAM iteration count", "not a number")
+            spec.assert_err_contains(pgconn.scram_recv_server_first_message(sc, "r=testnonceservernonce,s=${salt},i=0"), "invalid SCRAM iteration count", "zero")
+            spec.assert_err_contains(pgconn.scram_recv_server_first_message(sc, "r=wrongnonce,s=${salt},i=4096"), "did not start with client nonce", "someone else's nonce")
+            spec.assert_err_contains(pgconn.scram_recv_server_first_message(sc, "r=testnonce,s=${salt},i=4096"), "did not include server nonce", "no server part")
+        }
+        spec.it("binds no channel (c=biws) and checks the server-final-message (TestScramClientFinalMessage, TestScramClientRecvServerFinalMessage)") callback {
+            sc, _ = pgconn.new_scram_client([pgconn.SCRAM_SHA_256], "secret")
+            pgconn.scram_set_nonce(sc, "testnonce")
+            pgconn.scram_client_first_message(sc)
+            pgconn.scram_recv_server_first_message(sc, "r=testnonceservernonce,s=dGVzdHNhbHQ=,i=4096")
+            fin = pgconn.scram_client_final_message(sc)
+            spec.assert_true(string.starts_with(fin, "c=biws,r=testnonceservernonce,p=") == 1, "c is base64 of n,,")
+            sig = pgconn.scram_compute_server_signature(sc)
+            spec.assert_ok(pgconn.scram_recv_server_final_message(sc, "v=${sig}"), "valid")
+            spec.assert_err_contains(pgconn.scram_recv_server_final_message(sc, "e=some-error"), "invalid SCRAM server-final-message", "no v=")
+            spec.assert_err_contains(pgconn.scram_recv_server_final_message(sc, "v=d3Jvbmc="), "invalid SCRAM ServerSignature", "wrong")
+        }
+    }
+
+    spec.describe(fw, "pgconn: MD5") {
+        spec.it("hashes md5(md5(password + user) + salt)") callback {
+            spec.assert_str_eq(pgconn.hex_md5("postgrespostgres"), "3175bce1d3201d16594cebf9d7eb3f9d", "the stored form for postgres/postgres")
+            spec.assert_str_eq(pgconn.md5_password("postgres", "postgres", bs([1, 2, 3, 4])), "md568be9ed08db75f318087ab337aaea044", "the password message")
+        }
+    }
+
+    spec.describe(fw, "pgconn: ParseConfig (config_test.go)") {
+        clear_pg_env()
+        os.setenv("USER", "tcaeuser")
+        dh = pgconn.default_host()
+
+        spec.it("database url everything") callback {
+            c, err = pgconn.parse_config("postgres://jack:secret@localhost:5432/mydb?sslmode=disable&application_name=pgxtest&search_path=myschema&connect_timeout=5")
+            spec.assert_ok(err, "parses")
+            spec.assert_str_eq(c.user, "jack", "user")
+            spec.assert_str_eq(c.password, "secret", "password")
+            spec.assert_str_eq(c.host, "localhost", "host")
+            spec.assert_eq(c.port, 5432, "port")
+            spec.assert_str_eq(c.database, "mydb", "database")
+            spec.assert_true(c.tls == null, "no TLS")
+            spec.assert_eq_long(c.connect_timeout_ms, 5000, "5s")
+            spec.assert_str_eq(pgconn.runtime_param(c, "application_name"), "pgxtest", "a run-time parameter")
+            spec.assert_str_eq(pgconn.runtime_param(c, "search_path"), "myschema", "another")
+            spec.assert_eq(c.runtime_params.len, 4, "only those two")
+        }
+        spec.it("database url missing user and password, dbname, postgresql scheme, IPv6") callback {
+            c1, _ = pgconn.parse_config("postgres://localhost:5432/mydb?sslmode=disable")
+            spec.assert_str_eq(c1.user, "tcaeuser", "the OS user")
+            spec.assert_str_eq(c1.password, "", "no password")
+            c2, _ = pgconn.parse_config("postgres://localhost/?dbname=foo&sslmode=disable")
+            spec.assert_str_eq(c2.database, "foo", "dbname in the query")
+            spec.assert_eq(c2.port, 5432, "the default port")
+            c3, _ = pgconn.parse_config("postgresql://jack@[2001:db8::1]:5433/mydb?sslmode=disable")
+            spec.assert_str_eq(c3.host, "2001:db8::1", "IPv6 unbracketed")
+            spec.assert_eq(c3.port, 5433, "with its port")
+            c4, _ = pgconn.parse_config("postgresql://jack@[2001:db8::1]/mydb?sslmode=disable")
+            spec.assert_eq(c4.port, 5432, "IPv6 without a port")
+            c5, _ = pgconn.parse_config("postgres:///foo?host=/tmp")
+            spec.assert_str_eq(c5.host, "/tmp", "a Unix socket directory")
+            spec.assert_true(c5.tls == null, "no TLS over a Unix socket")
+            n, a = pgconn.network_address("/tmp", 5432)
+            spec.assert_str_eq("${n} ${a}", "unix /tmp/.s.PGSQL.5432", "its address")
+            c6, _ = pgconn.parse_config("postgres://jack:secret@:1/mydb?sslmode=disable")
+            spec.assert_str_eq(c6.host, dh, "no host but a port: the default host")
+            c7, _ = pgconn.parse_config("postgres://us%40er:p%2Bw+d@localhost/db%20x?sslmode=disable")
+            spec.assert_str_eq(c7.user, "us@er", "percent-decoded user")
+            spec.assert_str_eq(c7.password, "p+w+d", "'+' stays '+' outside the query")
+            spec.assert_str_eq(c7.database, "db x", "percent-decoded path")
+        }
+        spec.it("Key/value: everything, escapes, quotes, spaces") callback {
+            c1, e1 = pgconn.parse_config("user=jack password=secret host=localhost port=5432 dbname=mydb sslmode=disable application_name=pgxtest search_path=myschema connect_timeout=5")
+            spec.assert_ok(e1, "parses")
+            spec.assert_str_eq(c1.database, "mydb", "dbname")
+            spec.assert_eq_long(c1.connect_timeout_ms, 5000, "timeout")
+            c2, _ = pgconn.parse_config("user=jack\\'s password=secret host=localhost port=5432 dbname=mydb sslmode=disable")
+            spec.assert_str_eq(c2.user, "jack's", "escaped single quote")
+            c3, _ = pgconn.parse_config("user=jack password=sooper\\\\secret host=localhost port=5432 dbname=mydb sslmode=disable")
+            spec.assert_str_eq(c3.password, "sooper\\secret", "escaped backslash")
+            c4, _ = pgconn.parse_config("user='jack\\'s' host='localhost' dbname='mydb' sslmode='disable'")
+            spec.assert_str_eq(c4.user, "jack's", "quoted with an escaped quote")
+            c5, e5 = pgconn.parse_config("user = 'jack' password = '' host = 'localhost' dbname = 'mydb' sslmode='disable'")
+            spec.assert_ok(e5, "spaces round =")
+            spec.assert_str_eq(c5.user, "jack", "user")
+            spec.assert_str_eq(c5.password, "", "empty quoted password")
+            c6, _ = pgconn.parse_config("host=localhost dbname=test user=")
+            spec.assert_str_eq(c6.user, "tcaeuser", "an empty user is the default user")
+            _, e7 = pgconn.parse_config("user='jack")
+            spec.assert_err_contains(e7, "unterminated quoted string in connection info string", "unterminated")
+            _, e8 = pgconn.parse_config("nonsense")
+            spec.assert_err_contains(e8, "failed to parse as keyword/value (invalid keyword/value)", "no =")
+        }
+        spec.it("several hosts and ports, URL and key/value") callback {
+            c1, _ = pgconn.parse_config("postgres://jack:secret@foo,bar,baz/mydb?sslmode=disable")
+            spec.assert_str_eq(c1.host, "foo", "the first host")
+            spec.assert_eq(pgconn.fallback_count(c1), 2, "two fallbacks")
+            spec.assert_str_eq(pgconn.fallback_at(c1, 1).host, "baz", "in order")
+            spec.assert_eq(pgconn.fallback_at(c1, 1).port, 5432, "the default port")
+            c2, _ = pgconn.parse_config("postgres://jack:secret@foo:1,bar:2,baz:3/mydb?sslmode=disable")
+            spec.assert_eq(c2.port, 1, "port 1")
+            spec.assert_eq(pgconn.fallback_at(c2, 0).port, 2, "port 2")
+            spec.assert_eq(pgconn.fallback_at(c2, 1).port, 3, "port 3")
+            c3, _ = pgconn.parse_config("user=jack password=secret host=foo,bar,baz port=1,2,3 dbname=mydb sslmode=disable")
+            spec.assert_str_eq(pgconn.fallback_at(c3, 0).host, "bar", "key/value hosts")
+            spec.assert_eq(pgconn.fallback_at(c3, 1).port, 3, "key/value ports")
+        }
+        spec.it("sslmode: disable, allow, prefer, require, verify-ca, verify-full, and TLS fallbacks per host") callback {
+            c0, _ = pgconn.parse_config("postgres://jack:secret@localhost:5432/mydb")
+            spec.assert_true(c0.tls != null, "prefer by default: TLS first")
+            spec.assert_true(c0.tls.insecure_skip_verify, "unverified, as libpq")
+            spec.assert_eq(pgconn.fallback_count(c0), 1, "then plain")
+            spec.assert_true(pgconn.fallback_at(c0, 0).tls == null, "the plain fallback")
+            c1, _ = pgconn.parse_config("postgres://jack:secret@localhost:5432/mydb?sslmode=allow")
+            spec.assert_true(c1.tls == null, "allow: plain first")
+            spec.assert_true(pgconn.fallback_at(c1, 0).tls != null, "then TLS")
+            c2, _ = pgconn.parse_config("postgres://jack:secret@localhost:5432/mydb?sslmode=require")
+            spec.assert_true(c2.tls.insecure_skip_verify, "require: no verification")
+            spec.assert_eq(pgconn.fallback_count(c2), 0, "and no fallback")
+            spec.assert_str_eq(c2.tls.server_name, "localhost", "SNI is set by default")
+            c3, _ = pgconn.parse_config("postgres://jack:secret@localhost:5432/mydb?sslmode=verify-ca")
+            spec.assert_true(c3.tls.verify_ca, "verify-ca: the chain only")
+            c4, _ = pgconn.parse_config("postgres://jack:secret@localhost:5432/mydb?sslmode=verify-full")
+            spec.assert_false(c4.tls.insecure_skip_verify, "verify-full verifies")
+            spec.assert_str_eq(c4.tls.server_name, "localhost", "the host name")
+            c5, _ = pgconn.parse_config("postgres://jack:secret@1.1.1.1:5432/mydb?sslmode=require")
+            spec.assert_str_eq(c5.tls.server_name, "", "SNI is not set for IPv4")
+            c6, _ = pgconn.parse_config("postgres://jack:secret@sni.test:5432/mydb?sslmode=require&sslsni=0")
+            spec.assert_str_eq(c6.tls.server_name, "", "SNI can be disabled")
+            c7, _ = pgconn.parse_config("user=jack password=secret host=foo,bar,baz dbname=mydb sslmode=prefer")
+            spec.assert_eq(pgconn.fallback_count(c7), 5, "multiple hosts and fallback tls: 6 configs")
+            spec.assert_str_eq(pgconn.fallback_at(c7, 1).host, "bar", "bar with TLS")
+            spec.assert_true(pgconn.fallback_at(c7, 1).tls != null, "TLS")
+            spec.assert_str_eq(pgconn.fallback_at(c7, 1).tls.server_name, "bar", "its own name")
+            spec.assert_true(pgconn.fallback_at(c7, 2).tls == null, "then bar plain")
+            c8, _ = pgconn.parse_config("postgres://localhost/test?sslrootcert=system")
+            spec.assert_str_eq(c8.tls.server_name, "localhost", "sslrootcert=system is verify-full")
+            spec.assert_eq(pgconn.fallback_count(c8), 0, "no fallback")
+            _, e9 = pgconn.parse_config("postgres://localhost/test?sslmode=bogus")
+            spec.assert_err_contains(e9, "failed to configure TLS (sslmode is invalid)", "a bad sslmode")
+            _, e10 = pgconn.parse_config("postgres://localhost/test?sslcert=/x.crt")
+            spec.assert_err_contains(e10, "both \"sslcert\" and \"sslkey\" are required", "half a pair")
+            _, e11 = pgconn.parse_config("postgres://localhost/test?sslrootcert=/no/such/ca.pem")
+            spec.assert_err_contains(e11, "unable to read CA file", "a missing CA file")
+        }
+        spec.it("target_session_attrs, protocol versions, channel_binding") callback {
+            for v in ["read-write", "read-only", "primary", "standby", "prefer-standby", "any"] {
+                c, err = pgconn.parse_config("postgres://jack:secret@localhost:5432/mydb?sslmode=disable&target_session_attrs=${v}")
+                spec.assert_ok(err, v)
+                spec.assert_str_eq(c.target_session_attrs, v, "kept")
+            }
+            c0, _ = pgconn.parse_config("postgres://localhost/test")
+            spec.assert_str_eq(c0.target_session_attrs, "any", "not set: any")
+            spec.assert_str_eq(c0.min_protocol_version, "3.0", "defaults to 3.0")
+            spec.assert_str_eq(c0.max_protocol_version, "3.0", "max too")
+            c1, _ = pgconn.parse_config("postgres://localhost/test?min_protocol_version=latest")
+            spec.assert_str_eq(c1.max_protocol_version, "latest", "min latest auto-raises max")
+            _, e2 = pgconn.parse_config("postgres://localhost/test?min_protocol_version=2.0")
+            spec.assert_err_contains(e2, "invalid min_protocol_version", "invalid min")
+            _, e3 = pgconn.parse_config("postgres://localhost/test?min_protocol_version=3.2&max_protocol_version=3.0")
+            spec.assert_err_contains(e3, "min_protocol_version cannot be greater than max_protocol_version", "min > max")
+            c4, _ = pgconn.parse_config("postgres://localhost/test")
+            spec.assert_str_eq(c4.channel_binding, "prefer", "defaults to prefer")
+            c5, _ = pgconn.parse_config("postgres://localhost/test?channel_binding=disable")
+            spec.assert_str_eq(c5.channel_binding, "disable", "disable")
+            _, e6 = pgconn.parse_config("postgres://localhost/test?channel_binding=invalid")
+            spec.assert_err_contains(e6, "unknown channel_binding value: invalid", "invalid")
+            _, e7 = pgconn.parse_config("postgres://localhost/test?target_session_attrs=bogus")
+            spec.assert_err_contains(e7, "unknown target_session_attrs value: bogus", "invalid")
+        }
+        spec.it("reads the PG* environment, and the string wins") callback {
+            os.setenv("PGHOST", "envhost")
+            os.setenv("PGPORT", "7777")
+            os.setenv("PGDATABASE", "envdb")
+            os.setenv("PGUSER", "envuser")
+            os.setenv("PGPASSWORD", "envpw")
+            os.setenv("PGAPPNAME", "envapp")
+            os.setenv("PGSSLMODE", "disable")
+            c1, _ = pgconn.parse_config("")
+            spec.assert_str_eq("${c1.host} ${c1.port} ${c1.database} ${c1.user} ${c1.password}", "envhost 7777 envdb envuser envpw", "every field from the environment")
+            spec.assert_str_eq(pgconn.runtime_param(c1, "application_name"), "envapp", "PGAPPNAME")
+            spec.assert_true(c1.tls == null, "PGSSLMODE")
+            c2, _ = pgconn.parse_config("postgres://other:5432/db?sslmode=disable")
+            spec.assert_str_eq(c2.host, "other", "the connection string wins")
+            spec.assert_str_eq(c2.user, "envuser", "the environment fills the rest")
+            clear_pg_env()
+        }
+        spec.it("redacts the password in parse errors") callback {
+            spec.assert_str_eq(pgconn.redact_pw("postgres://jack:secret@localhost/db"), "postgres://jack:xxxxx@localhost/db", "URL")
+            spec.assert_str_eq(pgconn.redact_pw("user=jack password=secret host=x"), "user=jack password=xxxxx host=x", "key/value")
+            spec.assert_str_eq(pgconn.redact_pw("user=jack password='se cret' host=x"), "user=jack password=xxxxx host=x", "quoted")
+            _, err = pgconn.parse_config("postgres://jack:secret@localhost:99999/db")
+            spec.assert_err_contains(err, "cannot parse `postgres://jack:xxxxx@localhost:99999/db`: invalid port (outside range)", "Go's error, redacted")
+        }
+    }
+
+    spec.describe(fw, "sql.postgres: parameters and bytea (pgtype text format)") {
+        spec.it("encodes each kind of value as text, NULL as null") callback {
+            t, n = pgsql.encode_value(sql.text("it's 'quoted'"))
+            spec.assert_str_eq(t, "it's 'quoted'", "text goes as it is: bound, never spliced into SQL")
+            spec.assert_false(n, "not null")
+            _, n2 = pgsql.encode_value(sql.null_value())
+            spec.assert_true(n2, "NULL")
+            b, _ = pgsql.encode_value(sql.blob(bs([0, 1, 254, 255])))
+            spec.assert_str_eq(b, "\\x0001feff", "bytea hex input")
+            tb, _ = pgsql.encode_value(sql.boolean(true))
+            fb, _ = pgsql.encode_value(sql.boolean(false))
+            spec.assert_str_eq("${tb}${fb}", "tf", "bool")
+            i, _ = pgsql.encode_value(sql.int64(-9223372036854775807))
+            spec.assert_str_eq(i, "-9223372036854775807", "int8 range")
+            f, _ = pgsql.encode_value(sql.float64(0.1))
+            spec.assert_str_eq(f, "0.10000000000000001", "%.17g: reads back exactly")
+            w = pgproto3.new_buf()
+            vals = ["a'b", ""]
+            nulls = [false, true]
+            pgproto3.bind(w, "", "", vals, nulls)
+            spec.assert_str_eq(show(pgproto3.buf_bytes(w)), "66,0,0,0,23,0,0,0,0,0,2,0,0,0,3,97,39,98,255,255,255,255,0,0", "a quote is just a byte of a bound parameter")
+        }
+        spec.it("decodes bytea, hex and escape formats") callback {
+            h, e1 = pgsql.decode_bytea("\\x00ff27")
+            spec.assert_ok(e1, "hex")
+            spec.assert_str_eq(show(string.bytes(h)), "0,255,39", "the bytes")
+            x, e2 = pgsql.decode_bytea("a\\000\\\\b")
+            spec.assert_ok(e2, "escape")
+            spec.assert_str_eq(show(string.bytes(x)), "97,0,92,98", "octal and a backslash")
+            _, e3 = pgsql.decode_bytea("\\x0")
+            spec.assert_err_contains(e3, "odd length", "odd hex")
+            spec.assert_str_eq(pgsql.type_name(1184), "TIMESTAMPTZ", "a type name")
+            spec.assert_str_eq(pgsql.type_name(99999), "", "an unknown OID")
+        }
+    }
+    return spec.run_summary(fw)
+}

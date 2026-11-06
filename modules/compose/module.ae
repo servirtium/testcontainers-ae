@@ -1,0 +1,901 @@
+// Ported from testcontainers-go modules/compose/compose_local.go (the compose command line), with the ComposeStack API of modules/compose/compose.go and compose_api.go
+//
+// modules.compose: a Docker Compose project for a test, driven through the
+// compose command line (`docker compose`, `docker-compose`, `podman compose`
+// or `podman-compose`), the way Go's compose_local.go drives it.
+//
+//     import modules.compose
+//
+//     stack, err = compose.new_stack() {
+//         file("testdata/docker-compose-simple.yml")   // or content(yaml_text)
+//         identifier("myproject")                      // default: a random uuid
+//         env("bar", "BAR")
+//         wait_for_service("nginx", wait.for_listening_port("80/tcp"))
+//     }
+//     err = compose.up(stack) { wait_running() }       // up -d --wait, then the waits
+//     names = compose.services(stack)                  // ["nginx"]
+//     c, _ = compose.service_container(stack, "nginx") // a *docker.Container
+//     ep, _ = tc.endpoint(c, "80/tcp", "http")         // tc.exec, tc.logs too
+//     err = compose.down(stack) { remove_orphans(); remove_volumes() }
+//
+// Status: compile-checked only. The engine-free cases of the test (command
+// lines, CLI discovery, project names, services and profiles, the label
+// override) run for real; the cases that start a project are skipped
+// unless TCAE_LIVE_COMPOSE=1.
+//
+// The API is Go's ComposeStack (NewDockerComposeWith, WithStackFiles,
+// WithStackReaders, StackIdentifier, WithProfiles, WithEnv, WaitForService,
+// Up, Down, Services, ServiceContainer), implemented as compose_local.go
+// implements its LocalDockerCompose: by running the compose CLI with `-p`
+// and `-f` flags, then applying the wait strategies per service itself
+// (one after another; Go runs them in an errgroup). LocalDockerCompose's own
+// deprecated surface maps onto it: NewLocalDockerCompose(files, id) is
+// new_stack { file(..); identifier(id) }, WithCommand + Invoke is
+// invoke(stack, args), Down is down { remove_orphans(); remove_volumes() },
+// WaitForService / WithExposedService are wait_for_service (the published
+// port in WithExposedService only keyed Go's map), WithEnv is env. ExecError
+// is Result. Go's ComposeVersion / Format (v1 `_` vs v2 `-` container
+// names) are not needed: containers are found by compose's labels.
+//
+// The library flavour is NOT ported: Go's NewDockerCompose / compose_api.go
+// embed compose-spec/compose-go (the project loader) and docker/compose
+// (the engine-side implementation of up and down) as Go libraries. Those are
+// tens of thousands of lines of Go, outside testcontainers-go, with no
+// Aether counterpart; the CLI is the same code, already built. So:
+//   - Go's API interpolates only the given env (WithOsEnv adds the OS's);
+//     the CLI always reads this process's environment too, so os_env() is
+//     not needed and not ported.
+//   - Go loads the project to list services; here services() reads the
+//     compose files with testcontainers.miniyaml (pure Aether: std.yaml needs
+//     libfyaml, which the released toolchains are built without): the
+//     `services` keys, merged across files, filtered by profile as compose
+//     does, "*" enabling all. Interpolated
+//     or `extends`-generated service names are not resolved.
+//   - RecreateDependencies "never" has no CLI flag (only "force",
+//     `--always-recreate-deps`); Go's RemoveImages maps to `--rmi`.
+//   - Go's compose API stamps the testcontainers labels on every service
+//     and network of the project it loaded, and connects them to Ryuk. Here
+//     up writes a small override file (one more `-f`) that adds the
+//     session's labels (with org.testcontainers.reap=true while the reaper
+//     runs) to every service, to the default network and every declared
+//     network, and to every declared volume that is not external, and
+//     starts the reaper first (tc.reaper_start). So a crashed test leaks
+//     nothing, as with tc.run. Anonymous volumes go with their containers
+//     (Ryuk removes containers with their volumes); images compose builds
+//     are not labelled.
+//   - WithLogger: there is no logger in the core. The CLI's output is kept
+//     in the Result (and in an error), not echoed.
+//   - Windows (docker.exe): untested; the env is passed through /usr/bin/env,
+//     which is POSIX.
+//
+// CLI discovery, first match wins (compose_local.go only ever used
+// `docker compose`):
+//   1. the stack's cli([...]) setter;
+//   2. TESTCONTAINERS_COMPOSE_COMMAND, split on spaces ("podman compose");
+//   3. `docker compose`: `docker` on PATH and `docker compose version` exits 0;
+//   4. `docker-compose` on PATH;
+//   5. `podman compose`: `podman` on PATH and `podman compose version` exits 0;
+//   6. `podman-compose` on PATH.
+// For a docker CLI (3 and 4, or an override naming docker), when DOCKER_HOST
+// is set neither in this process nor by env(), the CLI is given the engine
+// the core found (docker.client()), so the CLI and service_container talk
+// to the same engine.
+
+import std.string
+import std.fs
+import std.os
+import std.list
+import std.uuid
+import std.json
+import std.sort
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+import testcontainers.miniyaml as yaml
+
+exports(
+    Stack, Options, Result,
+    new_stack, from_files, stack_new, stack_free,
+    file, content, identifier, profile, env, wait_for_service, cli,
+    up, down, invoke, services, service_container, project_name, stack_files,
+    up_options_new, down_options_new, options_free,
+    remove_orphans, wait_running, recreate, recreate_dependencies, run_services,
+    remove_volumes, remove_images,
+    command_line, up_args, down_args, environment, labels_override,
+    discover, discover_in, normalize_project_name, validate_recreate,
+    PROJECT_LABEL, SERVICE_LABEL, COMMAND_ENV,
+    RECREATE_DIVERGED, RECREATE_FORCE, RECREATE_NEVER,
+    REMOVE_IMAGES_ALL, REMOVE_IMAGES_LOCAL, ERR_NO_STACK_CONFIGURED
+)
+
+// compose's own labels (docker/compose api.ProjectLabel, api.ServiceLabel);
+// podman-compose sets them too.
+const PROJECT_LABEL = "com.docker.compose.project"
+const SERVICE_LABEL = "com.docker.compose.service"
+const COMMAND_ENV = "TESTCONTAINERS_COMPOSE_COMMAND"
+
+const RECREATE_DIVERGED = "diverged"
+const RECREATE_FORCE = "force"
+const RECREATE_NEVER = "never"
+const REMOVE_IMAGES_ALL = "all"
+const REMOVE_IMAGES_LOCAL = "local"
+const ERR_NO_STACK_CONFIGURED = "no stack files configured"
+
+// Go's DockerCompose (and LocalDockerCompose): the files, the project name,
+// the env, the wait strategies, and what up found.
+struct Stack {
+    project: string
+    files: string[]          // absolute, in order
+    temp_dirs: string[]      // written for content(), removed by down
+    profiles: string[]
+    env: string[]            // "KEY=VALUE"
+    wait_names: string[]
+    wait_strategies: ptr[]
+    cli_override: string[]   // cli([...])
+    cli: string[]            // resolved at the first command
+    run_services: string[]   // up's run_services, which narrow services()
+    labels_file: string      // the session-label override up wrote
+    labels_dir: string
+    cached_names: string[]
+    cached: ptr[]
+    err: string              // a setter's error, returned by new_stack
+}
+
+// Up's and down's options (Go's stackUpOptions and stackDownOptions).
+struct Options {
+    remove_orphans: bool
+    wait: bool
+    recreate: string
+    recreate_deps: string
+    services: string[]
+    volumes: bool
+    images: string
+}
+
+// Go's ExecError: the command run and what it said.
+struct Result {
+    command: string[]
+    stdout: string
+    stderr: string
+    exit_code: int
+}
+
+// ===================================================================
+// The stack and its setters
+// ===================================================================
+
+stack_new() -> ptr {
+    s = heap.new(Stack)
+    s.labels_file = ""
+    s.labels_dir = ""
+    s.err = ""
+    u, err = uuid.v4()
+    if err != "" { u = "tc-${os.getpid()}-${os.now_unix_ms()}" }
+    s.project = string.to_lower(u)
+    return s as ptr
+}
+
+stack_free(p: ptr) {
+    if p == null { return }
+    heap.free(p as *Stack)
+}
+
+fn st(p: @into ptr) -> *Stack { return p as *Stack }
+
+fn abs_path(p: string) -> string {
+    if string.starts_with(p, "/") == 1 { return p }
+    cwd = os.getcwd()
+    q = p
+    while string.starts_with(q, "./") == 1 { q = string.substring(q, 2, string.length(q)) }
+    return "${cwd}/${q}"
+}
+
+fn add_err(s: *Stack, e: string) {
+    if string.length(s.err) == 0 { s.err = e }
+}
+
+// A compose file (Go's WithStackFiles); relative paths are made absolute
+// against the working directory, as Go's filepath.Abs.
+file(_ctx: ptr, path: string) { s = st(_ctx); s.files.push(abs_path(path)) }
+
+// A compose file given as text (Go's WithStackReaders): written to a
+// temporary file, which down removes.
+content(_ctx: ptr, text: string) {
+    s = st(_ctx)
+    dir, derr = fs.make_temp_dir("", "tcae-compose-")
+    if derr != "" { add_err(s, "create temporary directory: ${derr}"); return }
+    p = "${dir}/docker-compose-${s.temp_dirs.len}.yml"
+    werr = fs.write(p, text)
+    if werr != "" { add_err(s, "write to temporary file: ${werr}"); return }
+    s.temp_dirs.push(dir)
+    s.files.push(p)
+}
+
+// The project name (Go's StackIdentifier; compose's -p). Lower-cased, as
+// Go's local compose does; an invalid one is new_stack's error.
+identifier(_ctx: ptr, name: string) {
+    s = st(_ctx)
+    n, err = normalize_project_name(name)
+    if err != "" { add_err(s, err); return }
+    s.project = n
+}
+
+// Enable a profile (Go's WithProfiles; compose's --profile). "*" enables all.
+profile(_ctx: ptr, name: string) { s = st(_ctx); s.profiles.push(name) }
+
+// An environment variable for the CLI, for interpolation in the compose
+// files (Go's WithEnv). A later value for a key replaces the earlier one.
+env(_ctx: ptr, key: string, value: string) {
+    s = st(_ctx)
+    string[] kept = []
+    prefix = "${key}="
+    for kv in s.env {
+        if string.starts_with(kv, prefix) != 1 { kept.push(kv) }
+    }
+    kept.push("${key}=${value}")
+    s.env = kept
+}
+
+// The wait strategy up applies to a service once the project is up
+// (Go's WaitForService). One per service; a later one replaces it (combine
+// with wait.for_all).
+wait_for_service(_ctx: ptr, service: string, strategy: *wait.Strategy) {
+    s = st(_ctx)
+    i = 0
+    while i < s.wait_names.len {
+        if s.wait_names[i] == service {
+            s.wait_strategies[i] = strategy as ptr
+            return
+        }
+        i = i + 1
+    }
+    s.wait_names.push(service)
+    s.wait_strategies.push(strategy as ptr)
+}
+
+// The compose command to run, e.g. ["podman", "compose"] or
+// ["/usr/local/bin/docker-compose"]; skips discovery.
+cli(_ctx: ptr, command: string[]) {
+    s = st(_ctx)
+    string[] c = []
+    for a in command { c.push(a) }
+    s.cli_override = c
+}
+
+// Go's NewDockerComposeWith: the block sets the files and options. An error
+// when no file was given (Go's ErrNoStackConfigured) or a setter failed.
+// Nothing runs yet: no CLI, no engine.
+builder new_stack() with stack_new -> (*Stack, string) {
+    if _builder == null { return null, ERR_NO_STACK_CONFIGURED }
+    s = st(_builder)
+    if string.length(s.err) > 0 { return s, s.err }
+    if s.files.len < 1 { return s, ERR_NO_STACK_CONFIGURED }
+    return s, ""
+}
+
+// Go's NewDockerCompose(filePaths...).
+from_files(paths: string[]) -> (*Stack, string) {
+    s = st(stack_new())
+    for p in paths { file(s as ptr, p) }
+    if s.files.len < 1 { return s, ERR_NO_STACK_CONFIGURED }
+    return s, ""
+}
+
+project_name(s: *Stack) -> string { return s.project }
+
+stack_files(s: *Stack) -> string[] {
+    string[] out = []
+    for f in s.files { out.push(f) }
+    return out
+}
+
+// compose's rule for a project name: lower-case letters, digits, '-' and
+// '_', starting with a letter or digit. The name is lower-cased first.
+normalize_project_name(name: string) -> (string, string) {
+    n = string.to_lower(string.trim(name))
+    if string.length(n) == 0 { return "", "invalid project name: empty" }
+    i = 0
+    while i < string.length(n) {
+        ch = string.substring(n, i, i + 1)
+        letter = string.contains("abcdefghijklmnopqrstuvwxyz0123456789", ch) == 1
+        if !letter {
+            if i == 0 || (ch != "-" && ch != "_") {
+                return "", "invalid project name \"${name}\": compose wants lower-case letters, digits, '-' and '_', starting with a letter or digit"
+            }
+        }
+        i = i + 1
+    }
+    return n, ""
+}
+
+// ===================================================================
+// Up and down options
+// ===================================================================
+
+up_options_new() -> ptr {
+    o = heap.new(Options)
+    o.recreate = RECREATE_DIVERGED
+    o.recreate_deps = RECREATE_DIVERGED
+    o.images = ""
+    return o as ptr
+}
+
+down_options_new() -> ptr {
+    o = heap.new(Options)
+    o.recreate = RECREATE_DIVERGED
+    o.recreate_deps = RECREATE_DIVERGED
+    o.images = ""
+    return o as ptr
+}
+
+options_free(p: ptr) {
+    if p == null { return }
+    heap.free(p as *Options)
+}
+
+fn op(p: @into ptr) -> *Options { return p as *Options }
+
+// Go's validateRecreate: anything but diverged, force or never is force.
+validate_recreate(r: string) -> string {
+    if r == RECREATE_DIVERGED || r == RECREATE_FORCE || r == RECREATE_NEVER { return r }
+    return RECREATE_FORCE
+}
+
+// Go's RemoveOrphans (up and down).
+remove_orphans(_ctx: ptr) { op(_ctx).remove_orphans = true }
+// Go's Wait(true): `up --wait`, until the containers are running or healthy.
+wait_running(_ctx: ptr) { op(_ctx).wait = true }
+// Go's WithRecreate / Recreate.
+recreate(_ctx: ptr, mode: string) { op(_ctx).recreate = validate_recreate(mode) }
+// Go's WithRecreateDependencies / RecreateDependencies.
+recreate_dependencies(_ctx: ptr, mode: string) { op(_ctx).recreate_deps = validate_recreate(mode) }
+// Go's RunServices: start only these services (and what they depend on).
+run_services(_ctx: ptr, names: string[]) {
+    o = op(_ctx)
+    for n in names { o.services.push(n) }
+}
+// Go's RemoveVolumes (down --volumes).
+remove_volumes(_ctx: ptr) { op(_ctx).volumes = true }
+// Go's RemoveImagesAll / RemoveImagesLocal (down --rmi all|local).
+remove_images(_ctx: ptr, mode: string) { op(_ctx).images = mode }
+
+fn sorted_copy(xs: string[]) -> string[] {
+    string[] out = []
+    for x in xs { out.push(x) }
+    sort.strings(out)
+    return out
+}
+
+// The arguments of `up` (after the global flags).
+up_args(p: ptr) -> string[] {
+    string[] a = []
+    a.push("up")
+    a.push("-d")
+    if p == null { return a }
+    o = op(p)
+    if o.remove_orphans { a.push("--remove-orphans") }
+    if o.wait { a.push("--wait") }
+    if o.recreate == RECREATE_FORCE { a.push("--force-recreate") }
+    if o.recreate == RECREATE_NEVER { a.push("--no-recreate") }
+    if o.recreate_deps == RECREATE_FORCE { a.push("--always-recreate-deps") }
+    for svc in sorted_copy(o.services) { a.push(svc) }
+    return a
+}
+
+// The arguments of `down`.
+down_args(p: ptr) -> string[] {
+    string[] a = []
+    a.push("down")
+    if p == null { return a }
+    o = op(p)
+    if o.remove_orphans { a.push("--remove-orphans") }
+    if o.volumes { a.push("--volumes") }
+    if string.length(o.images) > 0 {
+        a.push("--rmi")
+        a.push(o.images)
+    }
+    return a
+}
+
+// ===================================================================
+// The command line
+// ===================================================================
+
+fn split_words(s: string) -> string[] {
+    string[] out = []
+    cur = ""
+    i = 0
+    while i < string.length(s) {
+        ch = string.substring(s, i, i + 1)
+        if ch == " " || ch == "\t" {
+            if string.length(cur) > 0 { out.push(cur) }
+            cur = ""
+        } else {
+            cur = "${cur}${ch}"
+        }
+        i = i + 1
+    }
+    if string.length(cur) > 0 { out.push(cur) }
+    return out
+}
+
+fn find_in(path_env: string, name: string) -> string {
+    dirs = string.split(path_env, ":")
+    n = string.string_array_size(dirs)
+    i = 0
+    found = ""
+    while i < n && string.length(found) == 0 {
+        d = string.string_array_get(dirs, i)
+        if string.length(d) > 0 {
+            cand = "${d}/${name}"
+            if fs.exists(cand) == 1 && fs.dir_exists(cand) == 0 { found = cand }
+        }
+        i = i + 1
+    }
+    string.string_array_free(dirs)
+    return found
+}
+
+fn exits_zero(prog: string, args: string[]) -> bool {
+    argv = list.new()
+    for a in args { list.add(argv, a) }
+    _, _, rc, err = os.run_full(prog, argv, null, "")
+    list.free(argv)
+    return err == "" && rc == 0
+}
+
+// Discovery against a given PATH and override (the order is in the header
+// comment): (command words, "") or ([], why not).
+discover_in(path_env: string, override: string) -> (string[], string) {
+    string[] nothing = []
+    ov = split_words(override)
+    if ov.len > 0 { return ov, "" }
+    d = find_in(path_env, "docker")
+    if string.length(d) > 0 && exits_zero(d, ["compose", "version"]) {
+        string[] r1 = []
+        r1.push(d)
+        r1.push("compose")
+        return r1, ""
+    }
+    dc = find_in(path_env, "docker-compose")
+    if string.length(dc) > 0 {
+        string[] r2 = []
+        r2.push(dc)
+        return r2, ""
+    }
+    pm = find_in(path_env, "podman")
+    if string.length(pm) > 0 && exits_zero(pm, ["compose", "version"]) {
+        string[] r3 = []
+        r3.push(pm)
+        r3.push("compose")
+        return r3, ""
+    }
+    pc = find_in(path_env, "podman-compose")
+    if string.length(pc) > 0 {
+        string[] r4 = []
+        r4.push(pc)
+        return r4, ""
+    }
+    return nothing, "no compose command found on PATH (docker compose, docker-compose, podman compose, podman-compose); set ${COMMAND_ENV}"
+}
+
+fn getenv(name: string) -> string {
+    v = os.os_getenv(name)
+    if v == null { return "" }
+    return v
+}
+
+// Discovery with this process's PATH and TESTCONTAINERS_COMPOSE_COMMAND.
+discover() -> (string[], string) {
+    return discover_in(getenv("PATH"), getenv(COMMAND_ENV))
+}
+
+fn resolve_cli(s: *Stack) -> string {
+    if s.cli.len > 0 { return "" }
+    if s.cli_override.len > 0 {
+        s.cli = s.cli_override
+        return ""
+    }
+    c, err = discover()
+    if err != "" { return err }
+    s.cli = c
+    return ""
+}
+
+// The whole command for compose subcommand `args`: the CLI, -p, a -f per
+// file (the label override last, once up wrote it), a --profile per
+// profile, then args. Uses the cli([...]) override, else "docker compose"
+// when nothing is resolved yet (discovery runs at up / down / invoke).
+command_line(s: *Stack, args: string[]) -> string[] {
+    string[] a = []
+    if s.cli.len > 0 {
+        for w in s.cli { a.push(w) }
+    } else if s.cli_override.len > 0 {
+        for w in s.cli_override { a.push(w) }
+    } else {
+        a.push("docker")
+        a.push("compose")
+    }
+    a.push("-p")
+    a.push(s.project)
+    for f in s.files {
+        a.push("-f")
+        a.push(f)
+    }
+    if string.length(s.labels_file) > 0 {
+        a.push("-f")
+        a.push(s.labels_file)
+    }
+    for p in s.profiles {
+        a.push("--profile")
+        a.push(p)
+    }
+    for x in args { a.push(x) }
+    return a
+}
+
+fn has_key(kvs: string[], key: string) -> bool {
+    prefix = "${key}="
+    for kv in kvs {
+        if string.starts_with(kv, prefix) == 1 { return true }
+    }
+    return false
+}
+
+fn is_docker_cli(cmd: string[]) -> bool {
+    if cmd.len == 0 { return true }
+    c0 = cmd[0]
+    base = c0
+    i = 0
+    while i < string.length(c0) {
+        if string.substring(c0, i, i + 1) == "/" { base = string.substring(c0, i + 1, string.length(c0)) }
+        i = i + 1
+    }
+    return string.starts_with(base, "docker") == 1
+}
+
+// The variables the CLI gets on top of this process's environment: env()'s,
+// and DOCKER_HOST for a docker CLI when nothing else sets it (header).
+environment(s: *Stack) -> string[] {
+    string[] e = []
+    for kv in s.env { e.push(kv) }
+    c = s.cli
+    if c.len == 0 { c = s.cli_override }
+    if is_docker_cli(c) && !has_key(e, "DOCKER_HOST") && string.length(getenv("DOCKER_HOST")) == 0 {
+        cl, err = docker.client()
+        if err == "" && string.length(cl.host) > 0 { e.push("DOCKER_HOST=${cl.host}") }
+    }
+    return e
+}
+
+fn join_words(xs: string[]) -> string {
+    t = ""
+    for x in xs {
+        if string.length(t) > 0 { t = "${t} " }
+        t = "${t}${x}"
+    }
+    return t
+}
+
+fn run_cli(s: *Stack, args: string[], envs: string[]) -> (*Result, string) {
+    r = heap.new(Result)
+    r.stdout = ""
+    r.stderr = ""
+    cmd = command_line(s, args)
+    r.command = cmd
+    prog = cmd[0]
+    argv = list.new()
+    if envs.len > 0 {
+        prog = "/usr/bin/env"
+        for kv in envs { list.add(argv, kv) }
+        list.add(argv, cmd[0])
+    }
+    i = 1
+    while i < cmd.len {
+        list.add(argv, cmd[i])
+        i = i + 1
+    }
+    out, errout, rc, rerr = os.run_full(prog, argv, null, "")
+    list.free(argv)
+    r.stdout = out
+    r.stderr = errout
+    r.exit_code = rc
+    if rerr != "" { return r, "run ${cmd[0]}: ${rerr}" }
+    if rc != 0 {
+        return r, "local Docker compose exited abnormally (exit ${rc}) whilst running ${join_words(cmd)}: ${string.trim(errout)}"
+    }
+    return r, ""
+}
+
+// Run any compose subcommand against the project (Go's local
+// WithCommand(args).Invoke()): (*Result, err).
+invoke(s: *Stack, args: string[]) -> (*Result, string) {
+    cerr = resolve_cli(s)
+    if cerr != "" { return null, cerr }
+    return run_cli(s, args, environment(s))
+}
+
+// ===================================================================
+// The compose files (Go's validate, and the project's service names)
+// ===================================================================
+
+fn contains(xs: string[], x: string) -> bool {
+    for y in xs {
+        if y == x { return true }
+    }
+    return false
+}
+
+// What the files declare: per service its profiles ("a,b"), and the
+// networks and volumes that are not external.
+struct Model {
+    services: string[]
+    profiles: string[]
+    networks: string[]
+    volumes: string[]
+}
+
+fn add_service(m: *Model, name: string, profs: string) {
+    i = 0
+    while i < m.services.len {
+        if m.services[i] == name {
+            if string.length(profs) > 0 { m.profiles[i] = profs }
+            return
+        }
+        i = i + 1
+    }
+    m.services.push(name)
+    m.profiles.push(profs)
+}
+
+fn collect_resources(m: *Model, d: *yaml.Doc, section: int, volumes: bool) {
+    if yaml.kind(d, section) != yaml.MAPPING { return }
+    n = yaml.size(d, section)
+    i = 0
+    while i < n {
+        k = yaml.key(d, section, i)
+        v = yaml.value(d, section, i)
+        ext = yaml.scalar(d, yaml.lookup(d, v, "external"))
+        if string.length(k) > 0 && ext != "true" {
+            if volumes {
+                if !contains(m.volumes, k) { m.volumes.push(k) }
+            } else {
+                if !contains(m.networks, k) { m.networks.push(k) }
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn read_model(s: *Stack) -> (*Model, string) {
+    m = heap.new(Model)
+    for f in s.files {
+        text, rerr = fs.read(f)
+        if rerr != "" { return m, "read compose file ${f}: ${rerr}" }
+        doc, perr = yaml.parse(text)
+        if perr != "" {
+            yaml.free(doc)
+            return m, "parse compose file ${f}: ${perr}"
+        }
+        root = yaml.root(doc)
+        svcs = yaml.lookup(doc, root, "services")
+        if yaml.kind(doc, svcs) == yaml.MAPPING {
+            n = yaml.size(doc, svcs)
+            i = 0
+            while i < n {
+                name = yaml.key(doc, svcs, i)
+                body = yaml.value(doc, svcs, i)
+                profs = ""
+                pl = yaml.lookup(doc, body, "profiles")
+                if yaml.kind(doc, pl) == yaml.SEQUENCE {
+                    j = 0
+                    while j < yaml.size(doc, pl) {
+                        pv = yaml.scalar(doc, yaml.item(doc, pl, j))
+                        if string.length(profs) > 0 { profs = "${profs},${pv}" } else { profs = pv }
+                        j = j + 1
+                    }
+                }
+                if string.length(name) > 0 { add_service(m, name, profs) }
+                i = i + 1
+            }
+        }
+        collect_resources(m, doc, yaml.lookup(doc, root, "networks"), false)
+        collect_resources(m, doc, yaml.lookup(doc, root, "volumes"), true)
+        yaml.free(doc)
+    }
+    return m, ""
+}
+
+fn enabled(s: *Stack, profs: string) -> bool {
+    if string.length(profs) == 0 { return true }
+    if contains(s.profiles, "*") { return true }
+    parts = string.split(profs, ",")
+    n = string.string_array_size(parts)
+    i = 0
+    on = false
+    while i < n {
+        if contains(s.profiles, string.string_array_get(parts, i)) { on = true }
+        i = i + 1
+    }
+    string.string_array_free(parts)
+    return on
+}
+
+// The project's service names, sorted (Go's Services): those the files
+// declare that the enabled profiles start, narrowed to up's run_services.
+services(s: *Stack) -> string[] {
+    string[] out = []
+    m, err = read_model(s)
+    if err != "" { return out }
+    i = 0
+    while i < m.services.len {
+        name = m.services[i]
+        keep = enabled(s, m.profiles[i])
+        if keep && s.run_services.len > 0 && !contains(s.run_services, name) { keep = false }
+        if keep { out.push(name) }
+        i = i + 1
+    }
+    sort.strings(out)
+    return out
+}
+
+// ===================================================================
+// The session labels (the reaper)
+// ===================================================================
+
+fn yq(s: string) -> string {
+    t = string.replace_all(s, "\\", "\\\\")
+    t = string.replace_all(t, "\"", "\\\"")
+    return "\"${t}\""
+}
+
+fn label_lines(indent: string, reap: bool) -> string {
+    t = "${indent}${yq(docker.LABEL_BASE)}: \"true\"\n"
+    t = "${t}${indent}${yq(docker.LABEL_LANG)}: \"aether\"\n"
+    t = "${t}${indent}${yq(docker.LABEL_VERSION)}: ${yq(docker.VERSION)}\n"
+    t = "${t}${indent}${yq(docker.LABEL_SESSION_ID)}: ${yq(docker.session_id())}\n"
+    if reap { t = "${t}${indent}${yq(docker.LABEL_REAP)}: \"true\"\n" }
+    return t
+}
+
+// The override file up adds: the session's labels on every service, on the
+// default and every declared network, and on every non-external volume.
+labels_override(s: *Stack, reap: bool) -> (string, string) {
+    m, err = read_model(s)
+    if err != "" { return "", err }
+    t = "services:\n"
+    for svc in m.services {
+        t = "${t}  ${yq(svc)}:\n    labels:\n${label_lines("      ", reap)}"
+    }
+    string[] nets = []
+    nets.push("default")
+    for nn in m.networks {
+        if !contains(nets, nn) { nets.push(nn) }
+    }
+    t = "${t}networks:\n"
+    for nn in nets {
+        t = "${t}  ${yq(nn)}:\n    labels:\n${label_lines("      ", reap)}"
+    }
+    if m.volumes.len > 0 {
+        t = "${t}volumes:\n"
+        for v in m.volumes {
+            t = "${t}  ${yq(v)}:\n    labels:\n${label_lines("      ", reap)}"
+        }
+    }
+    return t, ""
+}
+
+fn write_labels(s: *Stack) -> string {
+    if string.length(s.labels_file) > 0 { return "" }
+    rerr = tc.reaper_start()
+    if rerr != "" { return rerr }
+    text, lerr = labels_override(s, tc.reaper_running())
+    if lerr != "" { return lerr }
+    dir, derr = fs.make_temp_dir("", "tcae-compose-labels-")
+    if derr != "" { return "create temporary directory: ${derr}" }
+    p = "${dir}/testcontainers-labels.yml"
+    werr = fs.write(p, text)
+    if werr != "" { return "write the label override: ${werr}" }
+    s.labels_dir = dir
+    s.labels_file = p
+    return ""
+}
+
+// ===================================================================
+// Up, down, and the services' containers
+// ===================================================================
+
+// The container of a service (Go's ServiceContainer), found by compose's
+// project and service labels through the engine API, as Go's
+// lookupContainer does: a *docker.Container that tc.endpoint, tc.exec,
+// tc.logs, tc.inspect and the wait strategies work on. Don't tc.terminate
+// it; down removes the project.
+service_container(s: *Stack, service: string) -> (*docker.Container, string) {
+    i = 0
+    while i < s.cached_names.len {
+        if s.cached_names[i] == service { return s.cached[i] as *docker.Container, "" }
+        i = i + 1
+    }
+    cl, err = docker.client()
+    if err != "" { return null, err }
+    ids, lerr = docker.list_containers(cl, ["${PROJECT_LABEL}=${s.project}", "${SERVICE_LABEL}=${service}"])
+    if lerr != "" { return null, "container list: ${lerr}" }
+    if ids.len == 0 { return null, "no container found for service name ${service}" }
+    c = docker.container_new(cl, ids[0], "")
+    doc, ierr = docker.inspect(c)
+    if ierr == "" {
+        cfg, cerr = json.object_get(doc, "Config")
+        if cerr == "" && cfg != null {
+            img, gerr = json.object_get(cfg, "Image")
+            if gerr == "" && img != null && json.json_type(img) == json.JSON_STRING {
+                iv, _ = json.get_string(img)
+                c.image = iv
+            }
+        }
+        nm, nerr = json.object_get(doc, "Name")
+        if nerr == "" && nm != null && json.json_type(nm) == json.JSON_STRING {
+            nv, _ = json.get_string(nm)
+            if string.starts_with(nv, "/") == 1 { nv = string.substring(nv, 1, string.length(nv)) }
+            c.name = nv
+        }
+        json.free(doc)
+    }
+    c.running = docker.is_running(c)
+    s.cached_names.push(service)
+    s.cached.push(c as ptr)
+    return c, ""
+}
+
+// `compose up -d` (Go's Up) with the block's options, then each
+// wait_for_service strategy on its service's container. Starts the reaper
+// and adds the session-label override first (header). Returns "" or the
+// error; a project that came up and failed a wait is still up: down it.
+builder up(s: *Stack) with up_options_new -> string {
+    o = _builder
+    if o == null { o = up_options_new() }
+    if s == null { return "compose up: no stack" }
+    cerr = resolve_cli(s)
+    if cerr != "" { return "compose up: ${cerr}" }
+    lerr = write_labels(s)
+    if lerr != "" { return "compose up: ${lerr}" }
+    string[] rs = []
+    for n in op(o).services { rs.push(n) }
+    s.run_services = rs
+    s.cached_names = []
+    s.cached = []
+    _, err = run_cli(s, up_args(o), environment(s))
+    if err != "" { return "compose up: ${err}" }
+    i = 0
+    while i < s.wait_names.len {
+        name = s.wait_names[i]
+        c, ferr = service_container(s, name)
+        if ferr != "" { return "wait for services: ${ferr}" }
+        werr = wait.until_ready(s.wait_strategies[i] as *wait.Strategy, c)
+        if werr != "" { return "wait for services: ${name}: ${werr}" }
+        i = i + 1
+    }
+    return ""
+}
+
+// `compose down` (Go's Down) with the block's options (remove_orphans,
+// remove_volumes, remove_images); then the temporary files go. Null-safe.
+builder down(s: *Stack) with down_options_new -> string {
+    o = _builder
+    if o == null { o = down_options_new() }
+    if s == null { return "" }
+    cerr = resolve_cli(s)
+    if cerr != "" { return "compose down: ${cerr}" }
+    _, err = run_cli(s, down_args(o), environment(s))
+    for d in s.temp_dirs { _ = fs.remove_tree(d) }
+    string[] gone = []
+    s.temp_dirs = gone
+    if string.length(s.labels_dir) > 0 {
+        _ = fs.remove_tree(s.labels_dir)
+        s.labels_dir = ""
+        s.labels_file = ""
+    }
+    s.cached_names = []
+    s.cached = []
+    if err != "" { return "compose down: ${err}" }
+    return ""
+}

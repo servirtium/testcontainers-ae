@@ -1,0 +1,80 @@
+// Ported from testcontainers-go modules/azurite/azurite_test.go
+//
+// A real Azurite: the blob service URL answers over HTTP (an unauthenticated
+// account listing is refused with 403 AuthorizationFailure, which only the
+// emulator on that port says); with enabled_services(["blob"]) the queue and
+// table ports are not published.
+
+import std.spec
+import std.string
+import std.http.client
+import std.tcp
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.azurite
+
+const IMAGE = "mcr.microsoft.com/azure-storage/azurite:3.28.0"
+
+// One HTTP request: (status, body, error).
+fn http_do(method: string, url: string, body: string) -> (int, string, string) {
+    req = client.request(method, url)
+    client.set_timeout(req, 15s)
+    if string.length(body) > 0 { client.set_body(req, string.bytes(body), "application/json") }
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    st = client.response_status(r)
+    b = client.response_body(r)
+    client.response_free(r)
+    return st, b, ""
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/azurite") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("serves blob, queue and table URLs (TestAzurite)") callback {
+            c, err = azurite.run(IMAGE)
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "azurite starts")
+            if err != "" { return }
+            blob, berr = azurite.blob_service_url(c)
+            spec.assert_ok(berr, "blob service url")
+            spec.assert_true(string.starts_with(blob, "http://") == 1, "an http:// URL: ${blob}")
+            queue, qerr = azurite.queue_service_url(c)
+            spec.assert_ok(qerr, "queue service url")
+            table, terr = azurite.table_service_url(c)
+            spec.assert_ok(terr, "table service url")
+            spec.assert_true(blob != queue && queue != table, "three different ports")
+            st, body, herr = http_do("GET", "${blob}/${azurite.ACCOUNT_NAME}?comp=list", "")
+            spec.assert_ok(herr, "GET blob account listing")
+            spec.assert_eq(st, 403, "anonymous listing is refused")
+            spec.assert_contains(body, "AuthorizationFailure", "by Azurite's storage error")
+            qs, _qb, qe = http_do("GET", "${queue}/${azurite.ACCOUNT_NAME}?comp=list", "")
+            spec.assert_ok(qe, "GET queue account listing")
+            spec.assert_eq(qs, 403, "queue service answers too")
+        }
+
+        spec.it("runs only the enabled services (TestAzuriteWithEnabledServices)") callback {
+            c, err = azurite.run(IMAGE) {
+                enabled_services(["blob"])
+                in_memory_persistence(64.0)
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "azurite-blob starts")
+            if err != "" { return }
+            blob, berr = azurite.blob_service_url(c)
+            spec.assert_ok(berr, "blob service url")
+            st, _b, herr = http_do("GET", "${blob}/${azurite.ACCOUNT_NAME}?comp=list", "")
+            spec.assert_ok(herr, "GET blob account listing")
+            spec.assert_eq(st, 403, "blob answers")
+            _q, qerr = azurite.queue_service_url(c)
+            spec.assert_true(qerr != "", "the queue port is not published")
+        }
+    }
+    return spec.run_summary(fw)
+}

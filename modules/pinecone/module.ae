@@ -1,0 +1,42 @@
+// Ported from testcontainers-go modules/pinecone/pinecone.go
+//
+// modules.pinecone: the Pinecone Local emulator (HTTP control plane on 5080).
+//
+//     import modules.pinecone
+//
+//     c, err = pinecone.run("ghcr.io/pinecone-io/pinecone-local:v0.7.0")
+//     defer tc.terminate(c)
+//     url, _ = pinecone.http_endpoint(c)    // "http://localhost:32771"
+//
+// As in Go, no wait strategy is set (the image's default applies: the
+// exposed port is checked). Not ported: the pinecone-go-client use in Go's
+// tests and examples (the test here calls the REST API instead).
+
+import testcontainers as tc
+import testcontainers.docker
+
+exports(run, http_endpoint, PORT, DEFAULT_IMAGE, pinecone_request_new, pinecone_request_free)
+
+const PORT = "5080/tcp"
+const DEFAULT_IMAGE = "ghcr.io/pinecone-io/pinecone-local:v0.7.0"
+
+pinecone_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    return r
+}
+
+pinecone_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with pinecone_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = pinecone_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run pinecone: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" (Go's HttpEndpoint).
+http_endpoint(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "http")
+}

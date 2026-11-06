@@ -1,0 +1,128 @@
+// Ported from testcontainers-go modules/garage/garage.go, modules/garage/options.go
+//
+// modules.garage: a single-node Garage S3 server with a default key and bucket.
+//
+//     import modules.garage
+//
+//     g, err = garage.run("dxflrs/garage:v2.4.1") {
+//         credentials("my-access-key", "my-secret-key-0123")
+//         bucket("my-bucket")
+//         region("eu-west-1")
+//     }
+//     defer tc.terminate(g.container)
+//     url, _ = garage.connection_string(g)       // "http://localhost:32771"
+//
+// The container carries its access key, secret key, bucket and region in a
+// struct, as Go's Container does. As in Go, a config file (garage.toml) with
+// a fresh random RPC secret is generated per run and copied to /etc/garage.toml.
+//
+// Not ported: nothing from garage.go/options.go. (Go's rpc_secret comes from
+// crypto/rand, here std.cryptography.random_hex; Go's TOML marshaling is a
+// fixed template here.)
+
+import std.string
+import std.cryptography
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    GarageContainer, run, connection_string, credentials, bucket, region,
+    S3_PORT, DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, DEFAULT_BUCKET, DEFAULT_REGION,
+    garage_request_new, garage_request_free
+)
+
+const S3_PORT = "3900/tcp"
+const DEFAULT_ACCESS_KEY = "testcontainers"
+const DEFAULT_SECRET_KEY = "testcontainers-secret"
+const DEFAULT_BUCKET = "testcontainers"
+const DEFAULT_REGION = "garage"
+
+const ERR_KEY = "garage.error"
+const REGION_KEY = "garage.region"
+
+struct GarageContainer {
+    container: *docker.Container
+    access_key: string
+    secret_key: string
+    bucket: string
+    region: string
+}
+
+garage_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, S3_PORT)
+    tc.cmd(r, ["/garage", "server", "--single-node", "--default-bucket"])
+    tc.env(r, "GARAGE_DEFAULT_ACCESS_KEY", DEFAULT_ACCESS_KEY)
+    tc.env(r, "GARAGE_DEFAULT_SECRET_KEY", DEFAULT_SECRET_KEY)
+    tc.env(r, "GARAGE_DEFAULT_BUCKET", DEFAULT_BUCKET)
+    tc.set_setting(r, REGION_KEY, DEFAULT_REGION)
+    tc.wait_for(r, wait.for_all([
+        wait.for_log("S3 API server listening"),
+        wait.for_listening_port(S3_PORT) { skip_internal_check() }
+    ]))
+    return r
+}
+
+garage_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithRegion; "" is refused at run.
+region(_ctx: ptr, name: string) {
+    if string.length(name) == 0 {
+        tc.set_setting(_ctx, ERR_KEY, "garage option: region must not be empty")
+        return
+    }
+    tc.set_setting(_ctx, REGION_KEY, name)
+}
+
+// Go's WithCredentials: access key >= 8 bytes, secret key >= 16 (checked at run).
+credentials(_ctx: ptr, access_key: string, secret_key: string) {
+    tc.env(_ctx, "GARAGE_DEFAULT_ACCESS_KEY", access_key)
+    tc.env(_ctx, "GARAGE_DEFAULT_SECRET_KEY", secret_key)
+}
+
+// Go's WithBucket.
+bucket(_ctx: ptr, name: string) { tc.env(_ctx, "GARAGE_DEFAULT_BUCKET", name) }
+
+// Go's garageConfig: the generated /etc/garage.toml.
+fn garage_config(reg: string, rpc_secret: string) -> string {
+    return "metadata_dir = \"/var/lib/garage/meta\"\ndata_dir = \"/var/lib/garage/data\"\ndb_engine = \"sqlite\"\nreplication_factor = 1\nrpc_bind_addr = \"[::]:3901\"\nrpc_public_addr = \"127.0.0.1:3901\"\nrpc_secret = \"${rpc_secret}\"\n\n[s3_api]\ns3_region = \"${reg}\"\napi_bind_addr = \"[::]:3900\"\n"
+}
+
+fn fail(r: ptr, msg: string) -> (*GarageContainer, string) {
+    tc.request_free(r)
+    return null, msg
+}
+
+builder run(image: string) with garage_request_new -> (*GarageContainer, string) {
+    r = _builder
+    if r == null { r = garage_request_new() }
+    e = tc.req_setting(r, ERR_KEY)
+    if string.length(e) > 0 { return fail(r, "run garage: ${e}") }
+    // Go's validateCredentials, after the caller's options.
+    ak = tc.req_env(r, "GARAGE_DEFAULT_ACCESS_KEY")
+    sk = tc.req_env(r, "GARAGE_DEFAULT_SECRET_KEY")
+    bk = tc.req_env(r, "GARAGE_DEFAULT_BUCKET")
+    if string.length(ak) < 8 { return fail(r, "run garage: access key must be at least 8 bytes") }
+    if string.length(sk) < 16 { return fail(r, "run garage: secret key must be at least 16 bytes") }
+    if string.length(bk) == 0 { return fail(r, "run garage: bucket must not be empty") }
+    reg = tc.req_setting(r, REGION_KEY)
+    secret, serr = cryptography.random_hex(32)
+    if serr != "" { return fail(r, "generate garage config: generate RPC secret: ${serr}") }
+    tc.file_content(r, garage_config(reg, secret), "/etc/garage.toml", 384)
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run garage: ${err}" }
+    g = heap.new(GarageContainer)
+    g.container = c
+    g.access_key = ak
+    g.secret_key = sk
+    g.bucket = bk
+    g.region = reg
+    if err != "" { return g, "run garage: ${err}" }
+    return g, ""
+}
+
+// "http://host:port" of the S3 API (Go's ConnectionString).
+connection_string(g: *GarageContainer) -> (string, string) {
+    return tc.endpoint(g.container, S3_PORT, "http")
+}

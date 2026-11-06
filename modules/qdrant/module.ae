@@ -1,0 +1,66 @@
+// Ported from testcontainers-go modules/qdrant/qdrant.go
+//
+// modules.qdrant: a Qdrant vector database container.
+//
+//     import modules.qdrant
+//
+//     c, err = qdrant.run("qdrant/qdrant:v1.7.4")
+//     defer tc.terminate(c)
+//     rest, _ = qdrant.rest_endpoint(c)    // "http://localhost:32771"
+//     grpc, _ = qdrant.grpc_endpoint(c)    // "localhost:32772"
+//
+// Go's QdrantContainer only embeds the container, so run returns the plain
+// *docker.Container. Not ported: the deprecated RunContainer.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, rest_endpoint, grpc_endpoint, web_ui, REST_PORT, GRPC_PORT,
+    DEFAULT_IMAGE, qdrant_request_new, qdrant_request_free
+)
+
+const REST_PORT = "6333/tcp"
+const GRPC_PORT = "6334/tcp"
+const DEFAULT_IMAGE = "qdrant/qdrant:v1.7.4"
+
+// Go's moduleOpts: both ports exposed, and both listening.
+qdrant_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, REST_PORT)
+    tc.expose(r, GRPC_PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(REST_PORT) { with_startup_timeout(5s) },
+        wait.for_listening_port(GRPC_PORT) { with_startup_timeout(5s) }
+    ]))
+    return r
+}
+
+qdrant_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with qdrant_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = qdrant_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run qdrant: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" of the REST API (Go's RESTEndpoint).
+rest_endpoint(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, REST_PORT, "http")
+}
+
+// "host:port" of the gRPC API (Go's GRPCEndpoint).
+grpc_endpoint(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, GRPC_PORT, "")
+}
+
+// The web UI, REST endpoint + "/dashboard" (Go's WebUI).
+web_ui(c: *docker.Container) -> (string, string) {
+    s, err = rest_endpoint(c)
+    if err != "" { return "", err }
+    return "${s}/dashboard", ""
+}

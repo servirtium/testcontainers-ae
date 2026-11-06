@@ -1,0 +1,69 @@
+// Ported from testcontainers-go modules/k6/k6_test.go
+//
+// A real k6 run per script: the container runs the script and exits, and the
+// result is its exit code, as Go's test checks it (state.ExitCode): 0 for
+// pass.js, 108 for fail.js (which aborts the test). Also set_env_var
+// reaching the script (__ENV) and the cache volume's name.
+// Not ported: the remote-script cases (WithRemoteTestScript is not ported).
+
+import std.spec
+import std.string
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.k6
+
+// Go's szkiba/k6x:v0.3.1 no longer works (it fetches k6's extension catalog from a
+// GitHub path that 404s, exit 116); the official multi-arch image takes the same arguments.
+const IMAGE = "grafana/k6:1.0.0"
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/k6") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("a passing script exits 0 (TestK6 Passing test)") callback {
+            c, err = k6.run(IMAGE) { test_script("modules/k6/scripts/pass.js") }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "k6 runs the script")
+            if err == "" {
+                code, serr = k6.exit_code(c)
+                spec.assert_ok(serr, "state")
+                spec.assert_eq(code, 0, "exit code")
+                logs, _ = tc.logs(c)
+                spec.assert_contains(logs, "Test executed", "the script's console.log is in the logs")
+            }
+        }
+
+        spec.it("a failing script exits 108 (TestK6 Failing test)") callback {
+            c, err = k6.run(IMAGE) { test_script("modules/k6/scripts/fail.js") }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "k6 runs the script")
+            if err == "" {
+                code, serr = k6.exit_code(c)
+                spec.assert_ok(serr, "state")
+                spec.assert_eq(code, 108, "exit code")
+            }
+        }
+
+        spec.it("passes --env to the script and mounts the cache") callback {
+            c, err = k6.run(IMAGE) {
+                test_script_content("export default function() { console.log('mark=' + __ENV.MARK) }", "env.js")
+                set_env_var("MARK", "from-the-block")
+                cache()
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "k6 runs the script")
+            if err == "" {
+                logs, _ = tc.logs(c)
+                spec.assert_contains(logs, "mark=from-the-block", "the script saw the variable")
+                vol, verr = k6.cache_mount(c)
+                spec.assert_ok(verr, "cache mount")
+                spec.assert_contains(vol, "k6-cache-", "the session cache volume is mounted at /cache")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

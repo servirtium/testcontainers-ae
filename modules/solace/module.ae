@@ -1,0 +1,307 @@
+// Ported from testcontainers-go modules/solace/solace.go, modules/solace/options.go, modules/solace/service.go, modules/solace/mounts/solace.script.tpl
+//
+// modules.solace: a Solace PubSub+ event broker. `run` exposes the chosen
+// services, waits for the primary router and then for each service's port,
+// and runs a CLI script that creates the message VPN (unless "default"), the
+// client username and the queues with their topic subscriptions.
+//
+//     import modules.solace
+//
+//     s, err = solace.run("solace/solace-pubsub-standard:latest") {
+//         credentials("admin", "admin")
+//         vpn("test-vpn")
+//         services([solace.SERVICE_AMQP, solace.SERVICE_MANAGEMENT, solace.SERVICE_SMF])
+//         queue("TestQueue", "Topic/ActualTopic")
+//         tc.env("username_admin_globalaccesslevel", "admin")
+//         tc.env("username_admin_password", "admin")
+//     }
+//     defer tc.terminate(s.container)
+//     amqp, _ = solace.broker_url_for(s, solace.SERVICE_AMQP)   // "amqp://localhost:32771"
+//
+// Go's Service value (name, port, protocol, SSL) is a name here:
+// SERVICE_AMQP, SERVICE_MQTT, SERVICE_REST, SERVICE_MANAGEMENT, SERVICE_SMF,
+// SERVICE_SMF_SSL, with service_port / service_protocol to look one up.
+// The default services are AMQP, SMF, REST and MQTT.
+//
+// The shared-memory size (Go's WithShmSize, default 1 GiB) is the core
+// shm_size(bytes) setter. The ulimits nofile, core and memlock Solace needs
+// are set through the host config modifier. Like Go, a wait strategy the
+// caller sets replaces the module's.
+//
+// Status: compile-checked only. On this project's Podman machine (rootless)
+// the container cannot start: the ulimit nofile 1048576 Go sets (and Solace
+// needs) is refused by crun (setrlimit RLIMIT_NOFILE: Operation not
+// permitted). On Docker or a rootful Podman it should run.
+//
+// Not ported: nothing of the Go module's API; Go's test publishes and
+// consumes with the Solace Go SDK, which has no counterpart (the test here
+// uses the SEMP management API instead).
+
+import std.string
+import std.json
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    SolaceContainer, run, broker_url_for, username, password, vpn, vpn_of,
+    credentials, services, queue, service_port, service_protocol,
+    SERVICE_AMQP, SERVICE_MQTT, SERVICE_REST, SERVICE_MANAGEMENT,
+    SERVICE_SMF, SERVICE_SMF_SSL, DEFAULT_IMAGE,
+    solace_request_new, solace_request_free
+)
+
+const DEFAULT_IMAGE = "solace/solace-pubsub-standard:latest"
+
+const SERVICE_AMQP = "amqp"
+const SERVICE_MQTT = "mqtt"
+const SERVICE_REST = "rest"
+const SERVICE_MANAGEMENT = "management"
+const SERVICE_SMF = "smf"
+const SERVICE_SMF_SSL = "smf_ssl"
+
+const S_VPN = "solace.vpn"
+const S_USER = "solace.username"
+const S_PASSWORD = "solace.password"
+const S_SERVICES = "solace.services"   // names, comma separated
+const S_QUEUES = "solace.queues"       // "queue\ttopic" lines
+const S_ERROR = "solace.error"
+
+struct SolaceContainer {
+    container: *docker.Container
+    vpn_name: string
+    user: string
+    pass: string
+}
+
+// Go's Service.Port; 0 for an unknown name.
+service_port(name: string) -> int {
+    if name == SERVICE_AMQP { return 5672 }
+    if name == SERVICE_MQTT { return 1883 }
+    if name == SERVICE_REST { return 9000 }
+    if name == SERVICE_MANAGEMENT { return 8080 }
+    if name == SERVICE_SMF { return 55555 }
+    if name == SERVICE_SMF_SSL { return 55443 }
+    return 0
+}
+
+// Go's Service.Protocol (the URL scheme of the service's endpoint).
+service_protocol(name: string) -> string {
+    if name == SERVICE_AMQP { return "amqp" }
+    if name == SERVICE_MQTT { return "tcp" }
+    if name == SERVICE_REST { return "http" }
+    if name == SERVICE_MANAGEMENT { return "http" }
+    if name == SERVICE_SMF { return "tcp" }
+    if name == SERVICE_SMF_SSL { return "tcps" }
+    return ""
+}
+
+fn ulimit(name: string, v: long) -> ptr {
+    u = json.obj()
+    json.set(u, "Name", json.str(name))
+    json.set(u, "Soft", json.from_int(v))
+    json.set(u, "Hard", json.from_int(v))
+    return u
+}
+
+fn set_ulimits(hc: ptr) {
+    list = json.arr()
+    json.push(list, ulimit("nofile", 1048576))
+    json.push(list, ulimit("core", -1))
+    json.push(list, ulimit("memlock", -1))
+    json.set(hc, "Ulimits", list)
+}
+
+// Go's defaultOptions, and the host config of run: shm 1 GiB, the ulimits.
+solace_request_new() -> ptr {
+    r = tc.request_new()
+    tc.shm_size(r, 1073741824)
+    tc.host_config_modifier(r, |hc: ptr| { set_ulimits(hc) })
+    return r
+}
+
+solace_request_free(p: ptr) { tc.request_free(p) }
+
+// ---- options ----
+
+// Go's WithServices: replaces the default services; at least one.
+services(_ctx: ptr, names: string[]) {
+    if names.len == 0 {
+        if !tc.req_has_setting(_ctx, S_ERROR) { tc.set_setting(_ctx, S_ERROR, "at least one service must be specified") }
+        return
+    }
+    out = ""
+    for n in names {
+        if string.length(out) > 0 { out = "${out}," }
+        out = "${out}${n}"
+    }
+    tc.set_setting(_ctx, S_SERVICES, out)
+}
+
+// Go's WithCredentials: the client username and password (default root/password).
+credentials(_ctx: ptr, user: string, pw: string) {
+    tc.set_setting(_ctx, S_USER, user)
+    tc.set_setting(_ctx, S_PASSWORD, pw)
+}
+
+// Go's WithVPN: the message VPN (default "default").
+vpn(_ctx: ptr, name: string) { tc.set_setting(_ctx, S_VPN, name) }
+
+// Go's WithQueue: a queue subscribed to a topic; calling it again with the
+// same queue adds a subscription.
+queue(_ctx: ptr, queue_name: string, topic: string) {
+    line = "${queue_name}\t${topic}"
+    if !tc.req_has_setting(_ctx, S_QUEUES) {
+        tc.set_setting(_ctx, S_QUEUES, line)
+    } else {
+        tc.set_setting(_ctx, S_QUEUES, "${tc.req_setting(_ctx, S_QUEUES)}\n${line}")
+    }
+}
+
+fn split_on(s: string, sep: string) -> string[] {
+    string[] out = []
+    if string.length(s) == 0 { return out }
+    rest = s
+    i = string.index_of(rest, sep)
+    while i >= 0 {
+        out.push(string.substring(rest, 0, i))
+        rest = string.substring(rest, i + string.length(sep), string.length(rest))
+        i = string.index_of(rest, sep)
+    }
+    out.push(rest)
+    return out
+}
+
+// The CLI script (mounts/solace.script.tpl).
+fn render_script(vpn_name: string, user: string, pw: string, queue_lines: string[]) -> string {
+    out = "enable
+configure
+"
+    if vpn_name != "default" {
+        out = "${out}create message-vpn ${vpn_name}
+	no shutdown
+	exit
+	client-profile default message-vpn ${vpn_name}
+		message-spool
+			allow-guaranteed-message-send
+			allow-guaranteed-message-receive
+			allow-guaranteed-endpoint-create
+			allow-guaranteed-endpoint-create-durability all
+			exit
+		exit
+	message-spool message-vpn ${vpn_name}
+		max-spool-usage 60000
+		exit
+"
+    }
+    out = "${out}
+create client-username ${user} message-vpn ${vpn_name}
+	password ${pw}
+	no shutdown
+	exit
+
+message-vpn ${vpn_name}
+	authentication basic auth-type internal
+	no shutdown
+	end
+
+configure
+message-spool message-vpn ${vpn_name}
+"
+    // the queues, in order of first appearance, each with its topics
+    string[] names = []
+    for ln in queue_lines {
+        q = string.substring(ln, 0, string.index_of(ln, "\t"))
+        seen = false
+        for n in names { if n == q { seen = true } }
+        if !seen { names.push(q) }
+    }
+    for q in names {
+        out = "${out}	create queue ${q}
+		access-type exclusive
+		permission all consume
+		no shutdown
+		exit
+"
+        for ln in queue_lines {
+            t = string.index_of(ln, "\t")
+            if string.substring(ln, 0, t) == q {
+                out = "${out}	queue ${q}
+		subscription topic ${string.substring(ln, t + 1, string.length(ln))}
+		exit
+"
+            }
+        }
+    }
+    return "${out}	exit
+exit"
+}
+
+// Run a Solace container (Go's solace.Run). Non-null whenever a container
+// was created; on a CLI script failure it is returned with the error too, so
+// the caller can terminate it.
+builder run(image: string) with solace_request_new -> (*SolaceContainer, string) {
+    r = _builder
+    if r == null { r = solace_request_new() }
+    if tc.req_has_setting(r, S_ERROR) {
+        e = tc.req_setting(r, S_ERROR)
+        solace_request_free(r)
+        return null, e
+    }
+    vpn_name = "default"
+    if tc.req_has_setting(r, S_VPN) { vpn_name = tc.req_setting(r, S_VPN) }
+    user = "root"
+    if tc.req_has_setting(r, S_USER) { user = tc.req_setting(r, S_USER) }
+    pw = "password"
+    if tc.req_has_setting(r, S_PASSWORD) { pw = tc.req_setting(r, S_PASSWORD) }
+    names = split_on(tc.req_setting(r, S_SERVICES), ",")
+    if names.len == 0 {
+        names = [SERVICE_AMQP, SERVICE_SMF, SERVICE_REST, SERVICE_MQTT]
+    }
+    queue_lines = split_on(tc.req_setting(r, S_QUEUES), "\n")
+
+    for n in names { tc.expose(r, "${service_port(n)}/tcp") }
+    // the primary router first, then each service's port, one after another,
+    // 2 minutes and 30 seconds each as in Go (and as long overall); a wait
+    // strategy the caller set stays
+    if tc.req_strategy(r) == null {
+        tc.wait_for(r, wait.for_exec(["grep", "-q", "Primary Virtual Router is now active", "/usr/sw/jail/logs/system.log"]) {
+            with_exit_code(0)
+            with_startup_timeout(120s)
+            with_poll_interval(1s)
+        })
+        for n in names {
+            tc.additional_wait(r, wait.for_listening_port("${service_port(n)}/tcp") { with_startup_timeout(30s) })
+        }
+        tc.wait_deadline(r, 120s + 30s * names.len)
+    }
+
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "generic container: ${err}" }
+    s = heap.new(SolaceContainer)
+    s.container = c
+    s.vpn_name = vpn_name
+    s.user = user
+    s.pass = pw
+    if err != "" { return s, "generic container: ${err}" }
+
+    script = render_script(vpn_name, user, pw, queue_lines)
+    cerr = tc.copy_to_container(c, script, "/usr/sw/jail/cliscripts/script.cli", 420)
+    if cerr != "" { return s, "failed to copy CLI script to container: ${cerr}" }
+    code, out, xerr = tc.exec(c, ["/usr/sw/loads/currentload/bin/cli", "-A", "-es", "script.cli"])
+    if xerr != "" { return s, "failed to execute CLI script for queue/topic setup: ${xerr}" }
+    if code != 0 { return s, "CLI script execution failed with exit code ${code}: ${out}" }
+    return s, ""
+}
+
+// The origin URL of a service, e.g. "amqp://localhost:32771" (Go's BrokerURLFor).
+broker_url_for(s: *SolaceContainer, service: string) -> (string, string) {
+    return tc.endpoint(s.container, "${service_port(service)}/tcp", service_protocol(service))
+}
+
+// The client username (Go's Username).
+username(s: *SolaceContainer) -> string { return s.user }
+// The client password (Go's Password).
+password(s: *SolaceContainer) -> string { return s.pass }
+// The message VPN (Go's VPN).
+vpn_of(s: *SolaceContainer) -> string { return s.vpn_name }

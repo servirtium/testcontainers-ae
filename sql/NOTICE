@@ -1,0 +1,71 @@
+sql/ in testcontainers-ae: what was ported from where.
+
+sql/module.ae
+    Original Aether code, designed to the shape of Go's database/sql (Open,
+    Ping, Exec, Query, QueryRow, Prepare, Begin/Commit/Rollback, Rows,
+    driver registration by name). No Go standard library code is ported;
+    its error texts are reproduced where callers may match on them.
+    License: MIT, the testcontainers-ae contributors.
+
+sql/postgres/pgproto3/module.ae
+    Ported from jackc/pgx v5.9.2 (commit 0aeabbc, tag v5.9.2), directory
+    pgproto3/: the frontend and backend message encodings and decodings and
+    the frontend's chunked receive. MIT, Copyright (c) 2013-2021 Jack
+    Christensen.
+
+sql/postgres/pgconn/module.ae
+    Ported from jackc/pgx v5.9.2, pgconn/config.go, defaults.go, pgconn.go,
+    auth_scram.go, errors.go. MIT, Copyright (c) 2013-2021 Jack Christensen.
+
+sql/postgres/module.ae
+    Ported from jackc/pgx v5.9.2, stdlib/sql.go, tx.go and the text-format
+    parts of pgtype/ (type OIDs, bytea). MIT, Copyright (c) 2013-2021 Jack
+    Christensen.
+
+sql/mysql/ -- MPL-2.0, not MIT: see sql/mysql/LICENSE
+    Ported from go-sql-driver/mysql v1.9.3
+    (https://github.com/go-sql-driver/mysql, tag v1.9.3, commit 62984ad),
+    "Copyright 2012 The Go-MySQL-Driver Authors. All rights reserved." (the
+    authors are listed in sql/mysql/AUTHORS, copied from the same commit),
+    Mozilla Public License, v. 2.0. Each ported file starts with the Go
+    files it came from, their copyright line, the MPL-2.0 Exhibit A notice,
+    and a line saying the modifications (the port to Aether) are by the
+    testcontainers-ae contributors. The original source is at
+    https://github.com/go-sql-driver/mysql/tree/v1.9.3.
+
+    sql/mysql/mysqlproto/module.ae
+        const.go (2012), errors.go (2013), fields.go (2017), utils.go
+        (2012), collations.go (2014: the default collation, a few common
+        ones and the unsafe list), packets.go (2012: the packet encodings
+        and decodings) and auth.go (2018: the password scrambles and
+        encryptPassword).
+    sql/mysql/mysqlconn/module.ae
+        dsn.go (2016), connector.go (2018), connection.go (2012), packets.go
+        (2012: reading and writing packets, the command and result flows),
+        auth.go (2018: auth, handleAuthResult, RegisterServerPubKey),
+        buffer.go (2013), statement.go, rows.go, result.go, transaction.go
+        and utils.go (RegisterTLSConfig) (2012).
+    sql/mysql/module.ae
+        driver.go (2012), with the database/sql/driver methods of
+        connection.go, statement.go, transaction.go and result.go (2012).
+    tests/test_sql_mysql_unit.ae (MPL-2.0 too)
+        Cases, vectors and captured bytes from packets_test.go (2016),
+        utils_test.go (2013), dsn_test.go (2016) and auth_test.go (2018).
+
+    Not ported: compress.go, infile.go, conncheck.go, conncheck_dummy.go,
+    nulltime.go, connector.go's dial registry, the collations table beyond
+    the entries named. tests/test_sql_mysql.ae is original, after
+    driver_test.go's cases (consulted, nothing copied).
+
+Consulted, nothing ported: lib/pq v1.10.9 (https://github.com/lib/pq, MIT,
+Copyright (c) 2011-2013, 'pq' Contributors, Portions Copyright (C) 2011
+Blake Mizerany), as a second reading of the simple query protocol.
+
+Tests: tests/test_sql_unit.ae, tests/test_sql_postgres_unit.ae and
+tests/test_sql_postgres.ae port cases from pgx's pgproto3 and pgconn tests
+(the same MIT license) and from testcontainers-go's wait/sql_test.go and
+modules/postgres/postgres_test.go (MIT, see ../LICENSE). The SCRAM vector is
+RFC 7677's example.
+
+The full license texts are in sql/LICENSE (MIT: sql/ and sql/postgres/)
+and sql/mysql/LICENSE (MPL-2.0: sql/mysql/).

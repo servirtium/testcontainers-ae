@@ -1,0 +1,76 @@
+// Ported from testcontainers-go modules/kurrentdb/kurrentdb.go
+//
+// modules.kurrentdb: a KurrentDB (formerly EventStoreDB) container, insecure
+// (no TLS) by default.
+//
+//     import modules.kurrentdb
+//
+//     k, err = kurrentdb.run("kurrentplatform/kurrentdb:26.1.1") {
+//         insecure()                        // the default; the Go option too
+//     }
+//     defer tc.terminate(k.container)
+//     cs, _ = kurrentdb.connection_string(k)   // "kurrentdb://localhost:32771?tls=false"
+//
+// Like Go's Container, the module's value holds the container and whether
+// the server runs insecure, read back from KURRENTDB_INSECURE in the final
+// request (Go reads it from the container's inspected Env).
+//
+// Not ported: nothing is left out (the Go module has no client helper).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    Container, run, connection_string, insecure,
+    PORT, DEFAULT_IMAGE, kurrentdb_request_new, kurrentdb_request_free
+)
+
+const PORT = "2113/tcp"
+const DEFAULT_IMAGE = "kurrentplatform/kurrentdb:latest"
+
+struct Container {
+    container: *docker.Container
+    insecure: bool
+}
+
+// Go's moduleOpts: the port, KURRENTDB_INSECURE=true, and /health/live
+// answering 204.
+kurrentdb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.env(r, "KURRENTDB_INSECURE", "true")
+    tc.wait_for(r, wait.for_http("/health/live") { with_port(PORT); with_status(204) })
+    return r
+}
+
+kurrentdb_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithInsecure: KURRENTDB_INSECURE=true (already the default).
+insecure(_ctx: ptr) { tc.env(_ctx, "KURRENTDB_INSECURE", "true") }
+
+builder run(image: string) with kurrentdb_request_new -> (*Container, string) {
+    r = _builder
+    if r == null { r = kurrentdb_request_new() }
+    // Go's default when the variable is absent is insecure.
+    ins = true
+    if tc.req_has_env(r, "KURRENTDB_INSECURE") { ins = tc.req_env(r, "KURRENTDB_INSECURE") == "true" }
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run kurrentdb: ${err}" }
+    k = heap.new(Container)
+    k.container = c
+    k.insecure = ins
+    if err != "" { return k, "run kurrentdb: ${err}" }
+    return k, ""
+}
+
+// "kurrentdb://host:port?tls=false" when insecure, else "kurrentdb://host:port".
+connection_string(k: *Container) -> (string, string) {
+    host, herr = tc.host(k.container)
+    if herr != "" { return "", "get host: ${herr}" }
+    port, perr = tc.mapped_port(k.container, PORT)
+    if perr != "" { return "", "get mapped port: ${perr}" }
+    if k.insecure { return "kurrentdb://${host}:${port}?tls=false", "" }
+    return "kurrentdb://${host}:${port}", ""
+}

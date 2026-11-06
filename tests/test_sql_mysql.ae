@@ -1,0 +1,393 @@
+// Ported from testcontainers-go wait/sql_test.go and modules/mysql/mysql_test.go
+// (the database/sql examples), with go-sql-driver/mysql v1.9.3's
+// driver_test.go cases (connect, auth plugins, errors with their number and
+// SQLSTATE, prepared statements, transactions, LastInsertId, TLS) as far as
+// sql/mysql implements them.
+//
+// `sql` and its MySQL driver against a real MySQL 8.0.36 (caching_sha2_password,
+// the server's default: full authentication over RSA without TLS, then the
+// fast path; the RSA key given by serverPubKey; full authentication over
+// TLS 1.3 with the test CA of tests/fixtures/pgtls) and a real MariaDB
+// 12.3.2 (mysql_native_password). Two containers in all; the cases on one
+// container share it.
+
+import std.spec
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.testing
+import modules.mysql as mymod          // aliased: sql.mysql has the same last name (README "Known gaps")
+import modules.mariadb as mariamod
+import sql
+import sql.mysql as mysqldrv
+import sql.mysql.mysqlconn
+
+const IMAGE = "mysql:8.0.36"
+const MARIADB_IMAGE = "mariadb:12.3.2"
+const CA = "tests/fixtures/pgtls/ca.crt"
+
+fn dsn(m: *mymod.MySQLContainer, user: string, pw: string, args: string) -> string {
+    ep, _ = tc.endpoint(m.container, mymod.PORT, "")
+    extra = ""
+    if string.length(args) > 0 { extra = "?${args}" }
+    return "${user}:${pw}@tcp(${ep})/app${extra}"
+}
+
+fn maria_dsn(m: *mariamod.MariaDBContainer, pw: string, args: string) -> string {
+    ep, _ = tc.endpoint(m.container, mariamod.PORT, "")
+    extra = ""
+    if string.length(args) > 0 { extra = "?${args}" }
+    return "appuser:${pw}@tcp(${ep})/app${extra}"
+}
+
+fn join(xs: string[]) -> string {
+    out = ""
+    for x in xs {
+        if string.length(out) > 0 { out = "${out}," }
+        out = "${out}${x}"
+    }
+    return out
+}
+
+// FLUSH PRIVILEGES as root: empties caching_sha2_password's cache, so the
+// next login takes the full authentication path.
+fn flush(m: *mymod.MySQLContainer) -> string {
+    c, err = mysqlconn.connect(dsn(m, "root", "s3cret", ""))
+    if err != "" { return err }
+    ferr = mysqlconn.exec(c, "FLUSH PRIVILEGES")
+    mysqlconn.close(c)
+    return ferr
+}
+
+// Connect with mysqlconn, say how it authenticated, run `q`, return its first value.
+fn login(d: string, q: string) -> (string, string, string) {
+    c, err = mysqlconn.connect(d)
+    if err != "" { return "", "", err }
+    path = mysqlconn.auth_path(c)
+    rs, qerr = mysqlconn.query(c, q)
+    mysqlconn.close(c)
+    if qerr != "" { return path, "", qerr }
+    if rs.nrows < 1 { return path, "", "no rows" }
+    return path, rs.values[rs.values.len - 1], ""
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+    mysqldrv.register()
+
+    spec.describe(fw, "sql with sql.mysql against MySQL 8.0.36") {
+        m, merr = mymod.run(IMAGE) {
+            database("app")
+            username("appuser")
+            password("s3cret")
+            tc.file("tests/fixtures/mysqltls/my.cnf", "/etc/mysql/conf.d/my.cnf", 420)
+            tc.file(CA, "/etc/mysql/tls/ca.crt", 420)
+            tc.file("tests/fixtures/pgtls/server.crt", "/etc/mysql/tls/server.crt", 420)
+            tc.file("tests/fixtures/pgtls/server.key", "/etc/mysql/tls/server.key", 420)
+            tc.additional_wait(wait.for_sql(mymod.PORT, "mysql", |host: string, port: int| -> "appuser:s3cret@tcp(${host}:${port})/app"))
+        }
+        if m != null { testing.cleanup_container(m.container) }
+
+        spec.it("starts with wait.for_sql on the default query (TestContainerWithWaitForSQL/default_query)") callback {
+            spec.assert_ok(merr, "mysql starts and answers SELECT 1")
+        }
+
+        spec.it("caching_sha2_password: full authentication over RSA, then the fast path") callback {
+            if merr != "" { return }
+            spec.assert_ok(flush(m), "FLUSH PRIVILEGES empties the cache")
+            p1, u1, e1 = login(dsn(m, "appuser", "s3cret", ""), "SELECT CURRENT_USER()")
+            spec.assert_ok(e1, "first login")
+            spec.assert_str_eq(p1, "caching_sha2_password full (RSA, key fetched from the server)", "the full path, the password RSA-OAEP encrypted")
+            spec.assert_str_eq(u1, "appuser@%", "logged in")
+            p2, _, e2 = login(dsn(m, "appuser", "s3cret", ""), "SELECT 1")
+            spec.assert_ok(e2, "second login")
+            spec.assert_str_eq(p2, "caching_sha2_password fast", "the cached fast path")
+        }
+
+        spec.it("caching_sha2_password: full authentication with the key given by serverPubKey") callback {
+            if merr != "" { return }
+            _, key, kerr = login(dsn(m, "root", "s3cret", ""), "SHOW STATUS LIKE 'Caching_sha2_password_rsa_public_key'")
+            spec.assert_ok(kerr, "read the server's public key")
+            spec.assert_contains(key, "-----BEGIN PUBLIC KEY-----", "a PEM key")
+            spec.assert_ok(mysqldrv.register_server_pub_key("live", key), "register it")
+            spec.assert_ok(flush(m), "flush")
+            p, _, err = login(dsn(m, "appuser", "s3cret", "serverPubKey=live"), "SELECT 1")
+            spec.assert_ok(err, "login")
+            spec.assert_str_eq(p, "caching_sha2_password full (RSA, serverPubKey)", "no key request")
+        }
+
+        spec.it("TLS 1.3 with a registered CA: full authentication sends the password over TLS") callback {
+            if merr != "" { return }
+            spec.assert_ok(mysqldrv.register_tls_config("testca", CA, ""), "register_tls_config")
+            spec.assert_ok(flush(m), "flush")
+            p, v, err = login(dsn(m, "appuser", "s3cret", "tls=testca"), "SHOW STATUS LIKE 'Ssl_version'")
+            spec.assert_ok(err, "login over TLS")
+            spec.assert_str_eq(p, "caching_sha2_password full (cleartext over TLS or a Unix socket)", "cleartext inside TLS")
+            spec.assert_str_eq(v, "TLSv1.3", "the server sees TLS 1.3")
+            db, _ = sql.open("mysql", dsn(m, "appuser", "s3cret", "tls=testca"))
+            r, qerr = sql.query_row(db, "SHOW STATUS LIKE 'Ssl_cipher'", [])
+            spec.assert_ok(qerr, "sql over TLS")
+            cipher, _ = sql.string_at(r, 1)
+            spec.assert_contains(cipher, "TLS_", "a TLS 1.3 suite")
+            sql.close(db)
+        }
+
+        spec.it("tls=true verifies against the system store; skip-verify is refused; preferred fails loudly") callback {
+            if merr != "" { return }
+            _, _, terr = login(dsn(m, "appuser", "s3cret", "tls=true"), "SELECT 1")
+            spec.assert_true(terr != "", "the test CA is not in the system store: ${terr}")
+            _, _, serr = login(dsn(m, "appuser", "s3cret", "tls=skip-verify"), "SELECT 1")
+            spec.assert_contains(serr, "tls=skip-verify asks for TLS without certificate verification", "refused")
+            _, _, perr = login(dsn(m, "appuser", "s3cret", "tls=preferred"), "SELECT 1")
+            spec.assert_contains(perr, "tls=preferred: the server offers TLS and its certificate did not verify", "not silently unverified")
+        }
+
+        spec.it("a wrong password is ER_ACCESS_DENIED_ERROR 1045, SQLSTATE 28000") callback {
+            if merr != "" { return }
+            db, _ = sql.open("mysql", dsn(m, "appuser", "wrong", ""))
+            err = sql.ping(db)
+            spec.assert_contains(err, "Access denied for user 'appuser'", "the server's message")
+            spec.assert_eq(mysqldrv.error_number(err), 1045, "the error number")
+            spec.assert_str_eq(sql.sqlstate(err), "28000", "the SQLSTATE")
+            sql.close(db)
+        }
+
+        spec.it("creates, inserts through a prepared statement, reads typed values back") callback {
+            if merr != "" { return }
+            db, _ = sql.open("mysql", dsn(m, "appuser", "s3cret", ""))
+            _, cerr = sql.exec(db, "CREATE TABLE people (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(50), active TINYINT(1), score DOUBLE, ratio FLOAT, photo BLOB, note TEXT NULL, born DATETIME, price DECIMAL(10,2))", [])
+            spec.assert_ok(cerr, "create table")
+            st, perr = sql.prepare(db, "INSERT INTO people (name, active, score, ratio, photo, note, born, price) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+            spec.assert_ok(perr, "prepare")
+            spec.assert_eq(sql.num_input(st), 8, "eight placeholders")
+            photo = [0, 1, 2, 255]
+            byte[] pb = []
+            for x in photo { pb.push((x & 255) as byte) }
+            r1, e1 = sql.stmt_exec(st, [sql.text("Ada"), sql.boolean(true), sql.float64(3.25), sql.float64(0.5), sql.blob(pb), sql.null_value(), sql.text("1815-12-10 08:30:00"), sql.text("12.50")])
+            spec.assert_ok(e1, "insert 1")
+            spec.assert_eq_long(sql.rows_affected(r1), 1, "one row")
+            id1, _ = sql.last_insert_id(r1)
+            spec.assert_eq_long(id1, 1, "AUTO_INCREMENT 1")
+            r2, e2 = sql.stmt_exec(st, [sql.text("it's \"Grace\""), sql.boolean(false), sql.float64(-1.5), sql.float64(2.0), sql.blob(pb), sql.text("note"), sql.text("1906-12-09 00:00:00"), sql.text("0.10")])
+            spec.assert_ok(e2, "insert 2")
+            id2, _ = sql.last_insert_id(r2)
+            spec.assert_eq_long(id2, 2, "AUTO_INCREMENT 2")
+            spec.assert_ok(sql.stmt_close(st), "COM_STMT_CLOSE")
+
+            // binary protocol: a query with arguments is prepared
+            rows, qerr = sql.query(db, "SELECT id, name, active, score, ratio, photo, note, born, price FROM people WHERE id >= ? ORDER BY id", [sql.int64(1)])
+            spec.assert_ok(qerr, "select (binary protocol)")
+            spec.assert_str_eq(join(sql.column_types(rows)), "INT,VARCHAR,TINYINT,DOUBLE,FLOAT,BLOB,TEXT,DATETIME,DECIMAL", "DatabaseTypeName")
+            spec.assert_true(sql.next(rows), "row 1")
+            id, _ = sql.int_at(rows, 0)
+            spec.assert_eq_long(id, 1, "int")
+            name, _ = sql.string_at(rows, 1)
+            spec.assert_str_eq(name, "Ada", "text")
+            act, _ = sql.bool_at(rows, 2)
+            spec.assert_true(act, "tinyint as bool")
+            score, _ = sql.float_at(rows, 3)
+            spec.assert_true(score == 3.25, "double")
+            ratio, _ = sql.float_at(rows, 4)
+            spec.assert_true(ratio == 0.5, "float")
+            got, _ = sql.bytes_at(rows, 5)
+            spec.assert_eq(got.len, 4, "blob length")
+            spec.assert_eq(got[3] as int, 255, "blob bytes")
+            spec.assert_true(sql.is_null_at(rows, 6), "NULL")
+            born, _ = sql.string_at(rows, 7)
+            spec.assert_str_eq(born, "1815-12-10 08:30:00", "datetime as text")
+            price, _ = sql.string_at(rows, 8)
+            spec.assert_str_eq(price, "12.50", "decimal as text")
+            spec.assert_true(sql.next(rows), "row 2")
+            n2, _ = sql.string_at(rows, 1)
+            spec.assert_str_eq(n2, "it's \"Grace\"", "quotes survive")
+            a2, _ = sql.bool_at(rows, 2)
+            spec.assert_false(a2, "false")
+            s2, _ = sql.float_at(rows, 3)
+            spec.assert_true(s2 == -1.5, "negative double")
+            spec.assert_false(sql.next(rows), "two rows")
+
+            // text protocol: no arguments
+            r, terr = sql.query_row(db, "SELECT id, active, score, ratio, photo, note, born, price FROM people WHERE id = 1", [])
+            spec.assert_ok(terr, "select (text protocol)")
+            tact, _ = sql.bool_at(r, 1)
+            spec.assert_true(tact, "tinyint text 1")
+            tsc, _ = sql.float_at(r, 2)
+            spec.assert_true(tsc == 3.25, "double text")
+            tph, _ = sql.bytes_at(r, 4)
+            spec.assert_eq(tph[3] as int, 255, "blob text bytes")
+            spec.assert_true(sql.is_null_at(r, 5), "NULL text")
+            tb, _ = sql.string_at(r, 6)
+            spec.assert_str_eq(tb, "1815-12-10 08:30:00", "datetime text")
+
+            // exec with arguments: prepared, executed, closed (Go's ErrSkip path)
+            u, uerr = sql.exec(db, "UPDATE people SET score = score + ? WHERE id = ?", [sql.float64(1.0), sql.int64(2)])
+            spec.assert_ok(uerr, "update with arguments")
+            spec.assert_eq_long(sql.rows_affected(u), 1, "one row changed")
+            sql.close(db)
+        }
+
+        spec.it("interpolateParams=true and multiStatements=true") callback {
+            if merr != "" { return }
+            db, _ = sql.open("mysql", dsn(m, "appuser", "s3cret", "interpolateParams=true&multiStatements=true"))
+            _, e1 = sql.exec(db, "CREATE TABLE kv (k VARCHAR(20) PRIMARY KEY, v TEXT); INSERT INTO kv VALUES ('a', '1')", [])
+            spec.assert_ok(e1, "two statements in one COM_QUERY")
+            res, e2 = sql.exec(db, "INSERT INTO kv VALUES (?, ?)", [sql.text("b"), sql.text("it's\\x\n")])
+            spec.assert_ok(e2, "interpolated")
+            spec.assert_eq_long(sql.rows_affected(res), 1, "one row")
+            r, e3 = sql.query_row(db, "SELECT v FROM kv WHERE k = ?", [sql.text("b")])
+            spec.assert_ok(e3, "interpolated query")
+            v, _ = sql.string_at(r, 0)
+            spec.assert_str_eq(v, "it's\\x\n", "escaped and back")
+            rows, e4 = sql.query(db, "UPDATE kv SET v = 'z' WHERE k = 'a'; SELECT k FROM kv ORDER BY k", [])
+            spec.assert_ok(e4, "the first result set with columns")
+            spec.assert_eq(sql.row_count(rows), 2, "the SELECT's rows")
+            spec.assert_ok(sql.ping(db), "the connection is in sync after it")
+            sql.close(db)
+        }
+
+        spec.it("a 17 MB blob is split across packets both ways; a big argument goes as COM_STMT_SEND_LONG_DATA") callback {
+            if merr != "" { return }
+            db, _ = sql.open("mysql", dsn(m, "appuser", "s3cret", ""))
+            _, cerr = sql.exec(db, "CREATE TABLE big (id INT PRIMARY KEY, b LONGBLOB)", [])
+            spec.assert_ok(cerr, "create")
+            n = 16777215 + 1000
+            data = make([]byte, n)
+            data[0] = 1 as byte
+            data[16777214] = 2 as byte
+            data[n - 1] = 3 as byte
+            _, ierr = sql.exec(db, "INSERT INTO big VALUES (?, ?)", [sql.int64(1), sql.blob(data)])
+            spec.assert_ok(ierr, "an execute packet over 0xffffff bytes")
+            r, qerr = sql.query_row(db, "SELECT b, LENGTH(b) FROM big WHERE id = 1", [])
+            spec.assert_ok(qerr, "a row over 0xffffff bytes (text protocol)")
+            got, _ = sql.bytes_at(r, 0)
+            spec.assert_eq(got.len, n, "every byte")
+            spec.assert_eq(got[0] as int, 1, "first")
+            spec.assert_eq(got[16777214] as int, 2, "at the split")
+            spec.assert_eq(got[n - 1] as int, 3, "last")
+            sql.close(db)
+            // maxAllowedPacket=1000000: an argument of 600000 bytes is sent ahead in long-data packets
+            db2, _ = sql.open("mysql", dsn(m, "appuser", "s3cret", "maxAllowedPacket=1000000"))
+            small = make([]byte, 600000)
+            small[599999] = 9 as byte
+            _, lerr = sql.exec(db2, "INSERT INTO big VALUES (?, ?)", [sql.int64(2), sql.blob(small)])
+            spec.assert_ok(lerr, "COM_STMT_SEND_LONG_DATA")
+            r2, _ = sql.query_row(db2, "SELECT LENGTH(b), ORD(SUBSTRING(b, 600000, 1)) FROM big WHERE id = ?", [sql.int64(2)])
+            l2, _ = sql.int_at(r2, 0)
+            spec.assert_eq_long(l2, 600000, "the server has every byte")
+            last, _ = sql.int_at(r2, 1)
+            spec.assert_eq_long(last, 9, "in order")
+            sql.close(db2)
+        }
+
+        spec.it("a bad statement's error has its number and SQLSTATE") callback {
+            if merr != "" { return }
+            db, _ = sql.open("mysql", dsn(m, "appuser", "s3cret", ""))
+            _, err = sql.exec(db, "SELECT * FROM nope", [])
+            spec.assert_str_eq(err, "Error 1146 (42S02): Table 'app.nope' doesn't exist", "ER_NO_SUCH_TABLE")
+            spec.assert_str_eq(sql.sqlstate(err), "42S02", "the SQLSTATE")
+            _, serr = sql.query(db, "SELEC 1", [])
+            spec.assert_eq(mysqldrv.error_number(serr), 1064, "ER_PARSE_ERROR")
+            _, perr = sql.prepare(db, "SELECT * FROM nope WHERE id = ?")
+            spec.assert_eq(mysqldrv.error_number(perr), 1146, "a prepare's error")
+            spec.assert_ok(sql.ping(db), "the connection survives")
+            sql.close(db)
+        }
+
+        spec.it("rolls back and commits transactions") callback {
+            if merr != "" { return }
+            db, _ = sql.open("mysql", dsn(m, "appuser", "s3cret", ""))
+            _, cerr = sql.exec(db, "CREATE TABLE tx (n INT) ENGINE=InnoDB", [])
+            spec.assert_ok(cerr, "create")
+            tx, berr = sql.begin(db)
+            spec.assert_ok(berr, "begin")
+            _, ierr = sql.tx_exec(tx, "INSERT INTO tx VALUES (?)", [sql.int64(1)])
+            spec.assert_ok(ierr, "insert in tx")
+            spec.assert_ok(sql.rollback(tx), "rollback")
+            r, _ = sql.query_row(db, "SELECT COUNT(*) FROM tx", [])
+            n, _ = sql.int_at(r, 0)
+            spec.assert_eq_long(n, 0, "rolled back: no row")
+            tx2, _ = sql.begin(db)
+            _, i2 = sql.tx_exec(tx2, "INSERT INTO tx VALUES (?)", [sql.int64(2)])
+            spec.assert_ok(i2, "insert")
+            spec.assert_ok(sql.commit(tx2), "commit")
+            r2, _ = sql.query_row(db, "SELECT n FROM tx", [])
+            v, _ = sql.int_at(r2, 0)
+            spec.assert_eq_long(v, 2, "committed: the row is there")
+            sql.close(db)
+        }
+
+        spec.it("runs wait.for_sql with a custom query, times out with wrong credentials") callback {
+            if merr != "" { return }
+            ok = wait.with_query(wait.for_sql(mymod.PORT, "mysql", |host: string, port: int| -> "appuser:s3cret@tcp(${host}:${port})/app"), "SELECT 10")
+            spec.assert_ok(wait.until_ready(ok, m.container), "custom query")
+            creds = wait.for_sql(mymod.PORT, "mysql", |host: string, port: int| -> "appuser:wrong@tcp(${host}:${port})/app")
+            wait.with_startup_timeout(creds, 3s)
+            cerr = wait.until_ready(creds, m.container)
+            spec.assert_contains(cerr, "timed out", "wrong credentials time out")
+            spec.assert_contains(cerr, "Error 1045 (28000)", "with the server's reason")
+        }
+        testing.cleanup_all()
+    }
+
+    spec.describe(fw, "sql with sql.mysql against MariaDB 12.3.2") {
+        md, derr = mariamod.run(MARIADB_IMAGE) {
+            database("app")
+            username("appuser")
+            password("s3cret")
+            tc.additional_wait(wait.for_sql(mariamod.PORT, "mysql", |host: string, port: int| -> "appuser:s3cret@tcp(${host}:${port})/app"))
+        }
+        if md != null { testing.cleanup_container(md.container) }
+
+        spec.it("starts with wait.for_sql, authenticates with mysql_native_password") callback {
+            spec.assert_ok(derr, "mariadb starts")
+            if derr != "" { return }
+            p, v, err = login(maria_dsn(md, "s3cret", ""), "SELECT VERSION()")
+            spec.assert_ok(err, "login")
+            spec.assert_str_eq(p, "mysql_native_password", "the plugin")
+            spec.assert_contains(v, "MariaDB", "the server")
+        }
+
+        spec.it("a wrong password is 1045 / 28000") callback {
+            if derr != "" { return }
+            db, _ = sql.open("mysql", maria_dsn(md, "wrong", ""))
+            err = sql.ping(db)
+            spec.assert_eq(mysqldrv.error_number(err), 1045, "ER_ACCESS_DENIED_ERROR")
+            spec.assert_str_eq(sql.sqlstate(err), "28000", "the SQLSTATE")
+            sql.close(db)
+        }
+
+        spec.it("prepared insert, typed select, LastInsertId, rollback and commit") callback {
+            if derr != "" { return }
+            db, _ = sql.open("mysql", maria_dsn(md, "s3cret", ""))
+            _, cerr = sql.exec(db, "CREATE TABLE t (id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20), ok BOOL, at TIMESTAMP NULL, f DOUBLE)", [])
+            spec.assert_ok(cerr, "create")
+            res, ierr = sql.exec(db, "INSERT INTO t (name, ok, at, f) VALUES (?, ?, ?, ?)", [sql.text("maria"), sql.boolean(true), sql.text("2024-02-29 12:00:01"), sql.float64(0.1)])
+            spec.assert_ok(ierr, "insert")
+            id, _ = sql.last_insert_id(res)
+            spec.assert_eq_long(id, 1, "LastInsertId")
+            r, qerr = sql.query_row(db, "SELECT id, name, ok, at, f FROM t WHERE id = ?", [sql.int64(id)])
+            spec.assert_ok(qerr, "select")
+            name, _ = sql.string_at(r, 1)
+            spec.assert_str_eq(name, "maria", "text")
+            okv, _ = sql.bool_at(r, 2)
+            spec.assert_true(okv, "bool")
+            at, _ = sql.string_at(r, 3)
+            spec.assert_str_eq(at, "2024-02-29 12:00:01", "timestamp as text")
+            f, _ = sql.string_at(r, 4)
+            spec.assert_str_eq(f, "0.1", "double, shortest form")
+            tx, _ = sql.begin(db)
+            _, terr = sql.tx_exec(tx, "DELETE FROM t", [])
+            spec.assert_ok(terr, "delete in tx")
+            spec.assert_ok(sql.rollback(tx), "rollback")
+            c, _ = sql.query_row(db, "SELECT COUNT(*) FROM t", [])
+            n, _ = sql.int_at(c, 0)
+            spec.assert_eq_long(n, 1, "still there")
+            _, berr = sql.exec(db, "INSERT INTO nope VALUES (1)", [])
+            spec.assert_str_eq(sql.sqlstate(berr), "42S02", "MariaDB's ER_NO_SUCH_TABLE")
+            sql.close(db)
+        }
+        testing.cleanup_all()
+    }
+    return spec.run_summary(fw)
+}

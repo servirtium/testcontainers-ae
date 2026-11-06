@@ -1,0 +1,65 @@
+// Ported from testcontainers-go modules/ravendb/ravendb.go
+//
+// modules.ravendb: a RavenDB server in unsecured, licence-accepted mode.
+//
+//     import modules.ravendb
+//
+//     c, err = ravendb.run("ravendb/ravendb:6.0-ubuntu-latest")
+//     defer tc.terminate(c)
+//     url, _ = ravendb.management_url(c)    // "http://localhost:32771"
+//     tcp, _ = ravendb.tcp_endpoint(c)      // "localhost:32772"
+//
+// Nothing is left out of the Go module's own API (its tests use the RavenDB
+// Go client, which has no Aether counterpart; the test calls the HTTP API).
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, management_url, tcp_endpoint,
+    HTTP_PORT, TCP_PORT, DEFAULT_IMAGE, ravendb_request_new, ravendb_request_free
+)
+
+const HTTP_PORT = "8080/tcp"
+const TCP_PORT = "38888/tcp"
+const DEFAULT_IMAGE = "ravendb/ravendb:6.0-ubuntu-latest"
+
+ravendb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, TCP_PORT)
+    tc.env(r, "RAVEN_Setup_Mode", "None")
+    tc.env(r, "RAVEN_License_Eula_Accepted", "true")
+    tc.env(r, "RAVEN_Security_UnsecuredAccessAllowed", "PublicNetwork")
+    tc.env(r, "RAVEN_Logs_Mode", "None")
+    tc.wait_deadline(r, 120s)
+    tc.wait_for(r, wait.for_http("/build/version") {
+        with_port(HTTP_PORT); with_status(200); with_startup_timeout(120s)
+    })
+    return r
+}
+
+ravendb_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with ravendb_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = ravendb_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run ravendb: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" of the management/HTTP API (Go's ManagementURL).
+management_url(c: *docker.Container) -> (string, string) {
+    ep, err = tc.endpoint(c, HTTP_PORT, "http")
+    if err != "" { return "", "port endpoint: ${err}" }
+    return ep, ""
+}
+
+// "host:port" of the server-to-server TCP port (Go's TCPEndpoint).
+tcp_endpoint(c: *docker.Container) -> (string, string) {
+    ep, err = tc.endpoint(c, TCP_PORT, "")
+    if err != "" { return "", "tcp port endpoint: ${err}" }
+    return ep, ""
+}

@@ -1,0 +1,133 @@
+// Ported from testcontainers-go modules/k6/k6.go
+//
+// modules.k6: a Grafana k6 load-test run. The container runs the script and
+// exits; `run` waits for the exit (wait.for_exit) and the result is the
+// container's exit code (0 passed, 108 a threshold/abort failure).
+//
+//     import modules.k6
+//
+//     c, err = k6.run("szkiba/k6x:v0.3.1") {
+//         test_script("modules/k6/scripts/pass.js")
+//         set_env_var("BASE_URL", "http://example.org")
+//     }
+//     defer tc.terminate(c)
+//     code, _ = k6.exit_code(c)
+//
+// Image: Go's szkiba/k6x:v0.3.1 (DEFAULT_IMAGE) no longer works (it fetches k6's
+// extension catalog from a GitHub path that now 404s, exit 116); the tests use
+// the official multi-arch grafana/k6, which takes the same arguments.
+//
+// Not ported: WithRemoteTestScript / DownloadableFile (Go downloads the
+// script while building the options; a setter cannot fail here, so download
+// it and pass the file to test_script). WithTestScriptReader is
+// test_script_content (a string, not an io.Reader).
+
+import std.string
+import std.os
+import std.json
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, test_script, test_script_content, cmd_options, set_env_var, cache,
+    cache_mount, exit_code, CACHE_TARGET, DEFAULT_IMAGE,
+    k6_request_new, k6_request_free
+)
+
+const CACHE_TARGET = "/cache"
+const DEFAULT_IMAGE = "szkiba/k6x:v0.3.1"
+
+k6_request_new() -> ptr {
+    r = tc.request_new()
+    tc.cmd_arg(r, "run")
+    tc.wait_for(r, wait.for_exit())
+    return r
+}
+
+k6_request_free(p: ptr) { tc.request_free(p) }
+
+fn base_name(p: string) -> string {
+    i = string.index_of(p, "/")
+    rest = p
+    while i >= 0 {
+        rest = string.substring(rest, i + 1, string.length(rest))
+        i = string.index_of(rest, "/")
+    }
+    return rest
+}
+
+// Go's WithTestScript: copy the host file to /home/k6x/<name> and pass it
+// to `k6 run`.
+test_script(_ctx: ptr, script_path: string) {
+    target = "/home/k6x/${base_name(script_path)}"
+    tc.file(_ctx, script_path, target, 420)
+    tc.cmd_arg(_ctx, target)
+}
+
+// Go's WithTestScriptReader: the script text and the file name it gets.
+test_script_content(_ctx: ptr, script: string, script_base_name: string) {
+    target = "/home/k6x/${script_base_name}"
+    tc.file_content(_ctx, script, target, 420)
+    tc.cmd_arg(_ctx, target)
+}
+
+// Go's WithCmdOptions: extra k6 arguments.
+cmd_options(_ctx: ptr, options: string[]) {
+    for o in options { tc.cmd_arg(_ctx, o) }
+}
+
+// Go's SetEnvVar: `--env NAME=value` for the script (not the container's env).
+set_env_var(_ctx: ptr, variable: string, value: string) {
+    tc.cmd_arg(_ctx, "--env")
+    tc.cmd_arg(_ctx, "${variable}=${value}")
+}
+
+// Go's WithCache: a volume at /cache for k6x's build cache. TC_K6_BUILD_CACHE
+// names an existing volume to share between runs; otherwise a volume named
+// after the session, which the reaper removes.
+cache(_ctx: ptr) {
+    vol = os.os_getenv("TC_K6_BUILD_CACHE")
+    if vol == null || string.length(vol) == 0 { vol = "k6-cache-${tc.session_id()}" }
+    tc.volume(_ctx, vol, CACHE_TARGET)
+}
+
+builder run(image: string) with k6_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = k6_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run k6: ${err}" }
+    return c, ""
+}
+
+// Go's CacheMount: the name of the volume mounted at /cache, "" if none.
+cache_mount(c: *docker.Container) -> (string, string) {
+    doc, err = tc.inspect(c)
+    if err != "" { return "", "inspect: ${err}" }
+    mounts, _ = json.object_get(doc, "Mounts")
+    n = json.json_array_size(mounts)
+    i = 0
+    while i < n {
+        m, _ = json.array_get(mounts, i)
+        tv, _ = json.object_get(m, "Type")
+        t, _ = json.get_string(tv)
+        dv, _ = json.object_get(m, "Destination")
+        d, _ = json.get_string(dv)
+        if t == "volume" && d == CACHE_TARGET {
+            nv, _ = json.object_get(m, "Name")
+            name, _ = json.get_string(nv)
+            json.free(doc)
+            return name, ""
+        }
+        i = i + 1
+    }
+    json.free(doc)
+    return "", ""
+}
+
+// What Go's test reads from ctr.State: the exit code of the finished run.
+exit_code(c: *docker.Container) -> (int, string) {
+    st, err = tc.state_of(c)
+    if err != "" { return 0, err }
+    return st.exit_code, ""
+}

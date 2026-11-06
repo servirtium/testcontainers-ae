@@ -1,0 +1,97 @@
+// Ported from testcontainers-go modules/couchdb/couchdb.go
+//
+// modules.couchdb: an Apache CouchDB container. The admin credentials
+// travel with the container in a struct, as Go's Container carries them.
+//
+//     import modules.couchdb
+//
+//     db, err = couchdb.run("couchdb:3") { admin_credentials("me", "secret") }
+//     defer tc.terminate(db.container)
+//     url, _ = couchdb.connection_string(db)   // "http://me:secret@localhost:32771"
+//
+// Go percent-encodes the credentials with url.UserPassword; so does
+// connection_string (every byte outside the RFC 3986 unreserved set).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    CouchDBContainer, run, connection_string, admin_credentials,
+    PORT, DEFAULT_USER, DEFAULT_PASSWORD, couchdb_request_new, couchdb_request_free
+)
+
+const PORT = "5984/tcp"
+const DEFAULT_USER = "admin"
+const DEFAULT_PASSWORD = "password"
+
+struct CouchDBContainer {
+    container: *docker.Container
+    user: string
+    password: string
+}
+
+// Go's moduleOpts: the port, admin/password, and a wait for GET /_up = 200.
+couchdb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.env(r, "COUCHDB_USER", DEFAULT_USER)
+    tc.env(r, "COUCHDB_PASSWORD", DEFAULT_PASSWORD)
+    tc.wait_for(r, wait.for_http("/_up") { with_port(PORT); with_status(200) })
+    return r
+}
+
+couchdb_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithAdminCredentials.
+admin_credentials(_ctx: ptr, user: string, password: string) {
+    tc.env(_ctx, "COUCHDB_USER", user)
+    tc.env(_ctx, "COUCHDB_PASSWORD", password)
+}
+
+// The credentials are read back from the request, so whatever the block
+// set (admin_credentials or a plain tc.env) is what the struct reports.
+builder run(image: string) with couchdb_request_new -> (*CouchDBContainer, string) {
+    r = _builder
+    if r == null { r = couchdb_request_new() }
+    user = tc.req_env(r, "COUCHDB_USER")
+    pw = tc.req_env(r, "COUCHDB_PASSWORD")
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run couchdb: ${err}" }
+    db = heap.new(CouchDBContainer)
+    db.container = c
+    db.user = user
+    db.password = pw
+    if err != "" { return db, "run couchdb: ${err}" }
+    return db, ""
+}
+
+// Percent-encode for the userinfo part of a URL: keep RFC 3986 unreserved
+// bytes (letters, digits, - . _ ~), encode the rest as %XX.
+fn userinfo_escape(s: string) -> string {
+    hex = "0123456789ABCDEF"
+    out = ""
+    b = string.bytes(s)
+    i = 0
+    while i < b.len {
+        ch = b[i]
+        keep = (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 45 || ch == 46 || ch == 95 || ch == 126
+        if keep {
+            out = string.concat(out, string.substring(s, i, i + 1))
+        } else {
+            hi = string.substring(hex, (ch >> 4) & 15, ((ch >> 4) & 15) + 1)
+            lo = string.substring(hex, ch & 15, (ch & 15) + 1)
+            out = "${out}%${hi}${lo}"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// "http://user:password@host:port" (Go's ConnectionString).
+connection_string(db: *CouchDBContainer) -> (string, string) {
+    ep, err = tc.endpoint(db.container, PORT, "")
+    if err != "" { return "", err }
+    return "http://${userinfo_escape(db.user)}:${userinfo_escape(db.password)}@${ep}", ""
+}

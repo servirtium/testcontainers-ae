@@ -1,0 +1,116 @@
+// Ported from testcontainers-go modules/yugabytedb/yugabytedb.go, modules/yugabytedb/options.go
+//
+// modules.yugabytedb: a single-node YugabyteDB container (YSQL, the
+// PostgreSQL-compatible API on 5433; YCQL, the Cassandra-compatible API on 9042).
+//
+//     import modules.yugabytedb
+//
+//     y, err = yugabytedb.run("yugabytedb/yugabyte:2024.1.3.0-b105") {
+//         database_name("app"); database_user("app"); database_password("secret")
+//         keyspace("ks"); user("cassandra"); password("cassandra")
+//     }
+//     defer tc.terminate(y.container)
+//     dsn, _ = yugabytedb.ysql_connection_string(y, ["sslmode=disable"])
+//     ycql, _ = yugabytedb.ycql_host(y)         // "localhost:32772" (added)
+//
+// The YSQL database, user and password are read back from the request's
+// environment, so what the block set is what the connection string uses.
+//
+// Status: compile-checked only. The test builds but is skipped unless
+// TCAE_YUGABYTEDB=1: on the Podman machine used for the port the container
+// was killed (exit 137) while yugabyted was still starting.
+//
+// Not ported: YCQLConfigureClusterConfig (it fills in a gocql ClusterConfig;
+// ycql_host and the YCQL credentials, which are the YCQL_* env of the
+// request, are what a client needs), and the pgx / gocql client code of Go's
+// tests and examples.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    YugabyteContainer, run, ysql_connection_string, ycql_host,
+    database_name, database_user, database_password, keyspace, user, password,
+    YSQL_PORT, YCQL_PORT, DEFAULT_IMAGE, yugabytedb_request_new, yugabytedb_request_free
+)
+
+const YSQL_PORT = "5433/tcp"
+const YCQL_PORT = "9042/tcp"
+const DEFAULT_IMAGE = "yugabytedb/yugabyte:2024.1.3.0-b105"
+
+struct YugabyteContainer {
+    container: *docker.Container
+    ysql_database_name: string
+    ysql_database_user: string
+    ysql_database_password: string
+}
+
+yugabytedb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.cmd(r, ["bin/yugabyted", "start", "--background=false"])
+    tc.wait_for(r, wait.for_all([
+        wait.for_log("YugabyteDB Started") { with_occurrence(1) },
+        wait.for_log("Data placement constraint successfully verified") { with_occurrence(1) },
+        wait.for_listening_port(YSQL_PORT),
+        wait.for_listening_port(YCQL_PORT)
+    ]))
+    tc.expose(r, YCQL_PORT)
+    tc.expose(r, YSQL_PORT)
+    tc.env(r, "YCQL_KEYSPACE", "yugabyte")
+    tc.env(r, "YCQL_USER", "yugabyte")
+    tc.env(r, "YCQL_PASSWORD", "yugabyte")
+    tc.env(r, "YSQL_DB", "yugabyte")
+    tc.env(r, "YSQL_USER", "yugabyte")
+    tc.env(r, "YSQL_PASSWORD", "yugabyte")
+    return r
+}
+
+yugabytedb_request_free(p: ptr) { tc.request_free(p) }
+
+// ---- options ----
+
+// Go's WithDatabaseName, WithDatabaseUser, WithDatabasePassword (YSQL).
+database_name(_ctx: ptr, name: string) { tc.env(_ctx, "YSQL_DB", name) }
+database_user(_ctx: ptr, name: string) { tc.env(_ctx, "YSQL_USER", name) }
+database_password(_ctx: ptr, pw: string) { tc.env(_ctx, "YSQL_PASSWORD", pw) }
+// Go's WithKeyspace, WithUser, WithPassword (YCQL).
+keyspace(_ctx: ptr, name: string) { tc.env(_ctx, "YCQL_KEYSPACE", name) }
+user(_ctx: ptr, name: string) { tc.env(_ctx, "YCQL_USER", name) }
+password(_ctx: ptr, pw: string) { tc.env(_ctx, "YCQL_PASSWORD", pw) }
+
+builder run(image: string) with yugabytedb_request_new -> (*YugabyteContainer, string) {
+    r = _builder
+    if r == null { r = yugabytedb_request_new() }
+    db = tc.req_env(r, "YSQL_DB")
+    u = tc.req_env(r, "YSQL_USER")
+    pw = tc.req_env(r, "YSQL_PASSWORD")
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run yugabytedb: ${err}" }
+    y = heap.new(YugabyteContainer)
+    y.container = c
+    y.ysql_database_name = db
+    y.ysql_database_user = u
+    y.ysql_database_password = pw
+    if err != "" { return y, "run yugabytedb: ${err}" }
+    return y, ""
+}
+
+// "postgres://user:password@host:port/db?a&b" (Go's YSQLConnectionString;
+// args are joined with &, e.g. "sslmode=disable"; with none the URL ends in "?").
+ysql_connection_string(y: *YugabyteContainer, args: string[]) -> (string, string) {
+    ep, err = tc.endpoint(y.container, YSQL_PORT, "")
+    if err != "" { return "", "port endpoint: ${err}" }
+    extra = ""
+    for a in args {
+        if string.length(extra) > 0 { extra = "${extra}&" }
+        extra = "${extra}${a}"
+    }
+    return "postgres://${y.ysql_database_user}:${y.ysql_database_password}@${ep}/${y.ysql_database_name}?${extra}", ""
+}
+
+// "host:port" of the YCQL (CQL native protocol) port.
+ycql_host(y: *YugabyteContainer) -> (string, string) {
+    return tc.endpoint(y.container, YCQL_PORT, "")
+}

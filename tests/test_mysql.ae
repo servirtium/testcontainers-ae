@@ -1,0 +1,223 @@
+// Ported from testcontainers-go modules/mysql/mysql_test.go
+//
+// A real MySQL. Two ways to show it is up, as the task asks and as Go does:
+// the server's handshake packet over std.tcp at the mapped port (protocol
+// version 10 and the server version string), and real SQL through the
+// mysql client inside the image over TCP (Go's runSQL), which also proves
+// the credentials, the database, init scripts and the config file. Go's
+// database/sql example (ExampleRun_connect) runs through this repository's
+// `sql` and its MySQL driver, waiting with wait.for_sql (tests/test_sql_mysql*.ae
+// test the driver itself).
+
+import std.spec
+import std.string
+import std.tcp
+import std.json
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.mysql as mysql        // aliased (to its own name): sql.mysql below has the same last name (README "Known gaps")
+import testcontainers.wait
+import sql
+import sql.mysql as mysqldrv          // the driver behind wait.for_sql's "mysql"
+
+const IMAGE = "mysql:8.0.36"
+
+// Read the server greeting: (protocol version, server version, error). The
+// packet is 3 bytes length, 1 byte sequence, then protocol byte 10 and the
+// NUL-terminated server version.
+// The container's Config.Env as JSON text.
+fn container_env(c: *docker.Container) -> string {
+    doc, err = tc.inspect(c)
+    if err != "" { return "" }
+    cfg, _ = json.object_get(doc, "Config")
+    ev, _ = json.object_get(cfg, "Env")
+    out, _ = json.encode(ev)
+    json.free(doc)
+    return out
+}
+
+fn greeting(host: string, port: int) -> (int, string, string) {
+    sock, cerr = tcp.connect(host, port)
+    if cerr != "" { return 0, "", cerr }
+    buf = ""
+    total = 0
+    tries = 0
+    while tries < 100 && total < 16 {
+        chunk, n, rerr = tcp.read_n(sock, 512)
+        if rerr != "" && rerr != "timeout" { tcp.tcp_close(sock); return 0, "", rerr }
+        if n > 0 {
+            if total == 0 { buf = chunk }
+            else { buf = string.concat(buf, chunk) }
+            total = total + n
+        }
+        tries = tries + 1
+    }
+    tcp.tcp_close(sock)
+    if total < 6 { return 0, "", "short greeting (${total} bytes)" }
+    proto = string.char_at_n(buf, total, 4)
+    ver = ""
+    i = 5
+    while i < total {
+        ch = string.char_at_n(buf, total, i)
+        if ch == 0 { i = total } else { ver = "${ver}${string.from_char(ch)}"; i = i + 1 }
+    }
+    return proto, ver, ""
+}
+
+// Go's runSQL: the in-image client over TCP; returns trimmed output, "" and
+// an error string on a non-zero exit.
+fn run_sql(m: *mysql.MySQLContainer, user: string, pw: string, db: string, query: string) -> (string, string) {
+    res, err = tc.exec_with(m.container, [
+        "mysql", "--ssl-mode=REQUIRED", "--protocol=TCP", "--host=127.0.0.1", "--port=3306",
+        "--connect-timeout=10", "--user=${user}", "--database=${db}",
+        "--batch", "--skip-column-names", "--execute=${query}"
+    ], "", "", ["MYSQL_PWD=${pw}"])
+    if err != "" { return "", err }
+    if res.exit_code != 0 { return "", "mysql exited ${res.exit_code}: ${res.output}" }
+    return string.trim(res.output), ""
+}
+
+fn check_greeting(m: *mysql.MySQLContainer) {
+    h, _ = tc.host(m.container)
+    port, perr = tc.mapped_port(m.container, mysql.PORT)
+    spec.assert_ok(perr, "mapped port")
+    proto, ver, gerr = greeting(h, port)
+    spec.assert_ok(gerr, "read the greeting from ${h}:${port}")
+    spec.assert_eq(proto, 10, "handshake protocol version 10")
+    spec.assert_true(string.starts_with(ver, "8.0.36") == 1, "server version is 8.0.36: ${ver}")
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    mysqldrv.register()
+
+    spec.describe(fw, "modules/mysql") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("connects with database/sql after wait.for_sql (ExampleRun_connect)") callback {
+            m, err = mysql.run(IMAGE) {
+                database("foo")
+                username("root")
+                password("password")
+                tc.additional_wait(wait.for_sql(mysql.PORT, "mysql", |h: string, p: int| -> "root:password@tcp(${h}:${p})/foo"))
+            }
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "mysql starts and answers SELECT 1")
+            if err == "" {
+                dsn, _ = mysql.connection_string(m, "")
+                db, oerr = sql.open("mysql", dsn)
+                spec.assert_ok(oerr, "sql.Open")
+                spec.assert_ok(sql.ping(db), "db.Ping")
+                r, qerr = sql.query_row(db, "SELECT DATABASE(), CURRENT_USER()", [])
+                spec.assert_ok(qerr, "query")
+                name, _ = sql.string_at(r, 0)
+                spec.assert_str_eq(name, "foo", "the module's database")
+                sql.close(db)
+            }
+        }
+
+        spec.it("starts with the default credentials (TestMySQL)") callback {
+            m, err = mysql.run(IMAGE)
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "mysql starts")
+            if err == "" {
+                dsn, derr = mysql.connection_string(m, "tls=skip-verify")
+                spec.assert_ok(derr, "connection string")
+                spec.assert_true(string.starts_with(dsn, "test:test@tcp(") == 1, "user:password@tcp(: ${dsn}")
+                spec.assert_true(string.contains(dsn, ")/test?tls=skip-verify") == 1, "/database?args: ${dsn}")
+                spec.assert_true(string.ends_with(dsn, "?tls=skip-verify") == 1, "ends with the args")
+                plain, _ = mysql.connection_string(m, "")
+                spec.assert_true(string.ends_with(plain, ")/test") == 1, "no ? without args: ${plain}")
+                check_greeting(m)
+                _, serr = run_sql(m, "test", "test", "test", "CREATE TABLE IF NOT EXISTS a_table (col_1 VARCHAR(128) NOT NULL, col_2 VARCHAR(128) NOT NULL, PRIMARY KEY (col_1, col_2))")
+                spec.assert_ok(serr, "CREATE TABLE as test/test")
+            }
+        }
+
+        spec.it("takes a custom database, user and password") callback {
+            m, err = mysql.run(IMAGE) {
+                database("foo")
+                username("alice")
+                password("s3cret")
+            }
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "mysql starts")
+            if err == "" {
+                dsn, _ = mysql.connection_string(m, "")
+                spec.assert_true(string.starts_with(dsn, "alice:s3cret@tcp(") == 1, "custom credentials in the DSN: ${dsn}")
+                spec.assert_true(string.ends_with(dsn, ")/foo") == 1, "custom database in the DSN: ${dsn}")
+                who, serr = run_sql(m, "alice", "s3cret", "foo", "SELECT CURRENT_USER(), DATABASE()")
+                spec.assert_ok(serr, "the server accepts alice/s3cret on foo")
+                spec.assert_contains(who, "alice@", "logged in as alice")
+                spec.assert_contains(who, "foo", "in database foo")
+                _, bad = run_sql(m, "alice", "wrong", "foo", "SELECT 1")
+                spec.assert_true(string.length(bad) > 0, "a wrong password is refused")
+            }
+        }
+
+        spec.it("refuses a non-root user with an empty password (TestMySQLWithNonRootUserAndEmptyPassword)") callback {
+            m, err = mysql.run(IMAGE) {
+                database("foo")
+                username("test")
+                password("")
+            }
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_contains(err, "empty password can be used only with the root user", "the credentials check")
+            spec.assert_true(m == null, "no container was started")
+        }
+
+        spec.it("allows root with an empty password (TestMySQLWithRootUserAndEmptyPassword)") callback {
+            m, err = mysql.run(IMAGE) {
+                database("foo")
+                username("root")
+                password("")
+            }
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "mysql starts")
+            if err == "" {
+                dsn, _ = mysql.connection_string(m, "")
+                spec.assert_true(string.starts_with(dsn, "root:@tcp(") == 1, "root with no password: ${dsn}")
+                check_greeting(m)
+                _, serr = run_sql(m, "root", "", "foo", "CREATE TABLE IF NOT EXISTS a_table (col_1 VARCHAR(128) NOT NULL, PRIMARY KEY (col_1))")
+                spec.assert_ok(serr, "CREATE TABLE as root with no password")
+                envs = container_env(m.container)
+                spec.assert_false(string.contains(envs, "\"MYSQL_USER=") == 1, "MYSQL_USER is dropped, not set empty: ${envs}")
+                spec.assert_false(string.contains(envs, "\"MYSQL_PASSWORD=") == 1, "MYSQL_PASSWORD is dropped")
+                spec.assert_contains(envs, "\"MYSQL_ALLOW_EMPTY_PASSWORD=yes\"", "empty root password allowed")
+            }
+        }
+
+        spec.it("runs init scripts (TestMySQLWithScripts)") callback {
+            m, err = mysql.run(IMAGE) {
+                scripts(["modules/mysql/testdata/schema.sql"])
+            }
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "mysql starts")
+            if err == "" {
+                name, serr = run_sql(m, "test", "test", "test", "SELECT name from profile")
+                spec.assert_ok(serr, "SELECT")
+                spec.assert_str_eq(name, "profile 1", "the script's row")
+            }
+        }
+
+        spec.it("starts from a config file (WithConfigFile)") callback {
+            m, err = mysql.run(IMAGE) {
+                config_file("modules/mysql/testdata/my_8.cnf")
+            }
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "mysql starts")
+            if err == "" {
+                conf, cerr = tc.copy_file_from_container(m.container, "/etc/mysql/conf.d/my.cnf")
+                spec.assert_ok(cerr, "the config file is in the container")
+                spec.assert_contains(conf, "skip-name-resolve", "it is the file we gave")
+                v, serr = run_sql(m, "test", "test", "test", "SELECT @@GLOBAL.skip_name_resolve, @@GLOBAL.host_cache_size")
+                spec.assert_ok(serr, "SELECT")
+                spec.assert_contains(v, "1\t0", "skip_name_resolve=1, host_cache_size=0 from the file")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

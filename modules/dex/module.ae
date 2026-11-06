@@ -1,0 +1,292 @@
+// Ported from testcontainers-go modules/dex (dex.go, options.go, config.go, types.go)
+//
+// modules.dex: a Dex OpenID Connect provider with a generated config.
+//
+//     import modules.dex
+//
+//     c, err = dex.run("dexidp/dex:v2.45.0") {
+//         client("my-app", "secret", "My App", ["http://localhost:3000/cb"], [], false)
+//         user("alice@example.com", "alice", "$2a$10$...bcrypt...", "")
+//     }
+//     defer dex.terminate(c)
+//     issuer = dex.issuer_url(c)          // "http://localhost:32771/dex"
+//     disco = dex.config_endpoint(c)      // issuer + "/.well-known/openid-configuration"
+//
+// As in Go the config is written into the container after it starts (the
+// entrypoint waits for /etc/dex/dex.yml), because the issuer holds the mapped
+// port; run returns once the discovery document and the gRPC port answer.
+//
+// Differences from Go:
+//  * user takes a bcrypt HASH of the password, not the password: there is no
+//    bcrypt in Aether's std, and Go hashes at render time. Make one with
+//    `htpasswd -bnBC 10 "" pw | tr -d ':\n'` or any bcrypt tool.
+//  * the user id, when "", is generated as a v4 UUID (std.uuid) at run.
+//  * the container is a *DexContainer holding the issuer; terminate it with
+//    dex.terminate(c).
+//
+// Not ported: the gRPC API helpers (AddClient / RemoveClient / AddUser /
+// RemoveUser, grpc.go: they need a protobuf/gRPC client), the slog logger
+// option (WithLogger; log_level is ported), and Go's tests' OIDC client libs.
+
+import std.string
+import std.uuid
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    DexContainer, run, terminate, container_of, issuer_url, config_endpoint, jwks_endpoint,
+    token_endpoint, auth_endpoint, grpc_endpoint,
+    client, user, connector, issuer, skip_approval_screen, storage,
+    disable_password_db, log_level, enable_client_credentials, render_config,
+    HTTP_PORT, GRPC_PORT, CONFIG_PATH, DEFAULT_IMAGE,
+    dex_request_new, dex_request_free
+)
+
+const HTTP_PORT = "5556/tcp"
+const GRPC_PORT = "5557/tcp"
+const CONFIG_PATH = "/etc/dex/dex.yml"
+const DEFAULT_IMAGE = "dexidp/dex:v2.45.0"
+
+// module settings
+const S_CLIENTS = "dex.clients"      // YAML list entries
+const S_USERS = "dex.users"
+const S_CONNECTORS = "dex.connectors"
+const S_ISSUER = "dex.issuer"
+const S_SKIP = "dex.skip_approval"
+const S_STORAGE = "dex.storage"
+const S_NOPASSDB = "dex.disable_password_db"
+const S_LOGLEVEL = "dex.log_level"
+const S_CREDGRANT = "dex.client_credentials"
+const S_ERROR = "dex.error"
+
+struct DexContainer {
+    container: *docker.Container
+    issuer: string
+}
+
+dex_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, GRPC_PORT)
+    tc.entrypoint(r, ["/bin/sh"])
+    tc.cmd(r, ["-c", "while [ ! -f ${CONFIG_PATH} ]; do sleep 0.1; done; exec dex serve ${CONFIG_PATH}"])
+    return r
+}
+
+dex_request_free(p: ptr) { tc.request_free(p) }
+
+// A double-quoted YAML scalar.
+fn q(s: string) -> string {
+    out = string.replace_all(s, "\\", "\\\\")
+    out = string.replace_all(out, "\"", "\\\"")
+    out = string.replace_all(out, "\n", "\\n")
+    return "\"${out}\""
+}
+
+fn flow_list(xs: string[]) -> string {
+    out = "["
+    i = 0
+    while i < xs.len {
+        if i > 0 { out = "${out}, " }
+        out = "${out}${q(xs[i])}"
+        i = i + 1
+    }
+    return "${out}]"
+}
+
+fn append_setting(r: ptr, key: string, text: string) {
+    tc.set_setting(r, key, "${tc.req_setting(r, key)}${text}")
+}
+
+fn fail(r: ptr, msg: string) {
+    if string.length(tc.req_setting(r, S_ERROR)) == 0 { tc.set_setting(r, S_ERROR, msg) }
+}
+
+fn valid_grant(g: string) -> bool {
+    return g == "authorization_code" || g == "refresh_token" || g == "client_credentials" || g == "password"
+}
+
+// Go's WithClient(NewClient(id, WithClientSecret, WithClientName,
+// WithClientRedirectURIs, WithClientGrantTypes, WithClientPublic)); "" and
+// empty lists leave a field out.
+client(_ctx: ptr, id: string, secret: string, name: string, redirect_uris: string[], grant_types: string[], is_public: bool) {
+    if string.length(id) == 0 { fail(_ctx, "dex: client id must not be blank")
+        return }
+    for g in grant_types {
+        if !valid_grant(g) { fail(_ctx, "dex: unsupported client grant type \"${g}\"")
+            return }
+    }
+    for u in redirect_uris {
+        if string.length(u) == 0 { fail(_ctx, "dex: client redirect URI must not be blank")
+            return }
+    }
+    t = "- id: ${q(id)}\n  secret: ${q(secret)}\n  name: ${q(name)}\n  public: ${is_public}\n"
+    if redirect_uris.len > 0 { t = "${t}  redirectURIs: ${flow_list(redirect_uris)}\n" }
+    if grant_types.len > 0 { t = "${t}  grantTypes: ${flow_list(grant_types)}\n" }
+    append_setting(_ctx, S_CLIENTS, t)
+}
+
+// Go's WithUser(NewUser(email, username, password, WithUserID)), with the
+// password already bcrypt-hashed. user_id "" generates a UUID.
+user(_ctx: ptr, email: string, username: string, bcrypt_hash: string, user_id: string) {
+    if string.length(email) == 0 { fail(_ctx, "dex: user email must not be blank")
+        return }
+    if string.length(username) == 0 { fail(_ctx, "dex: user username must not be blank")
+        return }
+    if string.length(bcrypt_hash) == 0 { fail(_ctx, "dex: user password hash must not be blank")
+        return }
+    uid = user_id
+    if string.length(uid) == 0 {
+        u4, _ = uuid.v4()
+        uid = u4
+    }
+    append_setting(_ctx, S_USERS, "- email: ${q(email)}\n  hash: ${q(bcrypt_hash)}\n  username: ${q(username)}\n  userID: ${q(uid)}\n")
+}
+
+// Go's WithConnector(type, id, name): type "mockCallback" is the test-only
+// connector; "password" is the built-in one and is a no-op, as in Go.
+connector(_ctx: ptr, ctype: string, id: string, name: string) {
+    if ctype == "password" { return }
+    if string.length(id) == 0 { fail(_ctx, "dex: connector id must not be blank")
+        return }
+    if string.length(name) == 0 { fail(_ctx, "dex: connector name must not be blank")
+        return }
+    append_setting(_ctx, S_CONNECTORS, "- type: ${q(ctype)}\n  id: ${q(id)}\n  name: ${q(name)}\n")
+}
+
+// Go's WithIssuer: overrides the issuer URL otherwise built from the mapped port.
+issuer(_ctx: ptr, url: string) {
+    if string.length(url) == 0 { fail(_ctx, "dex: issuer URL must not be blank")
+        return }
+    tc.set_setting(_ctx, S_ISSUER, url)
+}
+
+skip_approval_screen(_ctx: ptr, skip: bool) { tc.set_setting(_ctx, S_SKIP, "${skip}") }
+
+// Go's WithStorage: "sqlite3" (default) or "memory".
+storage(_ctx: ptr, kind: string) {
+    if string.length(kind) == 0 { fail(_ctx, "dex: storage must not be blank")
+        return }
+    tc.set_setting(_ctx, S_STORAGE, kind)
+}
+
+disable_password_db(_ctx: ptr) { tc.set_setting(_ctx, S_NOPASSDB, "true") }
+
+// Go's WithLogLevel, as dex's own names: "debug", "info", "warn", "error".
+log_level(_ctx: ptr, level: string) { tc.set_setting(_ctx, S_LOGLEVEL, level) }
+
+enable_client_credentials(_ctx: ptr) {
+    tc.set_setting(_ctx, S_CREDGRANT, "true")
+    tc.env(_ctx, "DEX_CLIENT_CREDENTIAL_GRANT_ENABLED_BY_DEFAULT", "true")
+}
+
+// Go's render: the dex.yml for an issuer and the settings (as strings:
+// the same values run reads off the request).
+render_config(issuer_url: string, storage_kind: string, skip: bool, password_db: bool, cred_grant: bool, level: string, clients: string, users: string, connectors: string) -> (string, string) {
+    if string.length(issuer_url) == 0 { return "", "dex: issuer is empty" }
+    if !password_db && string.length(connectors) == 0 {
+        return "", "dex: no auth source configured"
+    }
+    y = "issuer: ${q(issuer_url)}\nstorage:\n  type: ${q(storage_kind)}\n"
+    if storage_kind == "sqlite3" { y = "${y}  config:\n    file: \"/var/dex/dex.db\"\n" }
+    y = "${y}web:\n  http: \"0.0.0.0:5556\"\ngrpc:\n  addr: \"0.0.0.0:5557\"\nlogger:\n  level: ${q(level)}\n"
+    y = "${y}oauth2:\n  skipApprovalScreen: ${skip}\n  grantTypes: [\"authorization_code\", \"refresh_token\", \"password\""
+    if cred_grant { y = "${y}, \"client_credentials\"" }
+    y = "${y}]\n"
+    if password_db { y = "${y}  passwordConnector: \"local\"\n" }
+    y = "${y}enablePasswordDB: ${password_db}\n"
+    if string.length(clients) > 0 { y = "${y}staticClients:\n${indent_list(clients)}" }
+    if string.length(users) > 0 { y = "${y}staticPasswords:\n${indent_list(users)}" }
+    if string.length(connectors) > 0 { y = "${y}connectors:\n${indent_list(connectors)}" }
+    return y, ""
+}
+
+// The list entries are already "- k: v\n  k: v\n"; a top-level list is fine
+// at column 0, so they are used as they are.
+fn indent_list(s: string) -> string { return s }
+
+fn path_of(url: string) -> string {
+    i = string.index_of(url, "://")
+    rest = url
+    if i >= 0 { rest = string.substring(url, i + 3, string.length(url)) }
+    s = string.index_of(rest, "/")
+    if s < 0 { return "" }
+    p = string.substring(rest, s, string.length(rest))
+    while string.ends_with(p, "/") == 1 { p = string.substring(p, 0, string.length(p) - 1) }
+    return p
+}
+
+builder run(image: string) with dex_request_new -> (*DexContainer, string) {
+    r = _builder
+    if r == null { r = dex_request_new() }
+    d = heap.new(DexContainer)
+    d.container = null
+    d.issuer = ""
+    perr = tc.req_setting(r, S_ERROR)
+    if string.length(perr) > 0 {
+        tc.request_free(r)
+        return d, "dex: apply option: ${perr}"
+    }
+    given_issuer = tc.req_setting(r, S_ISSUER)
+    storage_kind = tc.req_setting(r, S_STORAGE)
+    if string.length(storage_kind) == 0 { storage_kind = "sqlite3" }
+    skip = tc.req_setting(r, S_SKIP) != "false"
+    password_db = tc.req_setting(r, S_NOPASSDB) != "true"
+    cred_grant = tc.req_setting(r, S_CREDGRANT) == "true"
+    level = tc.req_setting(r, S_LOGLEVEL)
+    if string.length(level) == 0 { level = "info" }
+    clients = tc.req_setting(r, S_CLIENTS)
+    users = tc.req_setting(r, S_USERS)
+    connectors = tc.req_setting(r, S_CONNECTORS)
+
+    tc.on_post_start(r, |c: *docker.Container| {
+        iss = given_issuer
+        if string.length(iss) == 0 {
+            h, herr = tc.host(c)
+            if herr != "" { return "dex: host: ${herr}" }
+            mp, merr = tc.mapped_port(c, HTTP_PORT)
+            if merr != "" { return "dex: mapped port: ${merr}" }
+            iss = "http://${h}:${mp}/dex"
+        }
+        d.issuer = iss
+        yml, rerr = render_config(iss, storage_kind, skip, password_db, cred_grant, level, clients, users, connectors)
+        if rerr != "" { return rerr }
+        cerr = tc.copy_to_container(c, yml, CONFIG_PATH, 420)
+        if cerr != "" { return "dex: copy yaml: ${cerr}" }
+        disco = "${path_of(iss)}/.well-known/openid-configuration"
+        ready = wait.for_all([
+            wait.for_http(disco) { with_port(HTTP_PORT); with_startup_timeout(60s) },
+            wait.for_listening_port(GRPC_PORT) { with_startup_timeout(60s) }
+        ])
+        return wait.until_ready(ready, c)
+    })
+
+    c, err = tc.run_request(r, image)
+    d.container = c
+    if err != "" { return d, "dex: run: ${err}" }
+    return d, ""
+}
+
+terminate(d: *DexContainer) -> string {
+    if d == null { return "" }
+    return tc.terminate(d.container)
+}
+
+container_of(d: *DexContainer) -> *docker.Container { return d.container }
+
+issuer_url(d: *DexContainer) -> string { return d.issuer }
+config_endpoint(d: *DexContainer) -> string { return "${d.issuer}/.well-known/openid-configuration" }
+jwks_endpoint(d: *DexContainer) -> string { return "${d.issuer}/keys" }
+token_endpoint(d: *DexContainer) -> string { return "${d.issuer}/token" }
+auth_endpoint(d: *DexContainer) -> string { return "${d.issuer}/auth" }
+
+// "host:port" of the gRPC API.
+grpc_endpoint(d: *DexContainer) -> (string, string) {
+    if d == null || d.container == null { return "", "dex: container not started" }
+    h, herr = tc.host(d.container)
+    if herr != "" { return "", "dex: host: ${herr}" }
+    mp, merr = tc.mapped_port(d.container, GRPC_PORT)
+    if merr != "" { return "", "dex: mapped grpc port: ${merr}" }
+    return "${h}:${mp}", ""
+}

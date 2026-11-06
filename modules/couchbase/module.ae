@@ -1,0 +1,601 @@
+// Ported from testcontainers-go modules/couchbase/couchbase.go, modules/couchbase/options.go, modules/couchbase/service.go, modules/couchbase/bucket.go, modules/couchbase/storage_mode.go
+//
+// modules.couchbase: a Couchbase Server container, initialised the way Go
+// does it through the cluster REST API on 8091: wait for the node, learn
+// whether it is the enterprise edition, rename the node to its container IP,
+// set up the services and memory quotas, configure the admin user and the
+// external (mapped) ports, set the index storage mode, wait for every node
+// and service to be healthy, then create the buckets (and their primary
+// indexes).
+//
+//     import modules.couchbase
+//
+//     c, err = couchbase.run("couchbase:community-7.1.1") {
+//         bucket_with("travel", 100, 0, false, true)   // or bucket("travel")
+//         admin_credentials("admin", "secret1")
+//         index_storage(couchbase.FORESTDB)
+//     }
+//     defer tc.terminate(c.container)
+//     url, _ = couchbase.connection_string(c)      // "couchbase://localhost:32771"
+//
+// The options are module settings on the request (tc.set_setting) read by
+// `run`. Go's bucket builder (NewBucket(...).WithQuota(...).WithReplicas(...))
+// becomes bucket(name) with the defaults (quota 100 MB, no replicas, no
+// flush, primary index) or bucket_with(name, quota, replicas, flush, primary
+// index), clamped as Go clamps (quota >= 100, replicas 0..3).
+//
+// The images are amd64 only; the test ran against couchbase:community-7.1.1
+// under emulation.
+//
+// Not ported: the deprecated Option / Config / StartContainer / RunContainer
+// API (WithEventingService, WithAnalyticsService, WithCredentials,
+// WithBucket, WithImageName, WithIndexStorageMode); the Couchbase SDK of
+// Go's tests.
+
+import std.string
+import std.json
+import std.encoding
+import std.url
+import std.http.client
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    CouchbaseContainer, run, connection_string, username, password,
+    bucket, bucket_with, admin_credentials, index_storage,
+    service_analytics, service_eventing,
+    MGMT_PORT, MGMT_SSL_PORT, VIEW_PORT, VIEW_SSL_PORT, QUERY_PORT,
+    QUERY_SSL_PORT, SEARCH_PORT, SEARCH_SSL_PORT, ANALYTICS_PORT,
+    ANALYTICS_SSL_PORT, EVENTING_PORT, EVENTING_SSL_PORT, KV_PORT, KV_SSL_PORT,
+    MEMORY_OPTIMIZED, PLASMA, FORESTDB, DEFAULT_IMAGE,
+    couchbase_request_new, couchbase_request_free
+)
+
+const MGMT_PORT = "8091"
+const MGMT_SSL_PORT = "18091"
+const VIEW_PORT = "8092"
+const VIEW_SSL_PORT = "18092"
+const QUERY_PORT = "8093"
+const QUERY_SSL_PORT = "18093"
+const SEARCH_PORT = "8094"
+const SEARCH_SSL_PORT = "18094"
+const ANALYTICS_PORT = "8095"
+const ANALYTICS_SSL_PORT = "18095"
+const EVENTING_PORT = "8096"
+const EVENTING_SSL_PORT = "18096"
+const KV_PORT = "11210"
+const KV_SSL_PORT = "11207"
+
+// Go's indexStorageMode values.
+const MEMORY_OPTIMIZED = "memory_optimized"
+const PLASMA = "plasma"
+const FORESTDB = "forestdb"
+
+const DEFAULT_IMAGE = "couchbase:6.5.1"
+
+// the service identifiers (Go's Service.identifier)
+const SVC_KV = "kv"
+const SVC_QUERY = "n1ql"
+const SVC_SEARCH = "fts"
+const SVC_INDEX = "index"
+const SVC_ANALYTICS = "cbas"
+const SVC_EVENTING = "eventing"
+
+const S_BUCKETS = "couchbase.buckets"     // "name\tquota\treplicas\tflush\tprimary" lines
+const S_EXTRA_SVCS = "couchbase.services" // the optional services, comma separated
+const S_USER = "couchbase.username"
+const S_PASSWORD = "couchbase.password"
+const S_MODE = "couchbase.index_storage"
+const S_ERROR = "couchbase.error"
+
+struct CouchbaseContainer {
+    container: *docker.Container
+    user: string
+    pass: string
+    services: string[]
+    enterprise: bool
+    index_mode: string
+}
+
+// Go's initialServices (kv, query, search, index): their ports, and the
+// management ports, are exposed by default.
+couchbase_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, "${MGMT_PORT}/tcp")
+    tc.expose(r, "${MGMT_SSL_PORT}/tcp")
+    tc.expose(r, "${KV_PORT}/tcp")
+    tc.expose(r, "${KV_SSL_PORT}/tcp")
+    tc.expose(r, "${VIEW_PORT}/tcp")
+    tc.expose(r, "${VIEW_SSL_PORT}/tcp")
+    tc.expose(r, "${QUERY_PORT}/tcp")
+    tc.expose(r, "${QUERY_SSL_PORT}/tcp")
+    tc.expose(r, "${SEARCH_PORT}/tcp")
+    tc.expose(r, "${SEARCH_SSL_PORT}/tcp")
+    return r
+}
+
+couchbase_request_free(p: ptr) { tc.request_free(p) }
+
+fn add_line(_ctx: ptr, key: string, line: string, sep: string) {
+    if !tc.req_has_setting(_ctx, key) {
+        tc.set_setting(_ctx, key, line)
+    } else {
+        tc.set_setting(_ctx, key, "${tc.req_setting(_ctx, key)}${sep}${line}")
+    }
+}
+
+// ---- options ----
+
+// Go's WithBuckets(NewBucket(name)): quota 100 MB, no replicas, flush
+// disabled, a primary index.
+bucket(_ctx: ptr, name: string) { bucket_with(_ctx, name, 100, 0, false, true) }
+
+// A bucket with every field, clamped as Go's builder does (quota at least
+// 100 MB, replicas 0 to 3).
+bucket_with(_ctx: ptr, name: string, quota_mb: int, replicas: int, flush_enabled: bool, primary_index: bool) {
+    q = quota_mb
+    if q < 100 { q = 100 }
+    n = replicas
+    if n < 0 { n = 0 }
+    if n > 3 { n = 3 }
+    f = "0"
+    if flush_enabled { f = "1" }
+    p = "0"
+    if primary_index { p = "1" }
+    add_line(_ctx, S_BUCKETS, "${name}\t${q}\t${n}\t${f}\t${p}", "\n")
+}
+
+// Go's WithAdminCredentials (the password must have 6 characters or more).
+admin_credentials(_ctx: ptr, user: string, pw: string) {
+    tc.set_setting(_ctx, S_USER, user)
+    tc.set_setting(_ctx, S_PASSWORD, pw)
+    if string.length(pw) < 6 && !tc.req_has_setting(_ctx, S_ERROR) {
+        tc.set_setting(_ctx, S_ERROR, "admin password must be at least 6 characters long")
+    }
+}
+
+// Go's WithIndexStorage: MEMORY_OPTIMIZED (default), PLASMA or FORESTDB.
+index_storage(_ctx: ptr, mode: string) { tc.set_setting(_ctx, S_MODE, mode) }
+
+// Go's WithServiceAnalytics (enterprise edition only).
+service_analytics(_ctx: ptr) {
+    tc.expose(_ctx, "${ANALYTICS_PORT}/tcp")
+    tc.expose(_ctx, "${ANALYTICS_SSL_PORT}/tcp")
+    add_line(_ctx, S_EXTRA_SVCS, SVC_ANALYTICS, ",")
+}
+
+// Go's WithServiceEventing (enterprise edition only).
+service_eventing(_ctx: ptr) {
+    tc.expose(_ctx, "${EVENTING_PORT}/tcp")
+    tc.expose(_ctx, "${EVENTING_SSL_PORT}/tcp")
+    add_line(_ctx, S_EXTRA_SVCS, SVC_EVENTING, ",")
+}
+
+fn split_on(s: string, sep: string) -> string[] {
+    string[] out = []
+    if string.length(s) == 0 { return out }
+    rest = s
+    i = string.index_of(rest, sep)
+    while i >= 0 {
+        out.push(string.substring(rest, 0, i))
+        rest = string.substring(rest, i + string.length(sep), string.length(rest))
+        i = string.index_of(rest, sep)
+    }
+    out.push(rest)
+    return out
+}
+
+fn has(cb: *CouchbaseContainer, svc: string) -> bool {
+    for s in cb.services { if s == svc { return true } }
+    return false
+}
+
+fn basic(user: string, pw: string) -> string {
+    return "Basic ${encoding.base64_encode_padded(string.bytes("${user}:${pw}"))}"
+}
+
+// ---- HTTP against the node (Go's doHTTPRequest, with its retry) ----
+
+// A form-encoded request to a service port; fields is key, value, key, value.
+// Retried on transport errors only (the node is still coming up), as Go's
+// backoff does. Returns the body.
+fn form_request(cb: *CouchbaseContainer, port: string, path: string, method: string, fields: string[]) -> (string, string) {
+    ep, eerr = tc.endpoint(cb.container, "${port}/tcp", "http")
+    if eerr != "" { return "", eerr }
+    form = ""
+    i = 0
+    while i + 1 < fields.len {
+        if string.length(form) > 0 { form = "${form}&" }
+        form = "${form}${url.encode(fields[i])}=${url.encode(fields[i + 1])}"
+        i = i + 2
+    }
+    lasterr = ""
+    attempt = 0
+    while attempt < 40 {
+        req = client.request(method, "${ep}${path}")
+        client.set_timeout(req, 30s)
+        client.set_header(req, "Authorization", basic(cb.user, cb.pass))
+        client.set_body(req, string.bytes(form), "application/x-www-form-urlencoded")
+        resp, err = client.send_request(req)
+        client.request_free(req)
+        if err == "" {
+            body = client.response_body(resp)
+            client.response_free(resp)
+            return body, ""
+        }
+        lasterr = err
+        sleep(1000)
+        attempt = attempt + 1
+    }
+    return "", lasterr
+}
+
+// GET a JSON document from a service port: (body, status, error).
+fn get_json(cb: *CouchbaseContainer, port: string, path: string) -> (string, int, string) {
+    ep, eerr = tc.endpoint(cb.container, "${port}/tcp", "http")
+    if eerr != "" { return "", 0, eerr }
+    req = client.request("GET", "${ep}${path}")
+    client.set_timeout(req, 30s)
+    client.set_header(req, "Authorization", basic(cb.user, cb.pass))
+    resp, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return "", 0, err }
+    body = client.response_body(resp)
+    st = client.response_status(resp)
+    client.response_free(resp)
+    return body, st, ""
+}
+
+// A boolean at doc.key (false if missing).
+fn json_bool(text: string, key: string) -> bool {
+    doc, perr = json.parse(text)
+    if perr != "" { return false }
+    v, _ = json.object_get(doc, key)
+    out = false
+    if v != null { out = json.json_get_bool(v) == 1 }
+    json.free(doc)
+    return out
+}
+
+// results.0.<key> as a boolean.
+fn first_result_bool(text: string, key: string) -> bool {
+    doc, perr = json.parse(text)
+    if perr != "" { return false }
+    res, _ = json.object_get(doc, "results")
+    out = false
+    if res != null && json.json_array_size(res) > 0 {
+        row, _ = json.array_get(res, 0)
+        v, _ = json.object_get(row, key)
+        if v != null { out = json.json_get_bool(v) == 1 }
+    }
+    json.free(doc)
+    return out
+}
+
+fn first_error_code(text: string) -> int {
+    doc, perr = json.parse(text)
+    if perr != "" { return 0 }
+    errs, _ = json.object_get(doc, "errors")
+    code = 0
+    if errs != null && json.json_array_size(errs) > 0 {
+        e, _ = json.array_get(errs, 0)
+        v, _ = json.object_get(e, "code")
+        if v != null { code = json.json_get_int(v) }
+    }
+    json.free(doc)
+    return code
+}
+
+// nodes.0.status == "healthy" (the matcher of the /pools/default wait).
+fn node_healthy(body: string) -> bool {
+    doc, perr = json.parse(body)
+    if perr != "" { return false }
+    nodes, _ = json.object_get(doc, "nodes")
+    ok = false
+    if nodes != null && json.json_array_size(nodes) > 0 {
+        n0, _ = json.array_get(nodes, 0)
+        sv, _ = json.object_get(n0, "status")
+        s, _ = json.get_string(sv)
+        ok = s == "healthy"
+    }
+    json.free(doc)
+    return ok
+}
+
+// Go's checkAllServicesEnabled: every node of nodesExt has, for each enabled
+// service, a service whose name starts with its identifier.
+fn all_services_enabled(cb: *CouchbaseContainer, raw: string) -> bool {
+    doc, perr = json.parse(raw)
+    if perr != "" { return false }
+    ext, _ = json.object_get(doc, "nodesExt")
+    if ext == null {
+        json.free(doc)
+        return false
+    }
+    ok = true
+    n = json.json_array_size(ext)
+    i = 0
+    while i < n {
+        node, _ = json.array_get(ext, i)
+        svcs, _ = json.object_get(node, "services")
+        if svcs == null { ok = false } else {
+            for want in cb.services {
+                found = false
+                m = json.object_size(svcs)
+                k = 0
+                while k < m {
+                    name, _v, _e = json.object_entry(svcs, k)
+                    if string.starts_with(name, want) == 1 { found = true }
+                    k = k + 1
+                }
+                if !found { ok = false }
+            }
+        }
+        i = i + 1
+    }
+    json.free(doc)
+    return ok
+}
+
+// Poll until check(body) is true or the attempts run out.
+fn expect_ok(what: string, cb: *CouchbaseContainer, port: string, path: string, kind: int, arg: string) -> string {
+    attempt = 0
+    while attempt < 120 {
+        body, st, err = get_json(cb, port, path)
+        if err == "" && st == 200 {
+            ok = false
+            if kind == 1 { ok = node_healthy(body) }
+            if kind == 2 { ok = all_services_enabled(cb, body) }
+            if kind == 0 { ok = true }
+            if ok { return "" }
+        }
+        sleep(1000)
+        attempt = attempt + 1
+    }
+    return what
+}
+
+// A N1QL statement through POST /query/service: the response body.
+fn query(cb: *CouchbaseContainer, statement: string) -> (string, string) {
+    return form_request(cb, QUERY_PORT, "/query/service", "POST", ["statement", statement])
+}
+
+// The mapped host port of a container port, as text ("" if unmapped).
+fn mp(c: *docker.Container, port: string) -> string {
+    p, _ = tc.mapped_port(c, "${port}/tcp")
+    return "${p}"
+}
+
+// ---- cluster init (Go's initCluster) ----
+
+fn init_cluster(cb: *CouchbaseContainer) -> string {
+    c = cb.container
+    // waitUntilNodeIsOnline
+    werr = wait.until_ready(wait.for_http("/pools") {
+        with_port(MGMT_PORT)
+        with_status(200)
+        with_basic_auth(cb.user, cb.pass)
+        with_startup_timeout(180s)
+    }, c)
+    if werr != "" { return werr }
+
+    // initializeIsEnterprise
+    body, err = form_request(cb, MGMT_PORT, "/pools", "GET", [])
+    if err != "" { return err }
+    cb.enterprise = json_bool(body, "isEnterprise")
+    if !cb.enterprise {
+        if has(cb, SVC_ANALYTICS) { return "the Analytics Service is only supported with the Enterprise version" }
+        if has(cb, SVC_EVENTING) { return "the Eventing Service is only supported with the Enterprise version" }
+    }
+
+    // renameNode: to the container's internal address
+    ip, iperr = tc.container_ip(c)
+    if iperr != "" { return iperr }
+    _b1, e1 = form_request(cb, MGMT_PORT, "/node/controller/rename", "POST", ["hostname", ip])
+    if e1 != "" { return e1 }
+
+    // initializeServices
+    svcs = ""
+    for s in cb.services {
+        if string.length(svcs) > 0 { svcs = "${svcs}," }
+        svcs = "${svcs}${s}"
+    }
+    _b2, e2 = form_request(cb, MGMT_PORT, "/node/controller/setupServices", "POST", ["services", svcs])
+    if e2 != "" { return e2 }
+
+    // setMemoryQuotas: 256 MB for kv, search, index, analytics and eventing
+    string[] quotas = []
+    for s in cb.services {
+        if s == SVC_QUERY { continue }
+        if s == SVC_KV {
+            quotas.push("memoryQuota")
+        } else {
+            quotas.push("${s}MemoryQuota")
+        }
+        quotas.push("256")
+    }
+    _b3, e3 = form_request(cb, MGMT_PORT, "/pools/default", "POST", quotas)
+    if e3 != "" { return e3 }
+
+    // configureAdminUser
+    _b4, e4 = form_request(cb, MGMT_PORT, "/settings/web", "POST", ["username", cb.user, "password", cb.pass, "port", "SAME"])
+    if e4 != "" { return e4 }
+
+    // configureExternalPorts: the mapped ports as the alternate addresses
+    host, _ = tc.host(c)
+    string[] ext = []
+    ext.push("hostname")
+    ext.push(host)
+    ext.push("mgmt")
+    ext.push(mp(c, MGMT_PORT))
+    ext.push("mgmtSSL")
+    ext.push(mp(c, MGMT_SSL_PORT))
+    if has(cb, SVC_KV) {
+        ext.push("kv")
+        ext.push(mp(c, KV_PORT))
+        ext.push("kvSSL")
+        ext.push(mp(c, KV_SSL_PORT))
+        ext.push("capi")
+        ext.push(mp(c, VIEW_PORT))
+        ext.push("capiSSL")
+        ext.push(mp(c, VIEW_SSL_PORT))
+    }
+    if has(cb, SVC_QUERY) {
+        ext.push("n1ql")
+        ext.push(mp(c, QUERY_PORT))
+        ext.push("n1qlSSL")
+        ext.push(mp(c, QUERY_SSL_PORT))
+    }
+    if has(cb, SVC_SEARCH) {
+        ext.push("fts")
+        ext.push(mp(c, SEARCH_PORT))
+        ext.push("ftsSSL")
+        ext.push(mp(c, SEARCH_SSL_PORT))
+    }
+    if has(cb, SVC_ANALYTICS) {
+        ext.push("cbas")
+        ext.push(mp(c, ANALYTICS_PORT))
+        ext.push("cbasSSL")
+        ext.push(mp(c, ANALYTICS_SSL_PORT))
+    }
+    if has(cb, SVC_EVENTING) {
+        ext.push("eventingAdminPort")
+        ext.push(mp(c, EVENTING_PORT))
+        ext.push("eventingSSL")
+        ext.push(mp(c, EVENTING_SSL_PORT))
+    }
+    _b5, e5 = form_request(cb, MGMT_PORT, "/node/controller/setupAlternateAddresses/external", "PUT", ext)
+    if e5 != "" { return e5 }
+
+    // configureIndexer: the storage mode, forestdb only on the community edition
+    if has(cb, SVC_INDEX) {
+        if cb.enterprise {
+            if cb.index_mode == FORESTDB { cb.index_mode = MEMORY_OPTIMIZED }
+        } else {
+            cb.index_mode = FORESTDB
+        }
+        _b6, e6 = form_request(cb, MGMT_PORT, "/settings/indexes", "POST", ["storageMode", cb.index_mode])
+        if e6 != "" { return e6 }
+    }
+
+    // waitUntilAllNodesAreHealthy
+    herr = expect_ok("wait for /pools/default: node not healthy", cb, MGMT_PORT, "/pools/default", 1, "")
+    if herr != "" { return herr }
+    if has(cb, SVC_QUERY) {
+        qerr = expect_ok("wait for the query service: /admin/ping", cb, QUERY_PORT, "/admin/ping", 0, "")
+        if qerr != "" { return qerr }
+    }
+    if has(cb, SVC_ANALYTICS) {
+        aerr = expect_ok("wait for the analytics service: /admin/ping", cb, ANALYTICS_PORT, "/admin/ping", 0, "")
+        if aerr != "" { return aerr }
+    }
+    if has(cb, SVC_EVENTING) {
+        eerr = expect_ok("wait for the eventing service: /api/v1/config", cb, EVENTING_PORT, "/api/v1/config", 0, "")
+        if eerr != "" { return eerr }
+    }
+    return ""
+}
+
+// Go's createBuckets.
+fn create_buckets(cb: *CouchbaseContainer, lines: string[]) -> string {
+    for ln in lines {
+        f = split_on(ln, "\t")
+        name = f[0]
+        _b1, e1 = form_request(cb, MGMT_PORT, "/pools/default/buckets", "POST",
+            ["name", name, "ramQuotaMB", f[1], "flushEnabled", f[3], "replicaNumber", f[2]])
+        if e1 != "" { return e1 }
+
+        // waitForAllServicesEnabled
+        e2 = expect_ok("bucket ${name}: services not enabled", cb, MGMT_PORT, "/pools/default/b/${name}", 2, "")
+        if e2 != "" { return e2 }
+
+        if has(cb, SVC_QUERY) {
+            // isQueryKeyspacePresent
+            present = false
+            attempt = 0
+            while !present && attempt < 120 {
+                body, qerr = query(cb, "SELECT COUNT(*) > 0 as present FROM system:keyspaces WHERE name = \"${name}\"")
+                if qerr == "" { present = first_result_bool(body, "present") }
+                if !present { sleep(1000) }
+                attempt = attempt + 1
+            }
+            if !present { return "query namespace is not present" }
+        }
+
+        if f[4] == "1" {
+            if !has(cb, SVC_QUERY) {
+                return "primary index creation for bucket ${name} ignored, since QUERY service is not present"
+            }
+            // createPrimaryIndex
+            created = false
+            attempt = 0
+            while !created && attempt < 120 {
+                body, qerr = query(cb, "CREATE PRIMARY INDEX on `${name}`")
+                if qerr == "" && first_error_code(body) == 0 { created = true }
+                if !created { sleep(1000) }
+                attempt = attempt + 1
+            }
+            if !created { return "index creation failed" }
+            // isPrimaryIndexOnline
+            online = false
+            attempt = 0
+            while !online && attempt < 120 {
+                body, qerr = query(cb, "SELECT count(*) > 0 AS online FROM system:indexes where keyspace_id = \"${name}\" and is_primary = true and state = \"online\"")
+                if qerr == "" { online = first_result_bool(body, "online") }
+                if !online { sleep(1000) }
+                attempt = attempt + 1
+            }
+            if !online { return "primary index state is not online" }
+        }
+    }
+    return ""
+}
+
+// Run a Couchbase container (Go's couchbase.Run). The returned struct is
+// non-null whenever a container was created, with the error.
+builder run(image: string) with couchbase_request_new -> (*CouchbaseContainer, string) {
+    r = _builder
+    if r == null { r = couchbase_request_new() }
+    if tc.req_has_setting(r, S_ERROR) {
+        e = tc.req_setting(r, S_ERROR)
+        couchbase_request_free(r)
+        return null, e
+    }
+    cb = heap.new(CouchbaseContainer)
+    cb.container = null
+    cb.user = "Administrator"
+    cb.pass = "password"
+    cb.services = []
+    cb.services.push(SVC_KV)
+    cb.services.push(SVC_QUERY)
+    cb.services.push(SVC_SEARCH)
+    cb.services.push(SVC_INDEX)
+    cb.enterprise = false
+    cb.index_mode = MEMORY_OPTIMIZED
+    if tc.req_has_setting(r, S_USER) { cb.user = tc.req_setting(r, S_USER) }
+    if tc.req_has_setting(r, S_PASSWORD) { cb.pass = tc.req_setting(r, S_PASSWORD) }
+    if tc.req_has_setting(r, S_MODE) { cb.index_mode = tc.req_setting(r, S_MODE) }
+    for s in split_on(tc.req_setting(r, S_EXTRA_SVCS), ",") { cb.services.push(s) }
+    buckets = split_on(tc.req_setting(r, S_BUCKETS), "\n")
+
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run couchbase: ${err}" }
+    cb.container = c
+    if err != "" { return cb, "run couchbase: ${err}" }
+    ierr = init_cluster(cb)
+    if ierr != "" { return cb, "init cluster: ${ierr}" }
+    berr = create_buckets(cb, buckets)
+    if berr != "" { return cb, "create buckets: ${berr}" }
+    return cb, ""
+}
+
+// "couchbase://host:port" of the key/value port (Go's ConnectionString).
+connection_string(cb: *CouchbaseContainer) -> (string, string) {
+    return tc.endpoint(cb.container, "${KV_PORT}/tcp", "couchbase")
+}
+
+// The administrator's username (Go's Username).
+username(cb: *CouchbaseContainer) -> string { return cb.user }
+// The administrator's password (Go's Password).
+password(cb: *CouchbaseContainer) -> string { return cb.pass }

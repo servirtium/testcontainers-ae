@@ -1,0 +1,152 @@
+// Ported from testcontainers-go modules/clickhouse/clickhouse.go, modules/clickhouse/options.go
+//
+// modules.clickhouse: a ClickHouse server container (HTTP 8123, native 9000).
+//
+//     import modules.clickhouse
+//
+//     ch, err = clickhouse.run("clickhouse/clickhouse-server:23.3.8.21-alpine") {
+//         username("clickhouse")
+//         password("password")
+//         database("testdb")
+//         init_script("testdata/init-db.sh")
+//     }
+//     defer tc.terminate(ch.container)
+//     host, _ = clickhouse.connection_host(ch)        // "localhost:32771" (native port)
+//     dsn, _ = clickhouse.connection_string(ch, ["dial_timeout=300ms"])
+//     http, _ = clickhouse.http_endpoint(ch)          // "http://localhost:32772" (added)
+//
+// The user, password and database are read back from the request's
+// environment, so what the block set is what connection_string uses.
+//
+// Not ported: the deprecated RunContainer and the clickhouse-go client code
+// of Go's tests and examples (the test here uses the HTTP interface).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    ClickHouseContainer, run, connection_host, connection_string, http_endpoint,
+    username, password, database, init_script, config_file, yaml_config_file,
+    zookeeper, HTTP_PORT, NATIVE_PORT, DEFAULT_USER, DEFAULT_DATABASE, DEFAULT_IMAGE,
+    clickhouse_request_new, clickhouse_request_free
+)
+
+const HTTP_PORT = "8123/tcp"
+const NATIVE_PORT = "9000/tcp"
+const DEFAULT_USER = "default"
+const DEFAULT_DATABASE = "clickhouse"
+const DEFAULT_IMAGE = "clickhouse/clickhouse-server:23.3.8.21-alpine"
+
+struct ClickHouseContainer {
+    container: *docker.Container
+    db_name: string
+    user: string
+    password: string
+}
+
+clickhouse_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, NATIVE_PORT)
+    tc.env(r, "CLICKHOUSE_USER", DEFAULT_USER)
+    tc.env(r, "CLICKHOUSE_PASSWORD", DEFAULT_USER)
+    tc.env(r, "CLICKHOUSE_DB", DEFAULT_DATABASE)
+    tc.wait_for(r, wait.for_http("/") { with_port(HTTP_PORT); with_status(200) })
+    return r
+}
+
+clickhouse_request_free(p: ptr) { tc.request_free(p) }
+
+// ---- options ----
+
+// Go's WithDatabase.
+database(_ctx: ptr, name: string) { tc.env(_ctx, "CLICKHOUSE_DB", name) }
+// Go's WithPassword.
+password(_ctx: ptr, pw: string) { tc.env(_ctx, "CLICKHOUSE_PASSWORD", pw) }
+// Go's WithUsername; "" is the default user.
+username(_ctx: ptr, user: string) {
+    u = user
+    if string.length(u) == 0 { u = DEFAULT_USER }
+    tc.env(_ctx, "CLICKHOUSE_USER", u)
+}
+
+fn base_name(p: string) -> string {
+    rest = p
+    i = string.index_of(rest, "/")
+    while i >= 0 {
+        rest = string.substring(rest, i + 1, string.length(rest))
+        i = string.index_of(rest, "/")
+    }
+    return rest
+}
+
+// Go's WithInitScripts, one script a call: into /docker-entrypoint-initdb.d.
+init_script(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, "/docker-entrypoint-initdb.d/${base_name(host_path)}", 493)
+}
+
+// Go's WithConfigFile: an XML file as config.d/config.xml.
+config_file(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, "/etc/clickhouse-server/config.d/config.xml", 493)
+}
+
+// Go's WithYamlConfigFile: a YAML file as config.d/config.yaml.
+yaml_config_file(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, "/etc/clickhouse-server/config.d/config.yaml", 493)
+}
+
+// Go's WithZookeeper: a rendered config that points ClickHouse at ZooKeeper
+// (host, port) and makes it a one-shard cluster. Go writes a temp file;
+// the content is copied straight in here.
+zookeeper(_ctx: ptr, host: string, port: string) {
+    cfg = "<?xml version=\"1.0\"?>\n<clickhouse>\n    <zookeeper>\n        <node index=\"1\">\n            <host>${host}</host>\n            <port>${port}</port>\n        </node>\n    </zookeeper>\n\n"
+    cfg = "${cfg}    <remote_servers>\n        <default>\n            <shard>\n                <replica>\n                    <host>localhost</host>\n                    <port>9000</port>\n                </replica>\n            </shard>\n        </default>\n    </remote_servers>\n"
+    cfg = "${cfg}    <macros>\n        <cluster>default</cluster>\n        <shard>shard</shard>\n        <replica>replica</replica>\n    </macros>\n\n"
+    cfg = "${cfg}    <distributed_ddl>\n        <path>/clickhouse/task_queue/ddl</path>\n    </distributed_ddl>\n\n"
+    cfg = "${cfg}    <format_schema_path>/var/lib/clickhouse/format_schemas/</format_schema_path>\n</clickhouse>\n"
+    tc.file_content(_ctx, cfg, "/etc/clickhouse-server/config.d/zookeeper_config.xml", 493)
+}
+
+builder run(image: string) with clickhouse_request_new -> (*ClickHouseContainer, string) {
+    r = _builder
+    if r == null { r = clickhouse_request_new() }
+    user = tc.req_env(r, "CLICKHOUSE_USER")
+    pw = tc.req_env(r, "CLICKHOUSE_PASSWORD")
+    db = tc.req_env(r, "CLICKHOUSE_DB")
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run clickhouse: ${err}" }
+    ch = heap.new(ClickHouseContainer)
+    ch.container = c
+    ch.user = user
+    ch.password = pw
+    ch.db_name = db
+    if err != "" { return ch, "run clickhouse: ${err}" }
+    return ch, ""
+}
+
+// "host:port" of the native port (Go's ConnectionHost).
+connection_host(ch: *ClickHouseContainer) -> (string, string) {
+    return tc.endpoint(ch.container, NATIVE_PORT, "")
+}
+
+// "clickhouse://user:password@host:port/db?a&b" (Go's ConnectionString;
+// args are joined with &, e.g. "dial_timeout=300ms").
+connection_string(ch: *ClickHouseContainer, args: string[]) -> (string, string) {
+    host, err = connection_host(ch)
+    if err != "" { return "", err }
+    extra = ""
+    for a in args {
+        if string.length(extra) > 0 { extra = "${extra}&" }
+        extra = "${extra}${a}"
+    }
+    if string.length(extra) > 0 { extra = "?${extra}" }
+    return "clickhouse://${ch.user}:${ch.password}@${host}/${ch.db_name}${extra}", ""
+}
+
+// "http://host:port" of the HTTP interface (not in Go, which only has the
+// native port; the port is exposed there too).
+http_endpoint(ch: *ClickHouseContainer) -> (string, string) {
+    return tc.endpoint(ch.container, HTTP_PORT, "http")
+}

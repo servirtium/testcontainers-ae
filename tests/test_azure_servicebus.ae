@@ -1,0 +1,151 @@
+// Ported from testcontainers-go modules/azure/servicebus/servicebus_test.go
+// (TestServiceBus_topology, _withConfig, _noEULA) and examples_test.go (ExampleRun)
+//
+// Compile-checked only. The engine-free cases check the module's request
+// defaults, options, the EULA refusal and the connection string for real. The
+// cases that start the emulator and its SQL Server run only with
+// TCAE_LIVE_SERVICEBUS=1 and an engine.
+
+import std.spec
+import std.string
+import std.os
+import std.file
+import std.json
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.mssql
+import modules.azure.servicebus
+
+const IMAGE = "mcr.microsoft.com/azure-messaging/servicebus-emulator:1.1.2"
+const MSSQL_IMAGE = "mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04"
+const CONFIG = "modules/azure/servicebus/testdata/servicebus_config.json"
+
+// 1 when TCAE_LIVE_SERVICEBUS=1 and an engine answers. The variable is read
+// first so that nothing touches an engine unless asked to.
+fn live_on() -> int {
+    if os.getenv("TCAE_LIVE_SERVICEBUS") != "1" { return 0 }
+    return testing.engine_ok()
+}
+
+// Whether the container's environment has the "KEY=value" entry, and its image.
+fn inspect_env_has(c: *docker.Container, entry: string) -> int {
+    doc, err = tc.inspect(c)
+    if err != "" { return 0 }
+    cfg, _ = json.object_get(doc, "Config")
+    envv, _ = json.object_get(cfg, "Env")
+    n = json.json_array_size(envv)
+    found = 0
+    k = 0
+    while k < n {
+        ev, _ = json.array_get(envv, k)
+        e, _ = json.get_string(ev)
+        if e == entry { found = 1 }
+        k = k + 1
+    }
+    json.free(doc)
+    return found
+}
+
+fn inspect_image(c: *docker.Container) -> string {
+    doc, err = tc.inspect(c)
+    if err != "" { return "" }
+    cfg, _ = json.object_get(doc, "Config")
+    iv, _ = json.object_get(cfg, "Image")
+    img, _ = json.get_string(iv)
+    json.free(doc)
+    return img
+}
+
+main() {
+    fw = spec.init()
+    live = live_on()
+
+    spec.describe(fw, "modules/azure/servicebus") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("has the module's defaults and options (engine-free)") callback {
+            r = servicebus.servicebus_request_new()
+            exposed = tc.req_exposed(r)
+            spec.assert_eq(exposed.len, 2, "AMQP and HTTP ports")
+            spec.assert_str_eq(exposed[0], "5672/tcp", "AMQP port")
+            spec.assert_str_eq(exposed[1], "5300/tcp", "HTTP port")
+            spec.assert_str_eq(tc.req_env(r, "SQL_WAIT_INTERVAL"), "0", "no wait: SQL Server starts first")
+            servicebus.accept_eula(r)
+            spec.assert_str_eq(tc.req_env(r, "ACCEPT_EULA"), "Y", "accept_eula")
+            servicebus.mssql_image(r, MSSQL_IMAGE)
+            servicebus.mssql_env(r, "A", "1")
+            servicebus.mssql_env(r, "B", "2")
+            spec.assert_str_eq(tc.req_setting(r, "servicebus.mssql_image"), MSSQL_IMAGE, "mssql image")
+            spec.assert_str_eq(tc.req_setting(r, "servicebus.mssql_env"), "A=1\nB=2", "mssql env accumulates")
+            servicebus.servicebus_request_free(r)
+        }
+
+        spec.it("formats the connection string (engine-free)") callback {
+            spec.assert_str_eq(servicebus.connection_string_for("localhost:5672"),
+                "Endpoint=sb://localhost:5672;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;", "Go's connection string format")
+        }
+
+        spec.it("fails without the EULA (TestServiceBus_noEULA, engine-free)") callback {
+            s, err = servicebus.run(IMAGE)
+            spec.assert_null(s as ptr, "nothing was started")
+            spec.assert_contains(err, "EULA not accepted", "the error says why")
+        }
+
+        spec.it_when(live, "starts the emulator and SQL Server on one network (ExampleRun, TestServiceBus_topology)", "set TCAE_LIVE_SERVICEBUS=1 and have an engine") callback {
+            s, err = servicebus.run(IMAGE) {
+                accept_eula()
+                mssql_image(MSSQL_IMAGE)
+                mssql_env("TESTCONTAINERS_TEST_VAR", "test")
+            }
+            if s != null {
+                testing.cleanup_container(s.container)
+                testing.cleanup_container(s.mssql.container)
+                testing.cleanup_network(s.net)
+            }
+            spec.assert_ok(err, "servicebus starts")
+            if err != "" { return }
+            st, serr = tc.state_of(s.container)
+            spec.assert_ok(serr, "state")
+            spec.assert_true(st.running, "state.Running")
+            cs, cerr = servicebus.connection_string(s)
+            spec.assert_ok(cerr, "connection string")
+            spec.assert_true(string.starts_with(cs, "Endpoint=sb://") == 1, "an sb:// endpoint: ${cs}")
+
+            // both containers belong to the same network
+            sb_nets, e1 = tc.networks(s.container)
+            spec.assert_ok(e1, "servicebus networks")
+            spec.assert_eq(sb_nets.len, 1, "one network")
+            m = servicebus.mssql_container(s)
+            ms_nets, e2 = tc.networks(m.container)
+            spec.assert_ok(e2, "mssql networks")
+            spec.assert_eq(ms_nets.len, 1, "one network")
+            spec.assert_str_eq(ms_nets[0], sb_nets[0], "the same network")
+
+            // the mssql image and the custom option
+            spec.assert_str_eq(inspect_image(m.container), MSSQL_IMAGE, "mssql image")
+            spec.assert_eq(inspect_env_has(m.container, "TESTCONTAINERS_TEST_VAR=test"), 1, "mssql_env reached the container")
+        }
+
+        spec.it_when(live, "copies the config into the container (TestServiceBus_withConfig)", "set TCAE_LIVE_SERVICEBUS=1 and have an engine") callback {
+            want, rerr = file.read(CONFIG)
+            spec.assert_ok(rerr, "read the fixture")
+            s, err = servicebus.run(IMAGE) {
+                accept_eula()
+                mssql_image(MSSQL_IMAGE)
+                config(want)
+            }
+            if s != null {
+                testing.cleanup_container(s.container)
+                testing.cleanup_container(s.mssql.container)
+                testing.cleanup_network(s.net)
+            }
+            spec.assert_ok(err, "servicebus starts")
+            if err != "" { return }
+            got, cerr = tc.copy_file_from_container(s.container, "/ServiceBus_Emulator/ConfigFiles/Config.json")
+            spec.assert_ok(cerr, "copy the config back")
+            spec.assert_str_eq(got, want, "the config is where the emulator reads it")
+        }
+    }
+    return spec.run_summary(fw)
+}

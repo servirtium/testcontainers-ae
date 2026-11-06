@@ -1,0 +1,116 @@
+// Ported from testcontainers-go modules/opensearch/opensearch.go and options.go
+//
+// modules.opensearch: a single-node OpenSearch container with the security
+// plugin disabled; the username and password are still set (OPENSEARCH_USERNAME,
+// OPENSEARCH_PASSWORD) and sent as basic auth by the readiness probe.
+//
+//     import modules.opensearch
+//
+//     o, err = opensearch.run("opensearchproject/opensearch:2.11.1") {
+//         username("app")
+//         password("secret")
+//     }
+//     defer tc.terminate(o.container)
+//     addr, _ = opensearch.address(o)       // "http://localhost:32771"
+//
+// The ulimits Go sets (memlock unlimited, nofile 65536) are set on the host
+// config. The readiness probe is GET / on 9200 answering 200 whose JSON
+// "tagline" is "The OpenSearch Project: https://opensearch.org/", 120s. As Go's
+// does, run applies it after the caller's block (the credentials are needed).
+//
+// Not ported: the deprecated RunContainer; the opensearch-go client of Go's
+// examples.
+
+import std.string
+import std.json
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    OpenSearchContainer, run, address, username, password,
+    HTTP_PORT, DEFAULT_IMAGE, DEFAULT_USERNAME, DEFAULT_PASSWORD,
+    opensearch_request_new, opensearch_request_free
+)
+
+const HTTP_PORT = "9200/tcp"
+const DEFAULT_IMAGE = "opensearchproject/opensearch:2.11.1"
+const DEFAULT_USERNAME = "admin"
+const DEFAULT_PASSWORD = "admin"
+
+struct OpenSearchContainer {
+    container: *docker.Container
+    user: string
+    password: string
+}
+
+fn ulimit(name: string, v: long) -> ptr {
+    u = json.obj()
+    json.set(u, "Name", json.str(name))
+    json.set(u, "Soft", json.from_int(v))
+    json.set(u, "Hard", json.from_int(v))
+    return u
+}
+
+fn set_ulimits(hc: ptr) {
+    list = json.arr()
+    json.push(list, ulimit("memlock", -1))
+    json.push(list, ulimit("nofile", 65536))
+    json.set(hc, "Ulimits", list)
+}
+
+fn is_opensearch_banner(body: string) -> bool {
+    doc, perr = json.parse(body)
+    if perr != "" { return false }
+    v, _ = json.object_get(doc, "tagline")
+    s, _ = json.get_string(v)
+    json.free(doc)
+    return s == "The OpenSearch Project: https://opensearch.org/"
+}
+
+// Go's moduleOpts, with the default credentials.
+opensearch_request_new() -> ptr {
+    r = tc.request_new()
+    tc.env(r, "discovery.type", "single-node")
+    tc.env(r, "DISABLE_INSTALL_DEMO_CONFIG", "true")
+    tc.env(r, "DISABLE_SECURITY_PLUGIN", "true")
+    tc.env(r, "OPENSEARCH_USERNAME", DEFAULT_USERNAME)
+    tc.env(r, "OPENSEARCH_PASSWORD", DEFAULT_PASSWORD)
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, "9600/tcp")
+    tc.host_config_modifier(r, |hc: ptr| { set_ulimits(hc) })
+    return r
+}
+
+opensearch_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithUsername / WithPassword.
+username(_ctx: ptr, user: string) { tc.env(_ctx, "OPENSEARCH_USERNAME", user) }
+password(_ctx: ptr, pw: string) { tc.env(_ctx, "OPENSEARCH_PASSWORD", pw) }
+
+builder run(image: string) with opensearch_request_new -> (*OpenSearchContainer, string) {
+    r = _builder
+    if r == null { r = opensearch_request_new() }
+    user = tc.req_env(r, "OPENSEARCH_USERNAME")
+    pw = tc.req_env(r, "OPENSEARCH_PASSWORD")
+    tc.wait_for(r, wait.for_http("/") {
+        with_port("9200")
+        with_startup_timeout(120s)
+        with_status(200)
+        with_basic_auth(user, pw)
+        with_response_matcher(|body: string| -> is_opensearch_banner(body))
+    })
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run opensearch: ${err}" }
+    o = heap.new(OpenSearchContainer)
+    o.container = c
+    o.user = user
+    o.password = pw
+    if err != "" { return o, "run opensearch: ${err}" }
+    return o, ""
+}
+
+// "http://host:port" of the HTTP API (Go's Address).
+address(o: *OpenSearchContainer) -> (string, string) {
+    return tc.endpoint(o.container, HTTP_PORT, "http")
+}

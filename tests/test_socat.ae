@@ -1,0 +1,63 @@
+// Ported from testcontainers-go modules/socat/socat_test.go (TestRun_helloWorld,
+// with nginx:alpine as the target)
+//
+// An nginx container on a network, a socat container on the same network
+// forwarding its port 80 to it: one HTTP GET through the socat container's
+// mapped port gets nginx's welcome page.
+
+import std.spec
+import std.string
+import std.http.client
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.network
+import testcontainers.testing
+import modules.socat
+
+const TARGET_IMAGE = "nginx:alpine"
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/socat") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("proxies a container on a network (TestRun_helloWorld)") callback {
+            n, nerr = network.new_random()
+            testing.cleanup_network(n)
+            spec.assert_ok(nerr, "network")
+            web, werr = tc.run(TARGET_IMAGE) {
+                expose("80/tcp")
+                with_network(n.name)
+                network_alias(n.name, "web")
+            }
+            testing.cleanup_container(web)
+            spec.assert_ok(werr, "nginx starts")
+
+            s, serr = socat.run(socat.DEFAULT_IMAGE) {
+                target(80, "web")
+                tc.with_network(n.name)
+                tc.network_alias(n.name, "socat")
+            }
+            testing.cleanup_container(s)
+            spec.assert_ok(serr, "socat starts")
+            if werr == "" && serr == "" {
+                url, uerr = socat.target_url(s, 80)
+                spec.assert_ok(uerr, "target url")
+                spec.assert_true(string.starts_with(url, "http://") == 1, "an http:// URL: ${url}")
+                req = client.request("GET", "${url}/")
+                client.set_timeout(req, 30s)
+                r, err = client.send_request(req)
+                client.request_free(req)
+                spec.assert_ok(err, "GET through socat")
+                if err == "" {
+                    spec.assert_eq(client.response_status(r), 200, "200 from nginx")
+                    spec.assert_contains(client.response_body(r), "Welcome to nginx", "nginx's page came through the proxy")
+                    client.response_free(r)
+                }
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

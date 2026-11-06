@@ -1,0 +1,268 @@
+// Ported from testcontainers-go wait/sql_test.go (its mock database/sql driver,
+// Test_waitForSql_WithQuery, String()); the rest checks `sql` against
+// database/sql's documented behaviour.
+//
+// `sql` itself, no database and no engine: driver registration by name, a
+// mock driver (Go's test registers one too) to watch what sql asks of a
+// driver (lazy connect, reconnect after a bad connection, statements
+// prepared again on a new connection, transactions holding the one
+// connection), the typed accessors' conversions and errors, and
+// wait.for_sql's defaults and description.
+
+import std.spec
+import std.string
+import sql
+import testcontainers.wait
+
+struct MockConn {
+    id: int
+    bad: bool
+}
+
+var connects = 0
+var execs: string[] = []
+var prepares = 0
+var fail_next_exec = false
+
+fn m_connect(dsn: string, conn_p: ptr) -> string {
+    if dsn == "refuse" { return "mock: connection refused" }
+    connects = connects + 1
+    c = heap.new(MockConn)
+    c.id = connects
+    c.bad = false
+    (conn_p as *sql.Conn).handle = c as ptr
+    return ""
+}
+fn m_close(h: ptr) -> string { return "" }
+fn m_ping(h: ptr) -> string { return "" }
+fn m_exec(h: ptr, q: string, args: sql.Value[], res_p: ptr) -> string {
+    c = h as *MockConn
+    if fail_next_exec {
+        fail_next_exec = false
+        c.bad = true
+        return "mock: broken pipe"
+    }
+    line = "${c.id}:${q}"
+    for a in args { line = "${line}|${sql.value_text(a)}" }
+    execs.push(line)
+    (res_p as *sql.Result).rows_affected = args.len as long
+    return ""
+}
+fn m_query(h: ptr, q: string, args: sql.Value[], rows_p: ptr) -> string {
+    rows = rows_p as *sql.Rows
+    sql.rows_set_columns(rows, ["n", "s", "b", "f"], ["INT8", "TEXT"])
+    sql.rows_append(rows, ["42", "hello", "t", "2.5"], [false, false, false, false])
+    sql.rows_append(rows, ["x", "", "maybe", "nan?"], [false, true, false, false])
+    return ""
+}
+fn m_prepare(h: ptr, q: string, st_p: ptr) -> string {
+    prepares = prepares + 1
+    st = st_p as *sql.Stmt
+    st.handle = null
+    st.inputs = 2
+    return ""
+}
+fn m_stmt_exec(h: ptr, sh: ptr, args: sql.Value[], res_p: ptr) -> string {
+    return m_exec(h, "stmt", args, res_p)
+}
+fn m_begin(h: ptr) -> string { return m_exec_plain(h, "BEGIN") }
+fn m_commit(h: ptr) -> string { return m_exec_plain(h, "COMMIT") }
+fn m_rollback(h: ptr) -> string { return m_exec_plain(h, "ROLLBACK") }
+fn m_exec_plain(h: ptr, q: string) -> string {
+    c = h as *MockConn
+    execs.push("${c.id}:${q}")
+    return ""
+}
+fn m_is_bad(h: ptr) -> bool { return (h as *MockConn).bad }
+
+fn register_mock() {
+    d = sql.new_driver("mock")
+    d.connect = m_connect as fn(string, ptr) -> string
+    d.close = m_close as fn(ptr) -> string
+    d.ping = m_ping as fn(ptr) -> string
+    d.exec = m_exec as fn(ptr, string, sql.Value[], ptr) -> string
+    d.query = m_query as fn(ptr, string, sql.Value[], ptr) -> string
+    d.prepare = m_prepare as fn(ptr, string, ptr) -> string
+    d.stmt_exec = m_stmt_exec as fn(ptr, ptr, sql.Value[], ptr) -> string
+    d.begin = m_begin as fn(ptr) -> string
+    d.commit = m_commit as fn(ptr) -> string
+    d.rollback = m_rollback as fn(ptr) -> string
+    d.is_bad = m_is_bad as fn(ptr) -> bool
+    sql.register("mock", d)
+}
+
+fn last_exec() -> string {
+    if execs.len == 0 { return "" }
+    return execs[execs.len - 1]
+}
+
+main() {
+    fw = spec.init()
+    register_mock()
+
+    spec.describe(fw, "sql: drivers by name") {
+        spec.it("opens a registered driver, refuses an unknown one with Go's message") callback {
+            _, err = sql.open("nosuch", "x")
+            spec.assert_str_eq(err, "sql: unknown driver \"nosuch\" (forgotten import?)", "database/sql's error")
+            db, oerr = sql.open("mock", "dsn")
+            spec.assert_ok(oerr, "open")
+            spec.assert_str_eq(sql.driver_name(db), "mock", "the driver")
+            spec.assert_eq(connects, 0, "open does not connect (Go's Open neither)")
+            spec.assert_ok(sql.ping(db), "ping connects")
+            spec.assert_eq(connects, 1, "one connection")
+            sql.close(db)
+            spec.assert_str_eq(sql.ping(db), sql.ERR_CONN_DONE, "closed")
+        }
+        spec.it("registers one driver under several names; a name registered again is replaced") callback {
+            d = sql.lookup("mock")
+            sql.register("mock2", d)
+            sql.register("mock2", d)
+            n = 0
+            for name in sql.drivers() {
+                if name == "mock2" { n = n + 1 }
+            }
+            spec.assert_eq(n, 1, "listed once")
+            db, err = sql.open("mock2", "dsn")
+            spec.assert_ok(err, "the alias opens")
+            spec.assert_ok(sql.ping(db), "and connects through the same vtable")
+            sql.close(db)
+        }
+        spec.it("returns a driver's connect error, and connects again on the next call") callback {
+            db, _ = sql.open("mock", "refuse")
+            spec.assert_str_eq(sql.ping(db), "mock: connection refused", "the driver's error")
+            sql.close(db)
+        }
+    }
+
+    spec.describe(fw, "sql: one connection, used as a pool of one") {
+        spec.it("passes arguments through, and reconnects after the driver reports a bad connection") callback {
+            db, _ = sql.open("mock", "dsn")
+            before = connects
+            res, err = sql.exec(db, "INSERT $1 $2", [sql.int64(7), sql.text("it's")])
+            spec.assert_ok(err, "exec")
+            spec.assert_eq_long(sql.rows_affected(res), 2, "the driver's Result")
+            spec.assert_str_eq(last_exec(), "${before + 1}:INSERT $1 $2|7|it's", "args as given")
+            fail_next_exec = true
+            _, e2 = sql.exec(db, "X", [])
+            spec.assert_str_eq(e2, "mock: broken pipe", "the failure")
+            _, e3 = sql.exec(db, "Y", [])
+            spec.assert_ok(e3, "the next call works")
+            spec.assert_eq(connects, before + 2, "on a new connection")
+            spec.assert_str_eq(last_exec(), "${before + 2}:Y", "there")
+            sql.close(db)
+        }
+        spec.it("prepares a statement again on a new connection") callback {
+            db, _ = sql.open("mock", "dsn")
+            st, err = sql.prepare(db, "UPDATE $1 $2")
+            spec.assert_ok(err, "prepare")
+            spec.assert_eq(sql.num_input(st), 2, "the driver's count")
+            p0 = prepares
+            _, e1 = sql.stmt_exec(st, [sql.int64(1), sql.null_value()])
+            spec.assert_ok(e1, "exec")
+            spec.assert_eq(prepares, p0, "no re-prepare on the same connection")
+            fail_next_exec = true
+            _, _ = sql.exec(db, "X", [])
+            _, e2 = sql.stmt_exec(st, [sql.int64(2), sql.boolean(true)])
+            spec.assert_ok(e2, "exec after a reconnect")
+            spec.assert_eq(prepares, p0 + 1, "prepared again")
+            spec.assert_true(string.ends_with(last_exec(), ":stmt|2|true") == 1, "with its args")
+            spec.assert_ok(sql.stmt_close(st), "close")
+            _, e3 = sql.stmt_exec(st, [])
+            spec.assert_str_eq(e3, "sql: statement is closed", "closed")
+            sql.close(db)
+        }
+        spec.it("holds the connection for a transaction; the DB refuses meanwhile") callback {
+            db, _ = sql.open("mock", "dsn")
+            tx, err = sql.begin(db)
+            spec.assert_ok(err, "begin")
+            spec.assert_true(string.ends_with(last_exec(), ":BEGIN") == 1, "the driver began")
+            _, busy = sql.exec(db, "Z", [])
+            spec.assert_contains(busy, "in a transaction", "the DB's exec refuses")
+            _, terr = sql.tx_exec(tx, "IN TX", [])
+            spec.assert_ok(terr, "the Tx's exec runs")
+            spec.assert_ok(sql.commit(tx), "commit")
+            spec.assert_str_eq(sql.rollback(tx), sql.ERR_TX_DONE, "Go's ErrTxDone")
+            _, after = sql.exec(db, "Z", [])
+            spec.assert_ok(after, "the DB is free again")
+            sql.close(db)
+        }
+    }
+
+    spec.describe(fw, "sql: rows and the typed accessors") {
+        spec.it("iterates, converts as convertAssign does, and errors as Go does") callback {
+            db, _ = sql.open("mock", "dsn")
+            rows, err = sql.query(db, "Q", [])
+            spec.assert_ok(err, "query")
+            spec.assert_eq(sql.num_columns(rows), 4, "four columns")
+            spec.assert_str_eq(sql.column_types(rows)[3], "", "a missing type name is empty")
+            _, before = sql.int_at(rows, 0)
+            spec.assert_str_eq(before, "sql: Scan called without calling Next", "Go's message")
+            spec.assert_true(sql.next(rows), "row 1")
+            n, _ = sql.int_at(rows, 0)
+            spec.assert_eq_long(n, 42, "int")
+            s, _ = sql.string_at(rows, 1)
+            spec.assert_str_eq(s, "hello", "string")
+            b, _ = sql.bool_at(rows, 2)
+            spec.assert_true(b, "\"t\" is true (strconv.ParseBool)")
+            f, _ = sql.float_at(rows, 3)
+            spec.assert_true(f == 2.5, "float")
+            bs, _ = sql.bytes_at(rows, 1)
+            spec.assert_eq(bs.len, 5, "bytes")
+            _, oor = sql.string_at(rows, 9)
+            spec.assert_contains(oor, "column index 9 out of range", "a bad column")
+            spec.assert_true(sql.next(rows), "row 2")
+            _, ie = sql.int_at(rows, 0)
+            spec.assert_contains(ie, "converting driver.Value type string (\"x\") to a int64: invalid syntax", "not an int")
+            spec.assert_true(sql.is_null_at(rows, 1), "NULL")
+            _, ne = sql.string_at(rows, 1)
+            spec.assert_contains(ne, "converting NULL to string is unsupported", "NULL into a string")
+            nb, nbe = sql.bytes_at(rows, 1)
+            spec.assert_ok(nbe, "NULL into bytes is no error")
+            spec.assert_eq(nb.len, 0, "but empty")
+            _, be = sql.bool_at(rows, 2)
+            spec.assert_contains(be, "couldn't convert \"maybe\" into type bool", "not a bool")
+            _, fe = sql.float_at(rows, 3)
+            spec.assert_contains(fe, "to a float64: invalid syntax", "not a float")
+            spec.assert_false(sql.next(rows), "two rows")
+            spec.assert_false(sql.next(rows), "still done")
+            sql.close_rows(rows)
+            r, rerr = sql.query_row(db, "Q", [])
+            spec.assert_ok(rerr, "query_row")
+            v, _ = sql.int_at(r, 0)
+            spec.assert_eq_long(v, 42, "positioned on the first row")
+            sql.close(db)
+        }
+        spec.it("renders values as text the way a text protocol sends them") callback {
+            spec.assert_str_eq(sql.value_text(sql.int64(-5)), "-5", "int")
+            spec.assert_str_eq(sql.value_text(sql.float64(1.5)), "1.5", "float")
+            spec.assert_str_eq(sql.value_text(sql.float64(0.1)), "0.10000000000000001", "float that reads back exactly")
+            spec.assert_str_eq(sql.value_text(sql.boolean(false)), "false", "bool")
+            spec.assert_str_eq(sql.value_text(sql.text("a'b")), "a'b", "text unchanged")
+            spec.assert_eq(sql.null_value().kind, sql.KIND_NULL, "null")
+            spec.assert_eq(sql.value_bytes(sql.blob([1 as byte, 0 as byte, 2 as byte])).len, 3, "a blob keeps its NUL")
+            spec.assert_str_eq(sql.sqlstate("FATAL: x (SQLSTATE 28P01)"), "28P01", "sqlstate")
+            spec.assert_str_eq(sql.sqlstate("no code"), "", "none")
+        }
+    }
+
+    spec.describe(fw, "wait.for_sql (wait/sql_test.go)") {
+        spec.it("defaults to SELECT 1, takes with_query (Test_waitForSql_WithQuery)") callback {
+            w = wait.for_sql("5432/tcp", "postgres", |host: string, port: int| -> "fake-url")
+            spec.assert_str_eq(w.sql_query, wait.DEFAULT_SQL_QUERY, "default query")
+            spec.assert_str_eq(wait.DEFAULT_SQL_QUERY, "SELECT 1", "Go's defaultForSQLQuery")
+            wait.with_query(w, "SELECT 100;")
+            spec.assert_str_eq(w.sql_query, "SELECT 100;", "custom query")
+            spec.assert_eq_long(wait.timeout_ms(w), 60000, "60 s default timeout")
+            spec.assert_eq_long(wait.poll_ms(w), 100, "100 ms default poll")
+        }
+        spec.it("describes itself as Go's String() does") callback {
+            w = wait.for_sql("3306", "mysql", |host: string, port: int| -> "")
+            spec.assert_str_eq(wait.describe(w), "SQL database on port 3306 using driver \"mysql\"", "default query not shown")
+            wait.with_query(w, "SELECT 10")
+            spec.assert_str_eq(wait.describe(w), "SQL database on port 3306 using driver \"mysql\" with query \"SELECT 10\"", "a custom one is")
+            w2 = wait.for_sql("", "pgx", |host: string, port: int| -> "")
+            spec.assert_str_eq(wait.describe(w2), "SQL database on port default using driver \"pgx\"", "no port")
+        }
+    }
+    return spec.run_summary(fw)
+}

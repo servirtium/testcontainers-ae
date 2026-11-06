@@ -1,0 +1,104 @@
+// Ported from testcontainers-go modules/cockroachdb/cockroachdb_test.go
+//
+// TestRun_WithAllOptions (secure, custom user, password, database, store
+// size, init script; the init script's cluster setting is read back with the user's
+// client certificate through the container's own `cockroach sql`, standing
+// in for pgx, and with `sql` over TLS as Go's test does with pgx), TestRun_WithInsecure (HTTP /health on the admin endpoint) and
+// the invalid-password-insecure / invalid-insecure-password cases.
+
+import std.spec
+import std.string
+import std.http.client
+import std.os
+import std.fs
+import sql
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.cockroachdb
+
+const IMAGE = "cockroachdb/cockroach:latest-v23.1"
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/cockroachdb") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("refuses a password with insecure mode, in both orders") callback {
+            c1, e1 = cockroachdb.run(IMAGE) { password("testPassword"); insecure() }
+            spec.assert_true(c1 == null, "no container")
+            spec.assert_contains(e1, "insecure mode cannot be used with a password", "password then insecure")
+            c2, e2 = cockroachdb.run(IMAGE) { insecure(); password("testPassword") }
+            spec.assert_true(c2 == null, "no container")
+            spec.assert_contains(e2, "insecure mode cannot be used with a password", "insecure then password")
+        }
+
+        spec.it("runs secure with all options (TestRun_WithAllOptions)") callback {
+            cr, err = cockroachdb.run(IMAGE) {
+                database("testDatabase")
+                store_size("50%")
+                user("testUser")
+                password("testPassword")
+                no_cluster_defaults()
+                init_script("modules/cockroachdb/testdata/__init.sql")
+            }
+            if cr != null { testing.cleanup_container(cr.container) }
+            spec.assert_ok(err, "cockroachdb starts")
+            if err == "" {
+                dsn, derr = cockroachdb.connection_string(cr)
+                spec.assert_ok(derr, "connection string")
+                spec.assert_true(string.starts_with(dsn, "postgres://testuser:testPassword@localhost:") == 1, "dsn: ${dsn}")
+                spec.assert_true(string.ends_with(dsn, "/testdatabase?sslmode=require") == 1, "lower-cased database: ${dsn}")
+                ca, cerr = cockroachdb.ca_cert(cr)
+                spec.assert_ok(cerr, "CA cert")
+                spec.assert_contains(ca, "BEGIN CERTIFICATE", "a PEM")
+                code, out, xerr = tc.exec(cr.container, ["/cockroach/cockroach", "sql", "--certs-dir=/cockroach/certs", "--host=127.0.0.1", "--user=testuser", "--database=testdatabase", "--format=csv", "-e", "SHOW CLUSTER SETTING jobs.registry.interval.gc"])
+                spec.assert_ok(xerr, "exec")
+                spec.assert_eq(code, 0, "SQL works with the client certificate: ${out}")
+                spec.assert_contains(out, "00:00:50", "the init script ran (gc interval 50s)")
+                // and through `sql` (pgx's port) over TLS 1.3, verified
+                // against the container's CA, as Go's test does with pgx
+                ca_path = "${os.temp_dir()}/tcae-crdb-ca-${tc.id(cr.container)}.pem"
+                spec.assert_ok(fs.write(ca_path, ca), "write the CA")
+                port, _ = tc.mapped_port(cr.container, cockroachdb.SQL_PORT)
+                db, _ = sql.open("pgx/v5", "postgres://testuser:testPassword@127.0.0.1:${port}/testdatabase?sslmode=verify-full&sslrootcert=${ca_path}")
+                row, qerr = sql.query_row(db, "SHOW CLUSTER SETTING jobs.registry.interval.gc", [])
+                spec.assert_ok(qerr, "the query over TLS with a password")
+                gc, _ = sql.string_at(row, 0)
+                spec.assert_str_eq(gc, "00:00:50", "the same setting")
+                sql.close(db)
+                fs.delete(ca_path)
+            }
+        }
+
+        spec.it("runs insecure and answers /health (TestRun_WithInsecure)") callback {
+            cr, err = cockroachdb.run(IMAGE) { insecure() }
+            if cr != null { testing.cleanup_container(cr.container) }
+            spec.assert_ok(err, "cockroachdb starts")
+            if err == "" {
+                dsn, _ = cockroachdb.connection_string(cr)
+                spec.assert_true(string.ends_with(dsn, "/defaultdb?sslmode=disable") == 1, "dsn: ${dsn}")
+                db, _ = sql.open("pgx/v5", dsn)
+                row, qerr = sql.query_row(db, "SELECT current_user", [])
+                spec.assert_ok(qerr, "SQL through `sql` without TLS")
+                who, _ = sql.string_at(row, 0)
+                spec.assert_str_eq(who, "root", "as root")
+                sql.close(db)
+                admin, aerr = cockroachdb.admin_endpoint(cr)
+                spec.assert_ok(aerr, "admin endpoint")
+                req = client.request("GET", "${admin}/health")
+                client.set_timeout(req, 30s)
+                r, rerr = client.send_request(req)
+                client.request_free(req)
+                spec.assert_ok(rerr, "GET /health")
+                if rerr == "" {
+                    spec.assert_eq(client.response_status(r), 200, "healthy")
+                    client.response_free(r)
+                }
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

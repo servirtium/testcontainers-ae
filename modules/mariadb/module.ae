@@ -1,0 +1,155 @@
+// Ported from testcontainers-go modules/mariadb/mariadb.go
+//
+// modules.mariadb: a MariaDB container. The same shape as modules.mysql
+// (the container type carries the credentials), with the MARIADB_*
+// variables.
+//
+//     import modules.mariadb
+//
+//     m, err = mariadb.run("mariadb:12.3.2") {
+//         database("app")
+//         username("app")
+//         password("secret")
+//         scripts(["testdata/schema.sql"])
+//         config_file("testdata/my.cnf")
+//     }
+//     defer tc.terminate(m.container)
+//     dsn, _ = mariadb.connection_string(m, "")
+//     // "app:secret@tcp(localhost:32771)/app"
+//
+// After the caller's block, run does what Go's trailing options do:
+// default_credentials (user root drops MARIADB_USER and sends the password as
+// MARIADB_ROOT_PASSWORD, or MARIADB_ALLOW_EMPTY_ROOT_PASSWORD with none),
+// then mirrors every MARIADB_* variable of the request to its MYSQL_* name
+// for old images (withMySQLEnvVars), then checks that an empty password goes
+// only with root ("empty password can be used only with the root user"; the
+// container is not started). Dropped variables are removed from the request
+// (tc.unset_env), as Go deletes them.
+//
+// Not ported: MustConnectionString (no Must* in this port) and the deprecated
+// RunContainer. The DSN connection_string returns is go-sql-driver/mysql's,
+// which this repository's `sql` with `sql.mysql` reads (tests/test_sql_mysql.ae uses it against MariaDB);
+// wait.for_sql(PORT, "mysql", ...) works with it too.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    MariaDBContainer, run, connection_string, database, username, password,
+    config_file, scripts, default_credentials, PORT, ROOT_USER, DEFAULT_USER,
+    DEFAULT_PASSWORD, DEFAULT_DATABASE, DEFAULT_IMAGE,
+    mariadb_request_new, mariadb_request_free
+)
+
+const PORT = "3306/tcp"
+const ROOT_USER = "root"
+const DEFAULT_USER = "test"
+const DEFAULT_PASSWORD = "test"
+const DEFAULT_DATABASE = "test"
+const DEFAULT_IMAGE = "mariadb:11.0.3"
+
+struct MariaDBContainer {
+    container: *docker.Container
+    username: string
+    password: string
+    database: string
+}
+
+mariadb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.expose(r, "33060/tcp")
+    tc.env(r, "MARIADB_USER", DEFAULT_USER)
+    tc.env(r, "MARIADB_PASSWORD", DEFAULT_PASSWORD)
+    tc.env(r, "MARIADB_DATABASE", DEFAULT_DATABASE)
+    tc.wait_for(r, wait.for_log("port: 3306  mariadb.org binary distribution"))
+    return r
+}
+
+mariadb_request_free(p: ptr) { tc.request_free(p) }
+
+database(_ctx: ptr, name: string) { tc.env(_ctx, "MARIADB_DATABASE", name) }
+username(_ctx: ptr, user: string) { tc.env(_ctx, "MARIADB_USER", user) }
+password(_ctx: ptr, pw: string) { tc.env(_ctx, "MARIADB_PASSWORD", pw) }
+
+fn base_name(p: string) -> string {
+    rest = p
+    i = string.index_of(rest, "/")
+    while i >= 0 {
+        rest = string.substring(rest, i + 1, string.length(rest))
+        i = string.index_of(rest, "/")
+    }
+    return rest
+}
+
+// Go's WithConfigFile: the host file becomes /etc/mysql/conf.d/my.cnf.
+config_file(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, "/etc/mysql/conf.d/my.cnf", 493)
+}
+
+// Go's WithScripts: host files copied into /docker-entrypoint-initdb.d.
+scripts(_ctx: ptr, host_paths: string[]) {
+    for p in host_paths {
+        tc.file(_ctx, p, "/docker-entrypoint-initdb.d/${base_name(p)}", 493)
+    }
+}
+
+// Go's WithDefaultCredentials, on a request (run calls it after the block).
+default_credentials(r: ptr) {
+    user = tc.req_env(r, "MARIADB_USER")
+    pw = tc.req_env(r, "MARIADB_PASSWORD")
+    is_root = string.to_lower(user) == ROOT_USER
+    if is_root { tc.unset_env(r, "MARIADB_USER") }
+    if string.length(pw) != 0 {
+        tc.env(r, "MARIADB_ROOT_PASSWORD", pw)
+    } else if is_root {
+        tc.env(r, "MARIADB_ALLOW_EMPTY_ROOT_PASSWORD", "yes")
+        tc.unset_env(r, "MARIADB_PASSWORD")
+    }
+}
+
+// Go's withMySQLEnvVars: every MARIADB_* variable again as MYSQL_*.
+fn mysql_env_vars(r: ptr) {
+    for k in tc.req_env_keys(r) {
+        if string.starts_with(k, "MARIADB_") == 1 {
+            tc.env(r, "MYSQL_${string.substring(k, 8, string.length(k))}", tc.req_env(r, k))
+        }
+    }
+}
+
+builder run(image: string) with mariadb_request_new -> (*MariaDBContainer, string) {
+    r = _builder
+    if r == null { r = mariadb_request_new() }
+    default_credentials(r)
+    mysql_env_vars(r)
+    // Go's validateCredentials: no MARIADB_USER at all means root
+    user = ROOT_USER
+    if tc.req_has_env(r, "MARIADB_USER") { user = tc.req_env(r, "MARIADB_USER") }
+    pw = tc.req_env(r, "MARIADB_PASSWORD")
+    if string.length(pw) == 0 && string.to_lower(user) != ROOT_USER {
+        tc.request_free(r)
+        return null, "run mariadb: empty password can be used only with the root user"
+    }
+    db = tc.req_env(r, "MARIADB_DATABASE")
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run mariadb: ${err}" }
+    m = heap.new(MariaDBContainer)
+    m.container = c
+    m.username = user
+    m.password = pw
+    m.database = db
+    if err != "" { return m, "run mariadb: ${err}" }
+    return m, ""
+}
+
+// "user:password@tcp(host:port)/db?args" (Go's ConnectionString; args are
+// joined with &, "" means none).
+connection_string(m: *MariaDBContainer, args: string) -> (string, string) {
+    ep, err = tc.endpoint(m.container, PORT, "")
+    if err != "" { return "", err }
+    extra = ""
+    if string.length(args) > 0 { extra = "?${args}" }
+    return "${m.username}:${m.password}@tcp(${ep})/${m.database}${extra}", ""
+}

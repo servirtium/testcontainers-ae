@@ -1,0 +1,57 @@
+// Ported from testcontainers-go parallel_test.go (TestParallelContainers, the all-good case and one bad image)
+//
+// tc.parallel starts three small containers at once on worker threads:
+// all three are up, distinct, and reachable; a request for an image that
+// does not exist comes back as that request's error, beside the others.
+
+import std.spec
+import std.string
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.wait
+import testcontainers.testing
+
+fn sleeper(tag: string) -> ptr {
+    return tc.container_request("alpine:3") {
+        cmd(["sh", "-c", "echo up ${tag}; sleep 300"])
+        wait_for(wait.for_log("up ${tag}"))
+    }
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "parallel (ParallelContainers)") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("starts three containers concurrently, and reports a bad request by index") callback {
+            reqs = [sleeper("a"), sleeper("b"), sleeper("c"), tc.container_request("tcae.invalid/no-such-image:0")]
+            cs, errs, all = tc.parallel(reqs, 0)
+            spec.assert_eq(cs.len, 4, "one slot per request")
+            i = 0
+            while i < cs.len {
+                if cs[i] != null { testing.cleanup_container(cs[i] as *docker.Container) }
+                i = i + 1
+            }
+            ids = ""
+            i = 0
+            while i < 3 {
+                spec.assert_ok(errs[i], "request ${i}")
+                c = cs[i] as *docker.Container
+                spec.assert_true(c != null && tc.is_running(c), "container ${i} is running")
+                if c != null {
+                    spec.assert_false(string.contains(ids, tc.id(c)) == 1, "container ${i} is a container of its own")
+                    ids = "${ids} ${tc.id(c)}"
+                    logs, _ = tc.logs(c)
+                    spec.assert_contains(logs, "up ", "container ${i} ran its command")
+                }
+                i = i + 1
+            }
+            spec.assert_true(errs[3] != "", "the bad image fails")
+            spec.assert_true(cs[3] == null, "and makes no container")
+            spec.assert_contains(all, "request 3 (tcae.invalid/no-such-image:0)", "the joined error names it: ${all}")
+        }
+    }
+    return spec.run_summary(fw)
+}

@@ -1,0 +1,127 @@
+// Ported from testcontainers-go modules/gcloud/bigquery/bigquery.go and
+// options.go (WithProjectID is internal/shared/shared.go's)
+//
+// modules.gcloud.bigquery: the goccy BigQuery emulator.
+//
+//     import modules.gcloud.bigquery
+//
+//     c, err = bigquery.run("ghcr.io/goccy/bigquery-emulator:0.6.1") {
+//         project_id("bigquery-project")
+//         data_yaml_content(seed)          // or data_yaml("testdata/data.yaml")
+//     }
+//     defer bigquery.terminate(c)
+//     bigquery.uri(c)                      // "http://localhost:32771"
+//     bigquery.project_id_of(c)            // "bigquery-project"
+//
+// The emulator is started by the image's own entrypoint; the project goes in
+// as `--project <id>`. data_yaml / data_yaml_content are Go's WithDataYAML
+// (an io.Reader there): the YAML is copied to /testcontainers-data.yaml and
+// handed over with --data-from-yaml; a second one is an error from run.
+//
+// Status: compile-checked only (alpha; no engine was used to port it).
+//
+// Not ported: Go's old flat gcloud.RunBigQuery (deprecated, replaced by this
+// module) and the cloud.google.com/go/bigquery client code of Go's example
+// (no such SDK in Aether; the test sends the query to the emulator's REST
+// API instead).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    BigQueryContainer, run, terminate, project_id, data_yaml, data_yaml_content,
+    project_id_of, uri,
+    PORT, PORT_GRPC, DEFAULT_PROJECT_ID, DEFAULT_IMAGE, DATA_YAML_PATH,
+    bigquery_request_new, bigquery_request_free
+)
+
+const PORT = "9050/tcp"
+const PORT_GRPC = "9060/tcp"
+const DEFAULT_PROJECT_ID = "test-project"
+const DEFAULT_IMAGE = "ghcr.io/goccy/bigquery-emulator:0.6.1"
+const DATA_YAML_PATH = "/testcontainers-data.yaml"
+
+const SET_PROJECT = "bigquery.project_id"
+const SET_ERROR = "bigquery.error"
+
+struct BigQueryContainer {
+    container: *docker.Container
+    pid: string
+    addr: string
+}
+
+bigquery_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.expose(r, PORT_GRPC)
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(PORT),
+        wait.for_http("/discovery/v1/apis/bigquery/v2/rest") { with_port(PORT); with_status(200); with_startup_timeout(5s) }
+    ]))
+    tc.set_setting(r, SET_PROJECT, DEFAULT_PROJECT_ID)
+    return r
+}
+
+bigquery_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithProjectID.
+project_id(_ctx: ptr, id: string) { tc.set_setting(_ctx, SET_PROJECT, id) }
+
+fn add_data_yaml(_ctx: ptr) -> bool {
+    if tc.req_has_cmd_arg(_ctx, "--data-from-yaml") {
+        tc.set_setting(_ctx, SET_ERROR, "data yaml already exists")
+        return false
+    }
+    tc.cmd_arg(_ctx, "--data-from-yaml")
+    tc.cmd_arg(_ctx, DATA_YAML_PATH)
+    return true
+}
+
+// Go's WithDataYAML from a file on the host: copied into the container and
+// passed with --data-from-yaml.
+data_yaml(_ctx: ptr, host_path: string) {
+    if add_data_yaml(_ctx) { tc.file(_ctx, host_path, DATA_YAML_PATH, 420) }
+}
+
+// Go's WithDataYAML from the YAML text itself (the io.Reader).
+data_yaml_content(_ctx: ptr, content: string) {
+    if add_data_yaml(_ctx) { tc.file_content(_ctx, content, DATA_YAML_PATH, 420) }
+}
+
+builder run(image: string) with bigquery_request_new -> (*BigQueryContainer, string) {
+    r = _builder
+    if r == null { r = bigquery_request_new() }
+    if tc.req_has_setting(r, SET_ERROR) {
+        msg = tc.req_setting(r, SET_ERROR)
+        bigquery_request_free(r)
+        return null, "apply option: ${msg}"
+    }
+    pid = tc.req_setting(r, SET_PROJECT)
+    tc.cmd_arg(r, "--project")
+    tc.cmd_arg(r, pid)
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run bigquery: ${err}" }
+    g = heap.new(BigQueryContainer)
+    g.container = c
+    g.pid = pid
+    g.addr = ""
+    if err != "" { return g, "run bigquery: ${err}" }
+    ep, eerr = tc.endpoint(c, PORT, "http")
+    if eerr != "" { return g, "port endpoint: ${eerr}" }
+    g.addr = ep
+    return g, ""
+}
+
+// Terminate the container (null-safe).
+terminate(g: *BigQueryContainer) -> string {
+    if g == null { return "" }
+    return tc.terminate(g.container)
+}
+
+// The project id the emulator was started with (Go's ProjectID).
+project_id_of(g: *BigQueryContainer) -> string { return g.pid }
+
+// "http://host:port" of the REST endpoint (Go's URI).
+uri(g: *BigQueryContainer) -> string { return g.addr }

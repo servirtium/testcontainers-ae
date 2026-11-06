@@ -1,0 +1,115 @@
+// Ported from testcontainers-go modules/k3s/k3s.go (and types.go)
+//
+// modules.k3s: a single-node K3s Kubernetes cluster. STATUS: compile-checked
+// only. K3s needs a privileged container; the Go module sets
+// Privileged=true and tmpfs on /run and /var/run, and so does this one, but
+// it was not run against the rootless Podman machine it was ported on.
+//
+//     import modules.k3s
+//
+//     c, err = k3s.run("rancher/k3s:v1.27.1-k3s1") {
+//         with_manifest("testdata/nginx-manifest.yaml")
+//     }
+//     defer tc.terminate(c)
+//     kubeconfig, _ = k3s.get_kube_config(c)     // YAML, server = https://host:port
+//
+// Not ported: LoadImages / LoadImagesWithOpts / LoadImagesWithPlatform
+// (docker save of local images, copy and `ctr -n=k8s.io images import`; needs
+// the engine's image-save API, not in the core), and the client-go calls of
+// the Go tests (the test here reads /version over HTTPS instead). Go parses
+// the kubeconfig with a YAML library; here only the cluster `server:` line is
+// rewritten in the text, which is all GetKubeConfig changes.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, get_kube_config, kube_config_with_server_url, with_manifest,
+    SECURE_PORT, WEBHOOK_PORT, DEFAULT_IMAGE, KUBECONFIG_PATH,
+    k3s_request_new, k3s_request_free
+)
+
+const SECURE_PORT = "6443/tcp"
+const WEBHOOK_PORT = "8443/tcp"
+const KUBECONFIG_PATH = "/etc/rancher/k3s/k3s.yaml"
+const MANIFESTS = "/var/lib/rancher/k3s/server/manifests/"
+const DEFAULT_IMAGE = "rancher/k3s:v1.27.1-k3s1"
+
+k3s_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, SECURE_PORT)
+    tc.expose(r, WEBHOOK_PORT)
+    tc.privileged(r)
+    tc.tmpfs(r, "/run", "")
+    tc.tmpfs(r, "/var/run", "")
+    tc.env(r, "K3S_KUBECONFIG_MODE", "644")
+    tc.wait_for(r, wait.for_log(".*Node controller sync successful.*") { as_regexp() })
+    return r
+}
+
+k3s_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithManifest: K3s applies a manifest dropped in its manifests
+// directory at startup.
+with_manifest(_ctx: ptr, manifest_path: string) {
+    base = manifest_path
+    i = 0
+    n = string.length(manifest_path)
+    while i < n {
+        if string.char_at(manifest_path, i) == 47 { base = string.substring(manifest_path, i + 1, n) }
+        i = i + 1
+    }
+    tc.file(_ctx, manifest_path, "${MANIFESTS}${base}", 0)
+}
+
+builder run(image: string) with k3s_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = k3s_request_new() }
+    cl, cerr = docker.client()
+    if cerr != "" {
+        tc.request_free(r)
+        return null, "run k3s: ${cerr}"
+    }
+    // the host the tests reach the API server on must be in its certificate
+    tc.cmd(r, ["server", "--disable=traefik", "--tls-san=${docker.daemon_host(cl)}"])
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run k3s: ${err}" }
+    return c, ""
+}
+
+// Go's kubeConfigWithServerURL: the kubeconfig text with the first cluster's
+// `server:` value replaced.
+kube_config_with_server_url(yaml: string, server: string) -> (string, string) {
+    lines = string.split(yaml, "\n")
+    n = string.string_array_size(lines)
+    out = ""
+    done = false
+    i = 0
+    while i < n {
+        line = string.string_array_get(lines, i)
+        t = string.trim(line)
+        if !done && string.starts_with(t, "server:") == 1 {
+            indent = string.substring(line, 0, string.index_of(line, "server:"))
+            line = "${indent}server: ${server}"
+            done = true
+        }
+        if i > 0 { out = "${out}\n" }
+        out = "${out}${line}"
+        i = i + 1
+    }
+    string.string_array_free(lines)
+    if !done { return "", "failed to modify kubeconfig with server url: no cluster server in it" }
+    return out, ""
+}
+
+// Go's GetKubeConfig: the kubeconfig from the container with its server set
+// to the mapped API-server port, "https://host:port".
+get_kube_config(c: *docker.Container) -> (string, string) {
+    yaml, err = tc.copy_file_from_container(c, KUBECONFIG_PATH)
+    if err != "" { return "", "failed to copy file from container: ${err}" }
+    server, serr = tc.endpoint(c, SECURE_PORT, "https")
+    if serr != "" { return "", "failed to get port endpoint: ${serr}" }
+    return kube_config_with_server_url(yaml, server)
+}

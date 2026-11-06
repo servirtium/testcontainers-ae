@@ -1,0 +1,64 @@
+// Ported from testcontainers-go modules/sftp/sftp.go, modules/sftp/options.go
+//
+// modules.sftp: an SFTP server (atmoz/sftp) container.
+//
+//     import modules.sftp
+//
+//     c, err = sftp.run("atmoz/sftp:latest") {
+//         user("testuser", "testpassword")
+//         user("other", "secret")
+//     }
+//     defer tc.terminate(c)
+//     addr, _ = sftp.address(c)       // "localhost:32771", for an SSH / SFTP client
+//
+// Go keeps the users in an options struct and passes them as the container's
+// command ("name:password:::upload", atmoz/sftp creates /home/<name>/upload).
+// Here user() appends the same entry to the request's command, and run
+// refuses to start when no entry is there: "at least one user is required".
+// Go's SFTP tests only check the address; the examples dial it with
+// golang.org/x/crypto/ssh and pkg/sftp, which are not ported (Aether's std
+// has no SSH client). Nothing else in the Go module is left out: Address is
+// its only helper and is ported as address().
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(run, address, user, PORT, DEFAULT_IMAGE, sftp_request_new, sftp_request_free)
+
+const PORT = "22/tcp"
+const DEFAULT_IMAGE = "atmoz/sftp:latest"
+
+// Go's moduleOpts: the SSH port, listening. (The users are the command.)
+sftp_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_listening_port(PORT))
+    return r
+}
+
+sftp_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithUser: add a user; the home directory has a writable upload/
+// directory (/home/<username>/upload). Calls accumulate users.
+user(_ctx: ptr, username: string, password: string) {
+    tc.cmd_arg(_ctx, "${username}:${password}:::upload")
+}
+
+builder run(image: string) with sftp_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = sftp_request_new() }
+    if tc.req_cmd(r).len == 0 {
+        tc.request_free(r)
+        return null, "run sftp: at least one user is required"
+    }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run sftp: ${err}" }
+    return c, ""
+}
+
+// "host:port" of the SSH / SFTP server (Go's Address).
+address(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "")
+}

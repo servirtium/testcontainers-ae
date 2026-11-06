@@ -1,0 +1,96 @@
+// Ported from testcontainers-go modules/tidb/tidb_test.go
+//
+// A real TiDB (TestTiDB): the DSN has the shape Go asserts
+// (root:@tcp(host:port)/test), the status REST port answers /status over
+// HTTP with the server version, and the MySQL port sends a protocol-10
+// handshake over std.tcp.
+
+import std.spec
+import std.string
+import std.tcp
+import std.http.client
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.tidb
+
+const IMAGE = "pingcap/tidb:v8.4.0"
+
+// (status, body, error) of a GET.
+fn http_get(url: string) -> (int, string, string) {
+    req = client.request("GET", url)
+    client.set_timeout(req, 30s)
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    status = client.response_status(r)
+    out = client.response_body(r)
+    client.response_free(r)
+    return status, out, ""
+}
+
+fn greeting(host: string, port: int) -> (int, string, string) {
+    sock, cerr = tcp.connect(host, port)
+    if cerr != "" { return 0, "", cerr }
+    buf = ""
+    total = 0
+    tries = 0
+    while tries < 100 && total < 16 {
+        chunk, n, rerr = tcp.read_n(sock, 512)
+        if rerr != "" && rerr != "timeout" { tcp.tcp_close(sock); return 0, "", rerr }
+        if n > 0 {
+            if total == 0 { buf = chunk }
+            else { buf = string.concat(buf, chunk) }
+            total = total + n
+        }
+        tries = tries + 1
+    }
+    tcp.tcp_close(sock)
+    if total < 6 { return 0, "", "short greeting (${total} bytes)" }
+    proto = string.char_at_n(buf, total, 4)
+    ver = ""
+    i = 5
+    while i < total {
+        ch = string.char_at_n(buf, total, i)
+        if ch == 0 { i = total } else { ver = "${ver}${string.from_char(ch)}"; i = i + 1 }
+    }
+    return proto, ver, ""
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/tidb") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("starts, and the DSN, REST and MySQL ports are right (TestTiDB)") callback {
+            t, err = tidb.run(IMAGE)
+            if t != null { testing.cleanup_container(t.container) }
+            spec.assert_ok(err, "tidb starts")
+            if err == "" {
+                ep, _ = tc.endpoint(t.container, tidb.PORT, "")
+                dsn, derr = tidb.connection_string(t, "")
+                spec.assert_ok(derr, "connection string")
+                spec.assert_str_eq(dsn, "root:@tcp(${ep})/test", "the DSN Go asserts")
+                with_args, _ = tidb.connection_string(t, "tls=skip-verify")
+                spec.assert_str_eq(with_args, "root:@tcp(${ep})/test?tls=skip-verify", "args after ?")
+
+                rest, _ = tc.endpoint(t.container, tidb.REST_PORT, "http")
+                st, body, herr = http_get("${rest}/status")
+                spec.assert_ok(herr, "GET /status")
+                spec.assert_eq(st, 200, "status is 200")
+                spec.assert_contains(body, "\"version\"", "the status JSON has a version: ${body}")
+
+                h, _ = tc.host(t.container)
+                port, perr = tc.mapped_port(t.container, tidb.PORT)
+                spec.assert_ok(perr, "mapped port")
+                proto, ver, gerr = greeting(h, port)
+                spec.assert_ok(gerr, "read the greeting from ${h}:${port}")
+                spec.assert_eq(proto, 10, "handshake protocol version 10")
+                spec.assert_contains(ver, "TiDB", "a TiDB server version string: ${ver}")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

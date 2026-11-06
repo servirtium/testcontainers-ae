@@ -1,0 +1,298 @@
+// Ported from testcontainers-go modules/etcd/etcd.go, modules/etcd/options.go
+//
+// modules.etcd: an etcd container, single node or a cluster on a network of
+// its own. The first node's *EtcdContainer holds the other nodes and the
+// network, as Go's EtcdContainer holds childNodes and the cluster network.
+//
+//     import modules.etcd
+//
+//     e, err = etcd.run("gcr.io/etcd-development/etcd:v3.5.14") {
+//         nodes(["etcd-1", "etcd-2", "etcd-3"])   // optional: a cluster
+//         cluster_token("my-token")
+//         data_dir()
+//     }
+//     defer etcd.terminate(e)        // children, the node, then the network
+//     eps, _ = etcd.client_endpoints(e)   // ["http://localhost:32771", ...]
+//
+// Go keeps the module options in a struct of their own and re-applies the
+// caller's options to every node. Here the block runs once, on the first
+// node's request: the module options (nodes, cluster_token, data_dir,
+// additional_args) are module settings on it (tc.set_setting, never sent to
+// the engine), and run copies the request as the block left it
+// (tc.request_copy) for each further node, so every node gets the caller's
+// core options (tc.env, tc.label, ...) as in Go.
+//
+// Differences from Go:
+//
+//  - additional_args appends on every call (Go's keeps the last call's).
+//  - Like Go there is no wait strategy: Run returns before the gateway
+//    answers (and a cluster's first node cannot be ready before the others
+//    start), so callers retry their first request.
+//  - Go's WithNodes requires two names or more by signature; here fewer
+//    than two names means a single node, as no option means.
+//
+// Not ported: the deprecated RunContainer; Go's examples (they use the etcd
+// Go client). Go's WithNodes in a cluster started with a node named
+// "default" has no special case either.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+import testcontainers.network
+
+exports(
+    EtcdContainer, run, terminate, client_endpoint, client_endpoints,
+    peer_endpoint, peer_endpoints, nodes, cluster_token, data_dir,
+    additional_args, CLIENT_PORT, PEER_PORT, DATA_DIR, DEFAULT_CLUSTER_TOKEN,
+    etcd_request_new, etcd_request_free
+)
+
+const CLIENT_PORT = "2379/tcp"
+const PEER_PORT = "2380/tcp"
+const DATA_DIR = "/data.etcd"
+const DEFAULT_CLUSTER_TOKEN = "mys3cr3ttok3n"
+const SCHEME = "http"
+
+// the module settings the options leave on the request (see the header)
+const SET_NODES = "etcd.nodes"
+const SET_TOKEN = "etcd.cluster_token"
+const SET_DATA_DIR = "etcd.data_dir"
+const SET_ARGS = "etcd.additional_args"
+
+struct EtcdContainer {
+    container: *docker.Container
+    children: ptr[]          // the other nodes of a cluster, as *EtcdContainer
+    net: *docker.Network     // the cluster network, null for a single node
+    node_names: string[]
+    current: int
+}
+
+// Go's moduleOpts: the client and peer ports.
+etcd_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, CLIENT_PORT)
+    tc.expose(r, PEER_PORT)
+    return r
+}
+
+etcd_request_free(p: ptr) { tc.request_free(p) }
+
+// ---- options ----
+
+// Go's WithNodes: the names of the cluster's nodes, two or more (Go's
+// signature is node1, node2, ...nodes; here one array). The first becomes
+// the *EtcdContainer run returns, the rest its children.
+nodes(_ctx: ptr, names: string[]) {
+    joined = ""
+    i = 0
+    for n in names {
+        if i > 0 { joined = "${joined}," }
+        joined = "${joined}${n}"
+        i = i + 1
+    }
+    tc.set_setting(_ctx, SET_NODES, joined)
+}
+
+// Go's WithClusterToken.
+cluster_token(_ctx: ptr, token: string) { tc.set_setting(_ctx, SET_TOKEN, token) }
+
+// Go's WithDataDir: --data-dir=/data.etcd, made writable by every user.
+data_dir(_ctx: ptr) { tc.set_setting(_ctx, SET_DATA_DIR, "1") }
+
+// Go's WithAdditionalArgs, one argument a call, appended last to the command.
+additional_args(_ctx: ptr, arg: string) {
+    if !tc.req_has_setting(_ctx, SET_ARGS) {
+        tc.set_setting(_ctx, SET_ARGS, arg)
+    } else {
+        tc.set_setting(_ctx, SET_ARGS, "${tc.req_setting(_ctx, SET_ARGS)}\n${arg}")
+    }
+}
+
+// ---- command line (Go's configureCMD) ----
+
+fn split_on(s: string, sep: string) -> string[] {
+    string[] out = []
+    if string.length(s) == 0 { return out }
+    rest = s
+    i = string.index_of(rest, sep)
+    while i >= 0 {
+        out.push(string.substring(rest, 0, i))
+        rest = string.substring(rest, i + string.length(sep), string.length(rest))
+        i = string.index_of(rest, sep)
+    }
+    out.push(rest)
+    return out
+}
+
+fn configure_cmd(names: string[], current: int, token: string, with_data_dir: bool, extra: string[]) -> string[] {
+    string[] cmds = []
+    cmds.push("etcd")
+    if names.len == 0 {
+        cmds.push("--name=default")
+        cmds.push("--listen-client-urls=${SCHEME}://0.0.0.0:2379")
+        cmds.push("--advertise-client-urls=${SCHEME}://0.0.0.0:2379")
+    } else {
+        me = names[current]
+        cmds.push("--name=${me}")
+        cmds.push("--initial-advertise-peer-urls=${SCHEME}://${me}:2380")
+        cmds.push("--advertise-client-urls=${SCHEME}://${me}:2379")
+        cmds.push("--listen-peer-urls=${SCHEME}://0.0.0.0:2380")
+        cmds.push("--listen-client-urls=${SCHEME}://0.0.0.0:2379")
+        cmds.push("--initial-cluster-state=new")
+        cluster = ""
+        i = 0
+        for n in names {
+            if i > 0 { cluster = "${cluster}," }
+            cluster = "${cluster}${n}=${SCHEME}://${n}:2380"
+            i = i + 1
+        }
+        cmds.push("--initial-cluster=${cluster}")
+        if string.length(token) > 0 { cmds.push("--initial-cluster-token=${token}") }
+    }
+    if with_data_dir { cmds.push("--data-dir=${DATA_DIR}") }
+    for a in extra { cmds.push(a) }
+    return cmds
+}
+
+// The chmod hook of WithDataDir.
+fn add_data_dir_hook(r: ptr) {
+    tc.on_post_start(r, |c: *docker.Container| {
+        // as Go: only a failure to exec is an error, not the exit code (the
+        // official image has no chmod at all, and Go's exec then returns 126/127)
+        _code, _out, err = tc.exec(c, ["chmod", "o+rwx", "-R", DATA_DIR])
+        if err != "" { return "chmod etcd data dir: ${err}" }
+        return ""
+    })
+}
+
+fn new_state(c: *docker.Container, names: string[], current: int, net: *docker.Network) -> *EtcdContainer {
+    e = heap.new(EtcdContainer)
+    e.container = c
+    e.children = []
+    e.net = net
+    e.node_names = names
+    e.current = current
+    return e
+}
+
+// Run an etcd container (Go's etcd.Run); with nodes(...) the first node
+// starts the cluster network and the rest. The returned *EtcdContainer is
+// non-null whenever something was created, with the error, so the caller can
+// terminate what exists.
+builder run(image: string) with etcd_request_new -> (*EtcdContainer, string) {
+    r = _builder
+    if r == null { r = etcd_request_new() }
+    names = split_on(tc.req_setting(r, SET_NODES), ",")
+    if names.len < 2 { names = [] }
+    token = tc.req_setting(r, SET_TOKEN)
+    if names.len > 0 && string.length(token) == 0 { token = DEFAULT_CLUSTER_TOKEN }
+    with_data = tc.req_has_setting(r, SET_DATA_DIR)
+    extra = split_on(tc.req_setting(r, SET_ARGS), "\n")
+    // the request as the module defaults and the caller's block left it,
+    // for the other nodes (Go's clusterOpts: the caller's options again)
+    ptr node_req = null
+    if names.len > 0 { node_req = tc.request_copy(r) }
+
+    e = new_state(null, names, 0, null)
+    if names.len > 0 {
+        n, nerr = network.new_random()
+        if nerr != "" {
+            etcd_request_free(r)
+            etcd_request_free(node_req)
+            return null, "configure cluster: new network: ${nerr}"
+        }
+        e.net = n
+        tc.network_alias(r, n.name, names[0])
+    }
+    tc.cmd(r, configure_cmd(names, 0, token, with_data, extra))
+    if with_data { add_data_dir_hook(r) }
+
+    c, err = tc.run_request(r, image)
+    if c == null && names.len == 0 { return null, "run etcd: ${err}" }
+    e.container = c
+    if err != "" {
+        etcd_request_free(node_req)
+        return e, "run etcd: ${err}"
+    }
+
+    // only the first node creates the cluster
+    i = 1
+    while i < names.len {
+        cr = tc.request_copy(node_req)
+        tc.network_alias(cr, e.net.name, names[i])
+        tc.cmd(cr, configure_cmd(names, i, token, with_data, extra))
+        if with_data { add_data_dir_hook(cr) }
+        cc, cerr = tc.run_request(cr, image)
+        if cc != null { e.children.push(new_state(cc, names, i, null) as ptr) }
+        if cerr != "" {
+            etcd_request_free(node_req)
+            return e, "run cluster node: run etcd: ${cerr}"
+        }
+        i = i + 1
+    }
+    etcd_request_free(node_req)
+    return e, ""
+}
+
+// Go's Terminate: the child nodes, the node, then the cluster network.
+// Null-safe. Returns the errors joined.
+terminate(e: *EtcdContainer) -> string {
+    if e == null { return "" }
+    errs = ""
+    i = 0
+    while i < e.children.len {
+        child = e.children[i] as *EtcdContainer
+        err = tc.terminate(child.container)
+        if err != "" { errs = "${errs}terminate child node(${i}): ${err}; " }
+        i = i + 1
+    }
+    if e.container != null {
+        err = tc.terminate(e.container)
+        if err != "" { errs = "${errs}terminate cluster node: ${err}; " }
+    }
+    if e.net != null {
+        err = network.remove(e.net)
+        if err != "" { errs = "${errs}remove cluster network: ${err}; " }
+    }
+    return errs
+}
+
+// "http://host:port" of this node's client port (Go's ClientEndpoint).
+client_endpoint(e: *EtcdContainer) -> (string, string) {
+    return tc.endpoint(e.container, CLIENT_PORT, "http")
+}
+
+// The client endpoints of the whole cluster, the first node first.
+client_endpoints(e: *EtcdContainer) -> (string[], string) {
+    string[] out = []
+    ep, err = client_endpoint(e)
+    if err != "" { return out, err }
+    out.push(ep)
+    for ch in e.children {
+        c = ch as *EtcdContainer
+        cep, cerr = client_endpoint(c)
+        if cerr != "" { return out, cerr }
+        out.push(cep)
+    }
+    return out, ""
+}
+
+// "http://host:port" of the peer port (Go's PeerEndpoint).
+peer_endpoint(e: *EtcdContainer) -> (string, string) {
+    return tc.endpoint(e.container, PEER_PORT, "http")
+}
+
+peer_endpoints(e: *EtcdContainer) -> (string[], string) {
+    string[] out = []
+    ep, err = peer_endpoint(e)
+    if err != "" { return out, err }
+    out.push(ep)
+    for ch in e.children {
+        c = ch as *EtcdContainer
+        cep, cerr = peer_endpoint(c)
+        if cerr != "" { return out, cerr }
+        out.push(cep)
+    }
+    return out, ""
+}

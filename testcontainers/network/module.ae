@@ -1,0 +1,117 @@
+// Ported from testcontainers-go network/network.go, network.go, generic.go (GenericNetwork)
+//
+// testcontainers.network: user-defined networks for containers to talk on.
+//
+//     n, err = network.new_random() { internal() }
+//     defer network.remove(n)
+//     c, _ = tc.run("nginx:alpine") { with_network(n.name); network_alias(n.name, "web") }
+//
+// new / new_random are builders: the block sets the request first. Every
+// network is labelled with the session, so the reaper removes it too.
+
+import std.string
+import std.json
+import std.uuid
+import testcontainers.docker
+
+exports(
+    NetRequest, net_request_new, net_request_free, new, new_random, remove,
+    driver, internal, attachable, enable_ipv6, label, option, subnet, gateway,
+    name_of, id_of, inspect
+)
+
+struct NetRequest {
+    driver: string
+    internal: bool
+    attachable: bool
+    ipv6: bool
+    labels: string[]
+    options: string[]
+    subnet: string
+    gateway: string
+}
+
+net_request_new() -> ptr {
+    r = heap.new(NetRequest)
+    r.driver = "bridge"
+    return r as ptr
+}
+
+net_request_free(p: ptr) {
+    if p == null { return }
+    heap.free(p as *NetRequest)
+}
+
+fn nr(p: @into ptr) -> *NetRequest { return p as *NetRequest }
+
+// ---- setters (Go's network.With* options) ----
+driver(_ctx: ptr, d: string) { r = nr(_ctx); r.driver = d }
+internal(_ctx: ptr) { r = nr(_ctx); r.internal = true }
+attachable(_ctx: ptr) { r = nr(_ctx); r.attachable = true }
+enable_ipv6(_ctx: ptr) { r = nr(_ctx); r.ipv6 = true }
+label(_ctx: ptr, key: string, value: string) { r = nr(_ctx); r.labels.push("${key}=${value}") }
+option(_ctx: ptr, key: string, value: string) { r = nr(_ctx); r.options.push("${key}=${value}") }
+subnet(_ctx: ptr, cidr: string) { r = nr(_ctx); r.subnet = cidr }
+gateway(_ctx: ptr, ip: string) { r = nr(_ctx); r.gateway = ip }
+
+fn set_kvs(o: ptr, kvs: string[]) {
+    for kv in kvs {
+        eq = string.index_of(kv, "=")
+        if eq > 0 { json.set(o, string.substring(kv, 0, eq), json.str(string.substring(kv, eq + 1, string.length(kv)))) }
+    }
+}
+
+fn create(p: ptr, name: string) -> (*docker.Network, string) {
+    r = nr(p)
+    if r == null { r = nr(net_request_new()) }
+    cl, err = docker.client()
+    if err != "" { return null, err }
+    body = json.obj()
+    json.set(body, "Name", json.str(name))
+    json.set(body, "Driver", json.str(r.driver))
+    json.set(body, "CheckDuplicate", json.boolean(1))
+    if r.internal { json.set(body, "Internal", json.boolean(1)) }
+    if r.attachable { json.set(body, "Attachable", json.boolean(1)) }
+    if r.ipv6 { json.set(body, "EnableIPv6", json.boolean(1)) }
+    labels = json.obj()
+    docker.add_default_labels(labels)
+    set_kvs(labels, r.labels)
+    json.set(body, "Labels", labels)
+    if r.options.len > 0 {
+        o = json.obj()
+        set_kvs(o, r.options)
+        json.set(body, "Options", o)
+    }
+    if string.length(r.subnet) > 0 {
+        ipam = json.obj()
+        cfgs = json.arr()
+        c = json.obj()
+        json.set(c, "Subnet", json.str(r.subnet))
+        if string.length(r.gateway) > 0 { json.set(c, "Gateway", json.str(r.gateway)) }
+        json.push(cfgs, c)
+        json.set(ipam, "Config", cfgs)
+        json.set(body, "IPAM", ipam)
+    }
+    net_request_free(r as ptr)
+    return docker.create_network(cl, body)
+}
+
+// A network named name (Go's GenericNetwork with a name).
+builder new(name: string) with net_request_new -> (*docker.Network, string) {
+    return create(_builder, name)
+}
+
+// A network with a made-up name (Go's network.New).
+builder new_random() with net_request_new -> (*docker.Network, string) {
+    u, _ = uuid.v4()
+    return create(_builder, "tcae-${string.replace_all(u, "-", "")}")
+}
+
+// Remove it (Go's Remove). Null-safe; one already gone is not an error.
+remove(n: *docker.Network) -> string { return docker.remove_network(n) }
+
+name_of(n: *docker.Network) -> string { return n.name }
+id_of(n: *docker.Network) -> string { return n.id }
+
+// The engine's document for the network; the caller json.frees it.
+inspect(n: *docker.Network) -> (ptr, string) { return docker.inspect_network(n.client, n.id) }

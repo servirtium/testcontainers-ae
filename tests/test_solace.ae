@@ -1,0 +1,78 @@
+// Ported from testcontainers-go modules/solace/solace_test.go (TestSolace)
+//
+// A real Solace PubSub+ broker with a message VPN, a client username and a
+// queue subscribed to a topic, all made by the module's CLI script. Checked
+// through the SEMP v2 management API (basic auth as the global admin the
+// block creates): the VPN and the queue exist, with the topic subscribed.
+// The AMQP broker URL has the amqp:// scheme.
+//
+// Image: amd64 only and slow to start. Compile-checked only on Podman (see main).
+
+import std.spec
+import std.string
+import std.http.client
+import std.encoding
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.solace
+
+const IMAGE = "solace/solace-pubsub-standard:latest"
+
+fn semp(url: string) -> (int, string, string) {
+    req = client.request("GET", url)
+    client.set_timeout(req, 30s)
+    client.set_header(req, "Authorization", "Basic ${encoding.base64_encode_padded(string.bytes("admin:admin"))}")
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    st = client.response_status(r)
+    body = client.response_body(r)
+    client.response_free(r)
+    return st, body, ""
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+    // Compile-checked only on a Podman machine: the image needs ulimit nofile
+    // 1048576 and a rootless Podman cannot raise RLIMIT_NOFILE that far
+    // (crun: setrlimit RLIMIT_NOFILE: Operation not permitted).
+    cl, _ = docker.client()
+    if spec.skip_all_if(fw, docker.is_podman(cl), "ported, test blocked: rootless Podman cannot set the nofile ulimit 1048576 Solace requires") == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/solace") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("sets up the VPN, user and queue (TestSolace)") callback {
+            s, err = solace.run(IMAGE) {
+                credentials("admin", "admin")
+                vpn("test-vpn")
+                services([solace.SERVICE_AMQP, solace.SERVICE_MANAGEMENT, solace.SERVICE_SMF])
+                tc.env("username_admin_globalaccesslevel", "admin")
+                tc.env("username_admin_password", "admin")
+                queue("TestQueue", "Topic/ActualTopic")
+            }
+            if s != null { testing.cleanup_container(s.container) }
+            spec.assert_ok(err, "solace starts")
+            if err == "" {
+                amqp, aerr = solace.broker_url_for(s, solace.SERVICE_AMQP)
+                spec.assert_ok(aerr, "amqp url")
+                spec.assert_true(string.starts_with(amqp, "amqp://") == 1, "an amqp:// URL: ${amqp}")
+                spec.assert_str_eq(solace.username(s), "admin", "username")
+                spec.assert_str_eq(solace.vpn_of(s), "test-vpn", "vpn")
+
+                mgmt, merr = solace.broker_url_for(s, solace.SERVICE_MANAGEMENT)
+                spec.assert_ok(merr, "management url")
+                st, body, gerr = semp("${mgmt}/SEMP/v2/config/msgVpns/test-vpn/queues/TestQueue")
+                spec.assert_ok(gerr, "GET the queue")
+                spec.assert_eq(st, 200, "the queue exists: ${body}")
+                st2, subs, serr = semp("${mgmt}/SEMP/v2/config/msgVpns/test-vpn/queues/TestQueue/subscriptions")
+                spec.assert_ok(serr, "GET the queue's subscriptions")
+                spec.assert_eq(st2, 200, "subscriptions listed")
+                spec.assert_contains(subs, "Topic/ActualTopic", "the topic is subscribed")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

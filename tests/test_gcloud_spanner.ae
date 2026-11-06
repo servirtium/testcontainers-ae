@@ -1,0 +1,87 @@
+// Ported from testcontainers-go modules/gcloud/examples/spanner/examples_test.go (ExampleRun)
+//
+// Compile-checked only. The engine-free case checks the module's request
+// defaults, option and helper output for real. The case that starts the
+// emulator runs only with TCAE_LIVE_SPANNER=1 and an engine.
+
+import std.spec
+import std.string
+import std.os
+import std.http.client
+import std.tcp
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.gcloud.spanner
+
+const IMAGE = "gcr.io/cloud-spanner-emulator/emulator:1.5.40"
+
+// 1 when TCAE_LIVE_SPANNER=1 and an engine answers. The variable is read first
+// so that nothing touches an engine unless asked to.
+fn live_on() -> int {
+    if string.length(os.os_getenv("TCAE_LIVE_SPANNER")) == 0 { return 0 }
+    if os.os_getenv("TCAE_LIVE_SPANNER") != "1" { return 0 }
+    return testing.engine_ok()
+}
+
+// One HTTP request with an optional JSON body: (status, body, error).
+fn http_do(method: string, url: string, body: string) -> (int, string, string) {
+    req = client.request(method, url)
+    client.set_timeout(req, 30s)
+    client.set_header(req, "Authorization", "Bearer owner")
+    if string.length(body) > 0 { client.set_body(req, string.bytes(body), "application/json") }
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    st = client.response_status(r)
+    b = client.response_body(r)
+    client.response_free(r)
+    return st, b, ""
+}
+
+main() {
+    fw = spec.init()
+    live = live_on()
+
+    spec.describe(fw, "modules/gcloud/spanner") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("has the module's defaults and options (engine-free)") callback {
+            r = spanner.spanner_request_new()
+            spec.assert_str_eq(tc.req_setting(r, "spanner.project_id"), "test-project", "default project id")
+            exposed = tc.req_exposed(r)
+            spec.assert_true(exposed.len >= 1, "ports are exposed")
+            spec.assert_str_eq(exposed[0], spanner.PORT, "the emulator port")
+            spanner.project_id(r, "spanner-project")
+            spec.assert_str_eq(tc.req_setting(r, "spanner.project_id"), "spanner-project", "project_id replaces it")
+            spec.assert_str_eq(spanner.emulator_env_entry("localhost:1234"), "SPANNER_EMULATOR_HOST=localhost:1234", "emulator env entry")
+            spanner.spanner_request_free(r)
+        }
+
+        spec.it_when(live, "starts the emulator (ExampleRun)", "set TCAE_LIVE_SPANNER=1 and have an engine") callback {
+            g, err = spanner.run(IMAGE) {
+                project_id("spanner-project")
+            }
+            if g != null { testing.cleanup_container(g.container) }
+            spec.assert_ok(err, "spanner starts")
+            if err != "" { return }
+            spec.assert_true(tc.is_running(g.container), "container is running")
+
+            // ExampleRun creates an instance and a database through the Spanner
+            // gRPC admin clients; with no gRPC client in Aether this checks the
+            // gRPC port accepts a connection.
+            spec.assert_str_eq(spanner.project_id_of(g), "spanner-project", "project id")
+            h, _ = tc.host(g.container)
+            p, perr = tc.mapped_port(g.container, spanner.PORT)
+            spec.assert_ok(perr, "mapped port")
+            spec.assert_str_eq(spanner.uri(g), "${h}:${p}", "uri is host:port")
+            name, value = spanner.emulator_env(g)
+            spec.assert_str_eq(name, "SPANNER_EMULATOR_HOST", "env name")
+            spec.assert_str_eq(value, spanner.uri(g), "env value")
+            sock, cerr = tcp.connect(h, p)
+            spec.assert_ok(cerr, "connect to the emulator")
+            if cerr == "" { tcp.tcp_close(sock) }
+        }
+    }
+    return spec.run_summary(fw)
+}

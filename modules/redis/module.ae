@@ -1,0 +1,98 @@
+// Ported from testcontainers-go modules/redis/redis.go, modules/redis/options.go
+//
+// modules.redis: a Redis container. THE MODEL MODULE: every other module
+// port copies this shape (DESIGN.md section 9).
+//
+//     import modules.redis
+//
+//     c, err = redis.run("redis:7-alpine") {
+//         log_level(redis.LOG_LEVEL_VERBOSE)   // a module option
+//         snapshotting(10, 1)
+//         tc.env("TZ", "UTC")                  // a core option, qualified
+//     }
+//     defer tc.terminate(c)
+//     url, _ = redis.connection_string(c)      // "redis://localhost:32771"
+//
+// Not ported: WithTLS (it needs certificates generated at run time, which
+// Go gets from github.com/mdelapenya/tlscert; Aether's std has the
+// primitives but no certificate builder yet) and the deprecated RunContainer.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, connection_string, log_level, snapshotting, config_file,
+    PORT, DEFAULT_IMAGE, CONFIG_FILE_PATH,
+    LOG_LEVEL_DEBUG, LOG_LEVEL_VERBOSE, LOG_LEVEL_NOTICE, LOG_LEVEL_WARNING,
+    redis_request_new, redis_request_free
+)
+
+const PORT = "6379/tcp"
+const DEFAULT_IMAGE = "redis:7"
+const CONFIG_FILE_PATH = "/usr/local/redis.conf"
+
+const LOG_LEVEL_DEBUG = "debug"
+const LOG_LEVEL_VERBOSE = "verbose"
+const LOG_LEVEL_NOTICE = "notice"
+const LOG_LEVEL_WARNING = "warning"
+
+// The module's defaults (Go's moduleOpts), applied before the caller's
+// block, which can override any of them.
+redis_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(PORT) { with_startup_timeout(10s) },
+        wait.for_log("* Ready to accept connections")
+    ]) { with_deadline(60s) })
+    return r
+}
+
+// The builder's release when the block is left early.
+redis_request_free(p: ptr) { tc.request_free(p) }
+
+// ---- options (Go's With* in options.go), setters on the same request ----
+
+// Go's WithLogLevel: --loglevel <level>.
+log_level(_ctx: ptr, level: string) {
+    tc.cmd_arg(_ctx, "--loglevel")
+    tc.cmd_arg(_ctx, level)
+}
+
+// Go's WithSnapshotting: --save <seconds> <changed keys>, each at least 1.
+snapshotting(_ctx: ptr, seconds: int, changed_keys: int) {
+    s = seconds
+    if s < 1 { s = 1 }
+    k = changed_keys
+    if k < 1 { k = 1 }
+    tc.cmd_arg(_ctx, "--save")
+    tc.cmd_arg(_ctx, "${s}")
+    tc.cmd_arg(_ctx, "${k}")
+}
+
+// Go's WithConfigFile: copy the host file to /usr/local/redis.conf and make
+// it the first argument of the command.
+config_file(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, CONFIG_FILE_PATH, 493)
+    string[] args = []
+    args.push(CONFIG_FILE_PATH)
+    for a in tc.req_cmd(_ctx) { args.push(a) }
+    tc.cmd(_ctx, args)
+}
+
+// Run a Redis container (Go's redis.Run). Without a block the compiler
+// passes no request at all (_builder is null), so start from the defaults.
+builder run(image: string) with redis_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = redis_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run redis: ${err}" }
+    return c, ""
+}
+
+// "redis://host:port" (Go's ConnectionString).
+connection_string(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "redis")
+}

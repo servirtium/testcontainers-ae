@@ -1,0 +1,121 @@
+// Ported from testcontainers-go modules/artemis/artemis.go
+//
+// modules.artemis: an Apache ActiveMQ Artemis broker (61616 multi-protocol,
+// 8161 web console).
+//
+//     import modules.artemis
+//
+//     a, err = artemis.run("apache/activemq-artemis:2.30.0-alpine") {
+//         credentials("me", "secret")
+//     }
+//     defer tc.terminate(a.container)
+//     ep, _ = artemis.broker_endpoint(a)     // "localhost:32771"
+//     url, _ = artemis.console_url(a)        // "http://me:secret@localhost:32772/console"
+//
+// The credentials are read back from the request (what the block set is
+// what the struct reports), where Go inspects the container's environment.
+//
+// Not ported: Go's deprecated RunContainer; the examples use a Go AMQP/Core
+// client.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    ArtemisContainer, run, broker_endpoint, console_url, credentials,
+    anonymous_login, extra_args, BROKER_PORT, HTTP_PORT, DEFAULT_USER,
+    DEFAULT_PASSWORD, DEFAULT_IMAGE, artemis_request_new, artemis_request_free
+)
+
+const BROKER_PORT = "61616/tcp"
+const HTTP_PORT = "8161/tcp"
+const DEFAULT_USER = "artemis"
+const DEFAULT_PASSWORD = "artemis"
+const DEFAULT_IMAGE = "apache/activemq-artemis:2.30.0-alpine"
+
+struct ArtemisContainer {
+    container: *docker.Container
+    user: string
+    password: string
+}
+
+artemis_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, BROKER_PORT)
+    tc.expose(r, HTTP_PORT)
+    tc.env(r, "ARTEMIS_USER", DEFAULT_USER)
+    tc.env(r, "ARTEMIS_PASSWORD", DEFAULT_PASSWORD)
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(BROKER_PORT),
+        wait.for_listening_port(HTTP_PORT),
+        wait.for_log("Server is now live"),
+        wait.for_log("REST API available")
+    ]))
+    return r
+}
+
+artemis_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithCredentials.
+credentials(_ctx: ptr, user: string, password: string) {
+    tc.env(_ctx, "ARTEMIS_USER", user)
+    tc.env(_ctx, "ARTEMIS_PASSWORD", password)
+}
+
+// Go's WithAnonymousLogin.
+anonymous_login(_ctx: ptr) { tc.env(_ctx, "ANONYMOUS_LOGIN", "true") }
+
+// Go's WithExtraArgs: EXTRA_ARGS for `artemis create`.
+extra_args(_ctx: ptr, args: string) { tc.env(_ctx, "EXTRA_ARGS", args) }
+
+builder run(image: string) with artemis_request_new -> (*ArtemisContainer, string) {
+    r = _builder
+    if r == null { r = artemis_request_new() }
+    user = tc.req_env(r, "ARTEMIS_USER")
+    pw = tc.req_env(r, "ARTEMIS_PASSWORD")
+    if string.length(user) == 0 { user = DEFAULT_USER }
+    if string.length(pw) == 0 { pw = DEFAULT_PASSWORD }
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run artemis: ${err}" }
+    a = heap.new(ArtemisContainer)
+    a.container = c
+    a.user = user
+    a.password = pw
+    if err != "" { return a, "run artemis: ${err}" }
+    return a, ""
+}
+
+// "host:port" of the broker (Go's BrokerEndpoint).
+broker_endpoint(a: *ArtemisContainer) -> (string, string) {
+    return tc.endpoint(a.container, BROKER_PORT, "")
+}
+
+// Percent-encode for the userinfo part of a URL (RFC 3986 unreserved kept).
+fn userinfo_escape(s: string) -> string {
+    hex = "0123456789ABCDEF"
+    out = ""
+    b = string.bytes(s)
+    i = 0
+    while i < b.len {
+        ch = b[i]
+        keep = (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 45 || ch == 46 || ch == 95 || ch == 126
+        if keep {
+            out = string.concat(out, string.substring(s, i, i + 1))
+        } else {
+            hi = string.substring(hex, (ch >> 4) & 15, ((ch >> 4) & 15) + 1)
+            lo = string.substring(hex, ch & 15, (ch & 15) + 1)
+            out = "${out}%${hi}${lo}"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// "http://user:password@host:port/console" (Go's ConsoleURL).
+console_url(a: *ArtemisContainer) -> (string, string) {
+    ep, err = tc.endpoint(a.container, HTTP_PORT, "")
+    if err != "" { return "", err }
+    return "http://${userinfo_escape(a.user)}:${userinfo_escape(a.password)}@${ep}/console", ""
+}

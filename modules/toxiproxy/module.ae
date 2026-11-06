@@ -1,0 +1,230 @@
+// Ported from testcontainers-go modules/toxiproxy/toxiproxy.go, modules/toxiproxy/options.go, modules/toxiproxy/config.go
+//
+// modules.toxiproxy: a Toxiproxy container (Shopify's TCP proxy for chaos
+// testing). Each proxy() listens on a port of its own in the container,
+// starting at 8666, mapped to a host port; the control API is on 8474.
+//
+//     import modules.toxiproxy
+//
+//     t, err = toxiproxy.run("ghcr.io/shopify/toxiproxy:2.12.0") {
+//         proxy("redis", "redis:6379")        // an upstream reachable from the container
+//         tc.with_network(n.name)
+//     }
+//     defer tc.terminate(t.container)
+//     host, port, _ = toxiproxy.proxied_endpoint(t, 8666)   // the first proxy
+//     api, _ = toxiproxy.uri(t)               // "http://localhost:32771"
+//
+// Go's WithProxy and WithConfigFile append proxies to the module's options;
+// here they are module settings on the request (tc.set_setting) that `run`
+// renders, after the block, into /tmp/tc-toxiproxy.json with the listen
+// ports assigned in order (8666 + index), as Go does. with_config_file takes
+// a host path (Go takes an io.Reader) and reads it at once. Option errors
+// (an upstream without a port, an unreadable or malformed config file) are
+// carried to `run`, which returns them.
+//
+// Not ported: Go's examples (they use the toxiproxy Go client); the
+// deprecated RunContainer.
+
+import std.string
+import std.fs
+import std.json
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    ToxiproxyContainer, run, proxy, with_config_file, proxied_endpoint, uri,
+    CONTROL_PORT, FIRST_PROXIED_PORT, DEFAULT_IMAGE,
+    toxiproxy_request_new, toxiproxy_request_free
+)
+
+const CONTROL_PORT = "8474/tcp"
+const FIRST_PROXIED_PORT = 8666
+const DEFAULT_IMAGE = "ghcr.io/shopify/toxiproxy:2.12.0"
+
+const SET_PROXIES = "toxiproxy.proxies"   // "name\tupstream" lines
+const SET_ERROR = "toxiproxy.error"
+
+struct ToxiproxyContainer {
+    container: *docker.Container
+    proxied_ports: string[]       // the listen ports, as text
+    proxied_endpoints: string[]   // "host:port" the same listen ports are mapped to
+}
+
+// Go's moduleOpts: the control port, waiting for GET /version = 200.
+toxiproxy_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, CONTROL_PORT)
+    tc.wait_for(r, wait.for_http("/version") { with_port(CONTROL_PORT); with_status(200) })
+    return r
+}
+
+toxiproxy_request_free(p: ptr) { tc.request_free(p) }
+
+fn last_colon(s: string) -> int {
+    i = string.length(s) - 1
+    while i >= 0 {
+        if string.char_at(s, i) == 58 { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// "host:port" must have a numeric port after the last colon (Go's newProxy).
+fn valid_upstream(upstream: string) -> bool {
+    i = last_colon(upstream)
+    if i < 0 { return false }
+    p = string.substring(upstream, i + 1, string.length(upstream))
+    if string.length(p) == 0 { return false }
+    j = 0
+    while j < string.length(p) {
+        ch = string.char_at(p, j)
+        if ch < 48 || ch > 57 { return false }
+        j = j + 1
+    }
+    return true
+}
+
+fn fail(_ctx: ptr, msg: string) {
+    if !tc.req_has_setting(_ctx, SET_ERROR) { tc.set_setting(_ctx, SET_ERROR, msg) }
+}
+
+fn add_proxy(_ctx: ptr, name: string, upstream: string) {
+    if !valid_upstream(upstream) {
+        fail(_ctx, "newProxy: split hostPort: invalid upstream \"${upstream}\"")
+        return
+    }
+    line = "${name}\t${upstream}"
+    if !tc.req_has_setting(_ctx, SET_PROXIES) {
+        tc.set_setting(_ctx, SET_PROXIES, line)
+    } else {
+        tc.set_setting(_ctx, SET_PROXIES, "${tc.req_setting(_ctx, SET_PROXIES)}\n${line}")
+    }
+}
+
+// Go's WithProxy: a proxy named name to upstream ("host:port", reachable from
+// the Toxiproxy container, e.g. a network alias). Proxies are numbered in
+// the order given: the first listens on 8666, the next 8667, ...
+proxy(_ctx: ptr, name: string, upstream: string) { add_proxy(_ctx, name, upstream) }
+
+// Go's WithConfigFile: the proxies of a Toxiproxy JSON config file (an array
+// of {name, listen, upstream, enabled}); only name and upstream are kept, the
+// listen ports are reassigned, as Go does. Added to any proxy() ones.
+with_config_file(_ctx: ptr, host_path: string) {
+    text, rerr = fs.read(host_path)
+    if rerr != "" {
+        fail(_ctx, "read config file: ${rerr}")
+        return
+    }
+    doc, perr = json.parse(text)
+    if perr != "" {
+        fail(_ctx, "unmarshal: ${perr}")
+        return
+    }
+    n = json.json_array_size(doc)
+    i = 0
+    while i < n {
+        item, _ = json.array_get(doc, i)
+        nv, _ = json.object_get(item, "name")
+        uv, _ = json.object_get(item, "upstream")
+        name, _ = json.get_string(nv)
+        up, _ = json.get_string(uv)
+        add_proxy(_ctx, name, up)
+        i = i + 1
+    }
+    json.free(doc)
+}
+
+fn split_lines(s: string) -> string[] {
+    string[] out = []
+    if string.length(s) == 0 { return out }
+    rest = s
+    i = string.index_of(rest, "\n")
+    while i >= 0 {
+        out.push(string.substring(rest, 0, i))
+        rest = string.substring(rest, i + 1, string.length(rest))
+        i = string.index_of(rest, "\n")
+    }
+    out.push(rest)
+    return out
+}
+
+// Run a Toxiproxy container (Go's toxiproxy.Run). With proxies, the config
+// file is copied in and the command is `-host=0.0.0.0 -config=...`.
+builder run(image: string) with toxiproxy_request_new -> (*ToxiproxyContainer, string) {
+    r = _builder
+    if r == null { r = toxiproxy_request_new() }
+    if tc.req_has_setting(r, SET_ERROR) {
+        e = tc.req_setting(r, SET_ERROR)
+        toxiproxy_request_free(r)
+        return null, "apply option: ${e}"
+    }
+    lines = split_lines(tc.req_setting(r, SET_PROXIES))
+    string[] ports = []
+    arr = json.arr()
+    i = 0
+    for ln in lines {
+        tab = string.index_of(ln, "\t")
+        name = string.substring(ln, 0, tab)
+        up = string.substring(ln, tab + 1, string.length(ln))
+        port = FIRST_PROXIED_PORT + i
+        o = json.obj()
+        json.set(o, "name", json.str(name))
+        json.set(o, "listen", json.str("0.0.0.0:${port}"))
+        json.set(o, "upstream", json.str(up))
+        json.set(o, "enabled", json.boolean(1))
+        json.push(arr, o)
+        tc.expose(r, "${port}/tcp")
+        ports.push("${port}")
+        i = i + 1
+    }
+    if lines.len > 0 {
+        text, eerr = json.encode(arr)
+        if eerr != "" {
+            json.free(arr)
+            toxiproxy_request_free(r)
+            return null, "marshal config: ${eerr}"
+        }
+        tc.file_content(r, text, "/tmp/tc-toxiproxy.json", 420)
+        tc.cmd(r, ["-host=0.0.0.0", "-config=/tmp/tc-toxiproxy.json"])
+    }
+    json.free(arr)
+
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run toxiproxy: ${err}" }
+    t = heap.new(ToxiproxyContainer)
+    t.container = c
+    t.proxied_ports = []
+    t.proxied_endpoints = []
+    if err != "" { return t, "run toxiproxy: ${err}" }
+    for p in ports {
+        ep, eerr = tc.endpoint(c, "${p}/tcp", "")
+        if eerr != "" { return t, "port endpoint: ${eerr}" }
+        t.proxied_ports.push(p)
+        t.proxied_endpoints.push(ep)
+    }
+    return t, ""
+}
+
+// The host and mapped port (as text) of a proxy's listen port, e.g. 8666
+// (Go's ProxiedEndpoint). An error if the port has no proxy.
+proxied_endpoint(t: *ToxiproxyContainer, listen_port: int) -> (string, string, string) {
+    want = "${listen_port}"
+    i = 0
+    while i < t.proxied_ports.len {
+        if t.proxied_ports[i] == want {
+            ep = t.proxied_endpoints[i]
+            k = last_colon(ep)
+            return string.substring(ep, 0, k), string.substring(ep, k + 1, string.length(ep)), ""
+        }
+        i = i + 1
+    }
+    return "", "", "port not found"
+}
+
+// "http://host:port" of the control API (Go's URI).
+uri(t: *ToxiproxyContainer) -> (string, string) {
+    ep, err = tc.endpoint(t.container, CONTROL_PORT, "http")
+    if err != "" { return "", "port endpoint: ${err}" }
+    return ep, ""
+}

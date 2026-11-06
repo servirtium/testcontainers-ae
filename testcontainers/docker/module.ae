@@ -1,0 +1,1922 @@
+// Ported from testcontainers-go internal/config/config.go, internal/core/{docker_host.go,docker_rootless.go,docker_socket.go,client.go,labels.go,images.go}, docker_client.go, docker.go (the container operations), docker_auth.go, image.go, network.go, file.go
+//
+// testcontainers.docker: the engine client under the testcontainers core.
+//
+// Discovery and configuration, the Docker Engine API over a Unix socket (or
+// plain tcp://) with std.http.client, JSON with std.json, the multiplexed
+// stdout/stderr stream format, and every operation on a container, an image
+// and a network the layers above need. Errors are strings ("" is success);
+// an error from the engine carries its HTTP status as "(status N)", which
+// is_not_found / is_conflict read. See DESIGN.md, sections 1 and 8.
+
+import std.os
+import std.fs
+import std.string
+import std.json
+import std.tcp
+import std.tar
+import std.path
+import std.url
+import std.encoding
+import std.http.client
+import std.uuid
+import std.list
+
+exports(
+    // configuration and session
+    Config, config, config_reset, session_id, VERSION, LABEL_BASE, LABEL_LANG,
+    LABEL_VERSION, LABEL_SESSION_ID, LABEL_REAP, LABEL_REAPER, LABEL_RYUK,
+    default_labels_json, add_default_labels,
+    // the client
+    Client, client, new_client, client_reset, engine_available, daemon_host,
+    is_podman, default_bridge_network, engine_socket_for_mounts, api_version,
+    api, api_headers, api_json, api_bytes, api_check, json_body, query_escape,
+    Stream, stream_open, stream_open_bytes, stream_read, stream_next_line,
+    stream_error, stream_close,
+    is_not_found, is_conflict, is_not_modified, engine_error,
+    // streams
+    Demux, demux_new, demux_feed, demux_next_kind, demux_next_payload,
+    demux_pop, demux_split, demux_combined,
+    // containers
+    Container, State, ExecResult, container_new, create_container,
+    start, stop, kill, remove, inspect, state_of, is_running, wait_exit,
+    mapped_port, host, endpoint, lowest_exposed_port, normalize_port,
+    container_ip, container_ips, networks, network_aliases,
+    logs, logs_split, logs_stream, exec, exec_with,
+    copy_to_container, copy_file_to_container, copy_dir_to_container,
+    copy_file_from_container, list_containers, find_container_by_name,
+    // images
+    image_exists, image_inspect, pull_image, build_image, remove_image,
+    parse_image, image_registry, hub_prefixed, registry_auth, registry_auth_lookup,
+    credential_helper_get, encode_registry_auth,
+    // networks
+    Network, create_network, remove_network, inspect_network, connect_network,
+    create_volume, remove_volume,
+    // events
+    events_open
+)
+
+const VERSION = "0.1.0"
+const MAX_API = "1.44"
+const LABEL_BASE = "org.testcontainers"
+const LABEL_LANG = "org.testcontainers.lang"
+const LABEL_VERSION = "org.testcontainers.version"
+const LABEL_SESSION_ID = "org.testcontainers.sessionId"
+const LABEL_REAP = "org.testcontainers.reap"
+const LABEL_REAPER = "org.testcontainers.reaper"
+const LABEL_RYUK = "org.testcontainers.ryuk"
+
+// ===================================================================
+// Configuration (internal/config/config.go)
+// ===================================================================
+
+// What ~/.testcontainers.properties and the TESTCONTAINERS_* environment
+// say, read once per process (config()). Durations are kept as Go duration
+// strings ("10s"), the form Ryuk reads.
+struct Config {
+    host: string                       // docker.host
+    tc_host: string                    // tc.host
+    hub_image_name_prefix: string      // hub.image.name.prefix
+    session_id: string                 // session.id
+    ryuk_disabled: bool                // ryuk.disabled
+    ryuk_privileged: bool              // ryuk.container.privileged
+    ryuk_reconnection_timeout: string  // ryuk.reconnection.timeout
+    ryuk_connection_timeout: string    // ryuk.connection.timeout
+    ryuk_verbose: bool                 // ryuk.verbose
+    provider: string                   // provider
+    docker_socket_override: string     // TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE
+    host_override: string              // TESTCONTAINERS_HOST_OVERRIDE
+    tls_verify: bool                   // docker.tls.verify / DOCKER_TLS_VERIFY
+    reuse_enable: bool                 // testcontainers.reuse.enable / TESTCONTAINERS_REUSE_ENABLE
+}
+
+var cfg_cache: ptr = null
+var session_cache: string = ""
+
+fn getenv(name: string) -> string {
+    v = os.os_getenv(name)
+    if v == null { return "" }
+    return v
+}
+
+fn home_dir() -> string { return getenv("HOME") }
+
+fn is_true(v: string) -> bool {
+    s = string.to_lower(string.trim(v))
+    return s == "true" || s == "1" || s == "t" || s == "yes"
+}
+
+fn is_bool_text(v: string) -> bool {
+    s = string.to_lower(string.trim(v))
+    return s == "true" || s == "false" || s == "1" || s == "0" || s == "t" || s == "f"
+}
+
+// A Java-style properties file reduced to what testcontainers uses:
+// "key=value" or "key: value" lines, # and ! comments.
+fn apply_property(c: *Config, key: string, value: string) {
+    if key == "docker.host" { c.host = value }
+    if key == "tc.host" { c.tc_host = value }
+    if key == "hub.image.name.prefix" { c.hub_image_name_prefix = value }
+    if key == "session.id" { c.session_id = value }
+    if key == "ryuk.disabled" { c.ryuk_disabled = is_true(value) }
+    if key == "ryuk.container.privileged" { c.ryuk_privileged = is_true(value) }
+    if key == "ryuk.reconnection.timeout" { c.ryuk_reconnection_timeout = value }
+    if key == "ryuk.connection.timeout" { c.ryuk_connection_timeout = value }
+    if key == "ryuk.verbose" { c.ryuk_verbose = is_true(value) }
+    if key == "provider" { c.provider = value }
+    if key == "docker.tls.verify" { c.tls_verify = is_true(value) }
+    if key == "testcontainers.reuse.enable" { c.reuse_enable = is_true(value) }
+}
+
+fn read_properties(c: *Config, path: string) {
+    if fs.exists(path) == 0 { return }
+    text, err = fs.read(path)
+    if err != "" { return }
+    lines = string.split(text, "\n")
+    n = string.string_array_size(lines)
+    i = 0
+    while i < n {
+        line = string.trim(string.string_array_get(lines, i))
+        i = i + 1
+        if string.length(line) == 0 { continue }
+        if string.starts_with(line, "#") == 1 || string.starts_with(line, "!") == 1 { continue }
+        eq = string.index_of(line, "=")
+        colon = string.index_of(line, ":")
+        sep = eq
+        if sep < 0 || (colon >= 0 && colon < sep) {
+            // "key: value" only when the colon comes first and is followed by a space
+            if colon >= 0 && string.index_of(line, ": ") == colon { sep = colon }
+        }
+        if sep < 0 { continue }
+        key = string.trim(string.substring(line, 0, sep))
+        value = string.trim(string.substring(line, sep + 1, string.length(line)))
+        apply_property(c, key, value)
+    }
+    string.string_array_free(lines)
+}
+
+// The process's configuration: the properties file, then the environment,
+// which wins (Go's applyEnvironmentConfiguration).
+config() -> *Config {
+    if cfg_cache != null { return cfg_cache as *Config }
+    c = heap.new(Config)
+    c.ryuk_reconnection_timeout = "10s"
+    c.ryuk_connection_timeout = "1m"
+    home = home_dir()
+    if string.length(home) > 0 {
+        read_properties(c, "${home}/.testcontainers.properties")
+    }
+    v = getenv("TESTCONTAINERS_RYUK_DISABLED")
+    if is_bool_text(v) { c.ryuk_disabled = is_true(v) }
+    v = getenv("TESTCONTAINERS_HUB_IMAGE_NAME_PREFIX")
+    if string.length(v) > 0 { c.hub_image_name_prefix = v }
+    v = getenv("TESTCONTAINERS_SESSION_ID")
+    if string.length(v) > 0 { c.session_id = v }
+    v = getenv("TESTCONTAINERS_RYUK_CONTAINER_PRIVILEGED")
+    if is_bool_text(v) { c.ryuk_privileged = is_true(v) }
+    v = tc_env("RYUK_VERBOSE")
+    if is_bool_text(v) { c.ryuk_verbose = is_true(v) }
+    v = tc_env("RYUK_RECONNECTION_TIMEOUT")
+    if string.length(v) > 0 { c.ryuk_reconnection_timeout = v }
+    v = tc_env("RYUK_CONNECTION_TIMEOUT")
+    if string.length(v) > 0 { c.ryuk_connection_timeout = v }
+    v = getenv("TESTCONTAINERS_PROVIDER")
+    if string.length(v) > 0 { c.provider = string.to_lower(v) }
+    c.docker_socket_override = getenv("TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE")
+    c.host_override = getenv("TESTCONTAINERS_HOST_OVERRIDE")
+    if is_true(getenv("DOCKER_TLS_VERIFY")) { c.tls_verify = true }
+    v = getenv("TESTCONTAINERS_REUSE_ENABLE")
+    if is_bool_text(v) { c.reuse_enable = is_true(v) }
+    cfg_cache = c as ptr
+    return c
+}
+
+// Forget the configuration (and the client), so the next call reads the
+// environment again. For tests of configuration.
+config_reset() {
+    cfg_cache = null
+    client_cache = null
+    session_cache = ""
+}
+
+// Go's readTestcontainersEnv: NAME, else TESTCONTAINERS_NAME.
+fn tc_env(name: string) -> string {
+    v = getenv(name)
+    if string.length(v) > 0 { return v }
+    return getenv("TESTCONTAINERS_${name}")
+}
+
+// The session id: session.id / TESTCONTAINERS_SESSION_ID, else a random one
+// for this process. It must make a valid container name after "reaper_".
+session_id() -> string {
+    if string.length(session_cache) > 0 { return session_cache }
+    c = config()
+    if string.length(c.session_id) > 0 {
+        session_cache = c.session_id
+        return session_cache
+    }
+    u, err = uuid.v4()
+    if err != "" {
+        u = "${os.getpid()}-${os.now_unix_ms()}"
+    }
+    session_cache = string.replace_all(u, "-", "")
+    return session_cache
+}
+
+// The labels every resource of the session carries, as a JSON object string
+// fragment builder: add_default_labels(obj) sets them on a std.json object.
+add_default_labels(obj: ptr) {
+    json.set(obj, LABEL_BASE, json.str("true"))
+    json.set(obj, LABEL_LANG, json.str("aether"))
+    json.set(obj, LABEL_VERSION, json.str(VERSION))
+    json.set(obj, LABEL_SESSION_ID, json.str(session_id()))
+    if !config().ryuk_disabled {
+        json.set(obj, LABEL_REAP, json.str("true"))
+    }
+}
+
+default_labels_json() -> string {
+    o = json.obj()
+    add_default_labels(o)
+    s, _ = json.encode(o)
+    json.free(o)
+    return s
+}
+
+// ===================================================================
+// The client (internal/core/docker_host.go, docker_rootless.go, client.go)
+// ===================================================================
+
+struct Client {
+    host: string          // the DOCKER_HOST-style URL it was made from
+    unix_path: string     // the socket file, "" for tcp://
+    base_url: string      // "http://localhost" for a socket, "http://h:p" for tcp
+    api: string           // the negotiated API version, "1.44"
+    podman: bool
+    server_version: string
+    os_type: string
+    remote_socket: string // the engine's socket as the containers see it
+    probed: bool          // remote_socket looked up
+}
+
+var client_cache: ptr = null
+
+fn client_from_host(host: string) -> (*Client, string) {
+    cl = heap.new(Client)
+    cl.host = host
+    cl.api = MAX_API
+    if string.starts_with(host, "unix://") == 1 {
+        cl.unix_path = string.substring(host, 7, string.length(host))
+        cl.base_url = "http://localhost"
+    } else if string.starts_with(host, "tcp://") == 1 || string.starts_with(host, "http://") == 1 {
+        if config().tls_verify {
+            return null, "docker host ${host}: TLS (DOCKER_TLS_VERIFY) is not supported by testcontainers-ae"
+        }
+        rest = host
+        if string.starts_with(host, "tcp://") == 1 { rest = string.substring(host, 6, string.length(host)) }
+        if string.starts_with(host, "http://") == 1 { rest = string.substring(host, 7, string.length(host)) }
+        slash = string.index_of(rest, "/")
+        if slash >= 0 { rest = string.substring(rest, 0, slash) }
+        cl.base_url = "http://${rest}"
+    } else if string.starts_with(host, "/") == 1 {
+        cl.unix_path = host
+        cl.host = "unix://${host}"
+        cl.base_url = "http://localhost"
+    } else {
+        return null, "docker host ${host}: unsupported scheme (unix:// and tcp:// are)"
+    }
+    return cl, ""
+}
+
+// Ping the engine and negotiate the API version (moby's NegotiateAPIVersion:
+// the lower of the server's and ours; DOCKER_API_VERSION pins it).
+fn negotiate(cl: *Client) -> string {
+    req = client.request("GET", "${cl.base_url}/_ping")
+    if string.length(cl.unix_path) > 0 { client.set_unix_socket(req, cl.unix_path) }
+    client.set_timeout(req, 5s)
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return "ping ${cl.host}: ${err}" }
+    status = client.response_status(r)
+    server_api = client.response_header(r, "Api-Version")
+    libpod = client.response_header(r, "Libpod-Api-Version")
+    client.response_free(r)
+    if status != 200 { return "ping ${cl.host}: status ${status}" }
+    pinned = getenv("DOCKER_API_VERSION")
+    if string.length(pinned) > 0 {
+        cl.api = pinned
+    } else if string.length(server_api) > 0 && string.version_compare(server_api, MAX_API) < 0 {
+        cl.api = server_api
+    }
+    if string.length(libpod) > 0 { cl.podman = true }
+    if config().provider == "podman" { cl.podman = true }
+    // /version: the server's version and whether a Podman Engine component is there.
+    st, body, verr = api(cl, "GET", "/version", "")
+    if verr == "" && st == 200 {
+        if string.contains(body, "Podman Engine") == 1 { cl.podman = true }
+        doc, perr = json.parse(body)
+        if perr == "" {
+            cl.server_version = json_str(doc, "Version")
+            cl.os_type = json_str(doc, "Os")
+            json.free(doc)
+        }
+    }
+    return ""
+}
+
+// A client for one host URL ("unix:///var/run/docker.sock", "tcp://h:2375"),
+// pinged and negotiated.
+new_client(host: string) -> (*Client, string) {
+    cl, err = client_from_host(host)
+    if err != "" { return null, err }
+    nerr = negotiate(cl)
+    if nerr != "" { return null, nerr }
+    return cl, ""
+}
+
+fn add_candidate(cands: string[], h: string) -> string[] {
+    if string.length(h) == 0 { return cands }
+    out = cands
+    out.push(h)
+    return out
+}
+
+fn sock_candidate(path: string) -> string {
+    if string.length(path) == 0 { return "" }
+    if fs.exists(path) == 0 { return "" }
+    return "unix://${path}"
+}
+
+fn normalize_host(h: string) -> string {
+    if string.starts_with(h, "/") == 1 { return "unix://${h}" }
+    return h
+}
+
+// The candidates in Go's order (testcontainersHostFromProperties,
+// dockerHostFromEnv, dockerSocketPath, dockerHostFromProperties,
+// rootlessDockerSocketPath), then the Podman, OrbStack and Colima sockets.
+fn candidates() -> string[] {
+    string[] cands = []
+    c = config()
+    cands = add_candidate(cands, normalize_host(c.tc_host))
+    cands = add_candidate(cands, normalize_host(getenv("DOCKER_HOST")))
+    cands = add_candidate(cands, sock_candidate("/var/run/docker.sock"))
+    cands = add_candidate(cands, normalize_host(c.host))
+    xdg = getenv("XDG_RUNTIME_DIR")
+    home = home_dir()
+    uid = os.user_id()
+    if string.length(xdg) > 0 { cands = add_candidate(cands, sock_candidate("${xdg}/docker.sock")) }
+    if string.length(home) > 0 {
+        cands = add_candidate(cands, sock_candidate("${home}/.docker/run/docker.sock"))
+        cands = add_candidate(cands, sock_candidate("${home}/.docker/desktop/docker.sock"))
+    }
+    cands = add_candidate(cands, sock_candidate("/run/user/${uid}/docker.sock"))
+    if string.length(xdg) > 0 { cands = add_candidate(cands, sock_candidate("${xdg}/podman/podman.sock")) }
+    cands = add_candidate(cands, sock_candidate("/run/user/${uid}/podman/podman.sock"))
+    cands = add_candidate(cands, sock_candidate("/run/podman/podman.sock"))
+    // Podman machine on macOS: $TMPDIR/podman/<machine>-api.sock
+    tmp = getenv("TMPDIR")
+    if string.length(tmp) > 0 {
+        if string.ends_with(tmp, "/") == 0 { tmp = "${tmp}/" }
+        cands = add_candidate(cands, sock_candidate("${tmp}podman/podman-machine-default-api.sock"))
+        gl, gerr = fs.glob("${tmp}podman/*-api.sock")
+        if gerr == "" && gl != null {
+            gn = fs.dir_list_count(gl)
+            gi = 0
+            while gi < gn {
+                cands = add_candidate(cands, sock_candidate(fs.dir_list_get(gl, gi)))
+                gi = gi + 1
+            }
+            fs.dir_list_free(gl)
+        }
+    }
+    if string.length(home) > 0 {
+        cands = add_candidate(cands, sock_candidate("${home}/.local/share/containers/podman/machine/podman.sock"))
+        cands = add_candidate(cands, sock_candidate("${home}/.orbstack/run/docker.sock"))
+        cands = add_candidate(cands, sock_candidate("${home}/.colima/default/docker.sock"))
+        cands = add_candidate(cands, sock_candidate("${home}/.colima/docker.sock"))
+    }
+    return cands
+}
+
+// The session's client, found once (ExtractDockerHost) and kept.
+client() -> (*Client, string) {
+    if client_cache != null { return client_cache as *Client, "" }
+    cands = candidates()
+    errs = ""
+    for h in cands {
+        cl, err = new_client(h)
+        if err == "" {
+            client_cache = cl as ptr
+            return cl, ""
+        }
+        if string.length(errs) > 0 { errs = "${errs}; " }
+        errs = "${errs}${err}"
+    }
+    if string.length(errs) == 0 {
+        return null, "no container engine found: set DOCKER_HOST, or start Docker or Podman"
+    }
+    return null, "no container engine reachable: ${errs}"
+}
+
+client_reset() { client_cache = null }
+
+// 1 when an engine answers, the cheap check a test uses to skip.
+engine_available() -> bool {
+    _, err = client()
+    return err == ""
+}
+
+is_podman(cl: *Client) -> bool { return cl.podman }
+api_version(cl: *Client) -> string { return cl.api }
+
+default_bridge_network(cl: *Client) -> string {
+    if cl.podman { return "podman" }
+    return "bridge"
+}
+
+// Where published ports are reached from this process (Go's DaemonHost):
+// TESTCONTAINERS_HOST_OVERRIDE, else localhost for a socket, else the
+// tcp:// host.
+daemon_host(cl: *Client) -> string {
+    o = config().host_override
+    if string.length(o) > 0 { return o }
+    if string.length(cl.unix_path) > 0 { return "localhost" }
+    h = string.substring(cl.base_url, 7, string.length(cl.base_url))
+    colon = string.index_of(h, ":")
+    if colon >= 0 { h = string.substring(h, 0, colon) }
+    return h
+}
+
+// The engine's socket as a container on the engine sees it, for Ryuk's bind
+// mount (Go's MustExtractDockerSocket). TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE
+// wins; Podman says where its own socket is (libpod info
+// host.remoteSocket.path), which is right for a Podman machine on macOS,
+// where the client's socket is a forwarded file outside the VM; a tcp://
+// Docker host means /var/run/docker.sock; else the client's socket path.
+engine_socket_for_mounts(cl: *Client) -> string {
+    o = config().docker_socket_override
+    if string.length(o) > 0 {
+        if string.starts_with(o, "unix://") == 1 { return string.substring(o, 7, string.length(o)) }
+        return o
+    }
+    if cl.probed { return cl.remote_socket }
+    cl.probed = true
+    cl.remote_socket = "/var/run/docker.sock"
+    if cl.podman {
+        req = client.request("GET", "${cl.base_url}/v4.0.0/libpod/info")
+        if string.length(cl.unix_path) > 0 { client.set_unix_socket(req, cl.unix_path) }
+        client.set_timeout(req, 10s)
+        r, err = client.send_request(req)
+        client.request_free(req)
+        if err == "" {
+            if client.response_status(r) == 200 {
+                doc, perr = json.parse(client.response_body(r))
+                if perr == "" {
+                    hst, _ = json.object_get(doc, "host")
+                    rs, _ = json.object_get(hst, "remoteSocket")
+                    p = json_str(rs, "path")
+                    if string.starts_with(p, "unix://") == 1 { p = string.substring(p, 7, string.length(p)) }
+                    if string.length(p) > 0 { cl.remote_socket = p }
+                    json.free(doc)
+                }
+            }
+            client.response_free(r)
+        }
+        return cl.remote_socket
+    }
+    if string.length(cl.unix_path) > 0 && !string.contains(cl.unix_path, "/.") == 1 {
+        // A socket in a dot directory (~/.docker/run/docker.sock) is a desktop
+        // VM's forwarded socket: its VM serves /var/run/docker.sock.
+        cl.remote_socket = cl.unix_path
+    }
+    return cl.remote_socket
+}
+
+// ===================================================================
+// HTTP (std.http.client over the socket)
+// ===================================================================
+
+fn make_request(cl: *Client, method: string, path: string, timeout: Duration) -> ptr {
+    req = client.request(method, "${cl.base_url}/v${cl.api}${path}")
+    if string.length(cl.unix_path) > 0 { client.set_unix_socket(req, cl.unix_path) }
+    client.set_timeout(req, timeout)
+    return req
+}
+
+// One API call with a text (JSON) body: (status, body, transport error).
+// A non-2xx status is not an error here; api_check makes it one.
+api(cl: *Client, method: string, path: string, body: string) -> (int, string, string) {
+    string[] no_headers = []
+    return api_headers(cl, method, path, body, no_headers)
+}
+
+// api with request headers, each "Name: value" (X-Registry-Auth for a push,
+// say). A header without ": " is ignored.
+api_headers(cl: *Client, method: string, path: string, body: string, headers: string[]) -> (int, string, string) {
+    req = make_request(cl, method, path, 120s)
+    for h in headers {
+        colon = string.index_of(h, ": ")
+        if colon > 0 { client.set_header(req, string.substring(h, 0, colon), string.substring(h, colon + 2, string.length(h))) }
+    }
+    if string.length(body) > 0 {
+        client.set_body(req, string.bytes(body), "application/json")
+    } else if method == "POST" {
+        client.set_header(req, "Content-Length", "0")
+    }
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", "${method} ${path}: ${err}" }
+    st = client.response_status(r)
+    b = client.response_body(r)
+    client.response_free(r)
+    return st, b, ""
+}
+
+// An API call with a binary body (a tar archive) and its content type.
+api_bytes(cl: *Client, method: string, path: string, body: string, ctype: string, timeout: Duration) -> (int, string, string) {
+    req = make_request(cl, method, path, timeout)
+    client.set_body(req, string.bytes(body), ctype)
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", "${method} ${path}: ${err}" }
+    st = client.response_status(r)
+    b = client.response_body(r)
+    client.response_free(r)
+    return st, b, ""
+}
+
+// The engine's error message from an error response body ({"message": ...}).
+fn message_of(body: string) -> string {
+    doc, err = json.parse(body)
+    if err != "" { return string.trim(body) }
+    m = json_str(doc, "message")
+    json.free(doc)
+    if string.length(m) == 0 { return string.trim(body) }
+    return m
+}
+
+// "" for a 2xx status, else "<op>: <engine message> (status N)".
+api_check(op: string, status: int, body: string) -> string {
+    if status >= 200 && status < 300 { return "" }
+    return engine_error(op, status, message_of(body))
+}
+
+engine_error(op: string, status: int, msg: string) -> string {
+    return "${op}: ${msg} (status ${status})"
+}
+
+is_not_found(err: string) -> bool { return string.contains(err, "(status 404)") == 1 }
+is_conflict(err: string) -> bool { return string.contains(err, "(status 409)") == 1 }
+is_not_modified(err: string) -> bool { return string.contains(err, "(status 304)") == 1 }
+
+// A call whose answer is JSON: (document, error). The caller json.frees it.
+api_json(cl: *Client, method: string, path: string, body: string, op: string) -> (ptr, string) {
+    st, b, err = api(cl, method, path, body)
+    if err != "" { return null, "${op}: ${err}" }
+    cerr = api_check(op, st, b)
+    if cerr != "" { return null, cerr }
+    doc, perr = json.parse(b)
+    if perr != "" { return null, "${op}: bad JSON from the engine: ${perr}" }
+    return doc, ""
+}
+
+// Encode a built std.json value and free it.
+json_body(v: ptr) -> string {
+    s, _ = json.encode(v)
+    json.free(v)
+    return s
+}
+
+query_escape(s: string) -> string { return url.encode_strict(s) }
+
+fn json_str(obj: ptr, key: string) -> string {
+    if obj == null { return "" }
+    v, err = json.object_get(obj, key)
+    if err != "" || v == null { return "" }
+    if json.json_type(v) != json.JSON_STRING { return "" }
+    s, _ = json.get_string(v)
+    return s
+}
+
+fn json_int(obj: ptr, key: string) -> int {
+    if obj == null { return 0 }
+    v, err = json.object_get(obj, key)
+    if err != "" || v == null { return 0 }
+    return json.json_get_int(v)
+}
+
+fn json_bool(obj: ptr, key: string) -> bool {
+    if obj == null { return false }
+    v, err = json.object_get(obj, key)
+    if err != "" || v == null { return false }
+    return json.json_get_bool(v) == 1
+}
+
+fn json_obj(obj: ptr, key: string) -> ptr {
+    if obj == null { return null }
+    v, err = json.object_get(obj, key)
+    if err != "" { return null }
+    return v
+}
+
+// ---- streamed responses (events, followed logs, pull and build output) ----
+
+struct Stream {
+    resp: ptr
+    buf: string     // bytes read but not yet handed out as lines
+    done: bool
+    err: string
+}
+
+fn open_stream_req(req: ptr) -> (*Stream, string) {
+    r, err = client.send_stream(req)
+    client.request_free(req)
+    if err != "" { return null, err }
+    s = heap.new(Stream)
+    s.resp = r
+    s.buf = ""   // string.concat(null, x) is "": a zeroed field is null
+    s.err = ""
+    return s, ""
+}
+
+// Open a streamed call. The status is checked: an error status reads the
+// (short) body and returns it as the error.
+stream_open(cl: *Client, method: string, path: string, body: string, timeout: Duration) -> (*Stream, string) {
+    req = make_request(cl, method, path, timeout)
+    if string.length(body) > 0 {
+        client.set_body(req, string.bytes(body), "application/json")
+    } else if method == "POST" {
+        client.set_header(req, "Content-Length", "0")
+    }
+    s, err = open_stream_req(req)
+    if err != "" { return null, "${method} ${path}: ${err}" }
+    return check_stream(s, "${method} ${path}")
+}
+
+stream_open_bytes(cl: *Client, method: string, path: string, body: string, ctype: string, timeout: Duration) -> (*Stream, string) {
+    req = make_request(cl, method, path, timeout)
+    client.set_body(req, string.bytes(body), ctype)
+    s, err = open_stream_req(req)
+    if err != "" { return null, "${method} ${path}: ${err}" }
+    return check_stream(s, "${method} ${path}")
+}
+
+fn check_stream(s: *Stream, op: string) -> (*Stream, string) {
+    st = client.response_status(s.resp)
+    if st >= 200 && st < 300 { return s, "" }
+    body = ""
+    going = true
+    while going {
+        ch = client.response_read(s.resp, 65536)
+        if string.length(ch) == 0 { going = false } else { body = string.concat(body, ch) }
+    }
+    stream_close(s)
+    return null, api_check(op, st, body)
+}
+
+// The next chunk as it arrives; "" at the end (or on an error: stream_error).
+stream_read(s: *Stream, max: int) -> string {
+    if s.done { return "" }
+    if string.length(s.buf) > 0 {
+        b = s.buf
+        s.buf = ""
+        return b
+    }
+    ch = client.response_read(s.resp, max)
+    if string.length(ch) == 0 {
+        s.done = true
+        s.err = client.response_error(s.resp)
+    }
+    return ch
+}
+
+// The next newline-terminated line (without the newline); ok false at the end.
+stream_next_line(s: *Stream) -> (string, bool) {
+    while true {
+        nl = string.index_of(s.buf, "\n")
+        if nl >= 0 {
+            line = string.substring(s.buf, 0, nl)
+            s.buf = string.substring(s.buf, nl + 1, string.length(s.buf))
+            return line, true
+        }
+        if s.done { break }
+        ch = client.response_read(s.resp, 65536)
+        if string.length(ch) == 0 {
+            s.done = true
+            s.err = client.response_error(s.resp)
+        } else {
+            s.buf = string.concat(s.buf, ch)
+        }
+    }
+    if string.length(s.buf) > 0 {
+        line = s.buf
+        s.buf = ""
+        return line, true
+    }
+    return "", false
+}
+
+stream_error(s: *Stream) -> string { return s.err }
+
+stream_close(s: *Stream) {
+    if s == null { return }
+    if s.resp != null {
+        client.response_free(s.resp)
+        s.resp = null
+    }
+    s.done = true
+}
+
+// ===================================================================
+// The multiplexed stream format (stdcopy): [kind,0,0,0,size(4, big-endian)]
+// then size bytes; kind 1 stdout, 2 stderr (0 stdin, 3 system error).
+// ===================================================================
+
+struct Demux {
+    buf: string
+    kind: int        // of the frame demux_pop last returned
+    payload: string
+}
+
+demux_new() -> *Demux {
+    d = heap.new(Demux)
+    d.buf = ""
+    d.payload = ""
+    return d
+}
+
+demux_feed(d: *Demux, chunk: string) {
+    d.buf = string.concat(d.buf, chunk)
+}
+
+// Take the next whole frame out of the buffer: true and the frame in
+// d.kind / d.payload, or false when a whole frame is not there yet.
+demux_pop(d: *Demux) -> bool {
+    n = string.length(d.buf)
+    if n < 8 { return false }
+    b = string.bytes(d.buf)
+    size = (b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7]
+    if n < 8 + size { return false }
+    d.kind = b[0]
+    d.payload = bsub(d.buf, 8, 8 + size)
+    d.buf = bsub(d.buf, 8 + size, n)
+    return true
+}
+
+// A binary-safe substring: string.substring stops at a NUL byte, and the
+// frame headers are full of them.
+fn bsub(s: string, from: int, to: int) -> string {
+    return string.string_substring_n(s, string.length(s), from, to)
+}
+
+demux_next_kind(d: *Demux) -> int { return d.kind }
+demux_next_payload(d: *Demux) -> string { return d.payload }
+
+// A whole multiplexed buffer into (stdout, stderr, both in order). Bytes
+// after the last whole frame (a cut-off stream) go to both as they are.
+demux_split(raw: string) -> (string, string, string) {
+    d = demux_new()
+    demux_feed(d, raw)
+    out = ""
+    errs = ""
+    all = ""
+    while demux_pop(d) {
+        if d.kind == 2 { errs = string.concat(errs, d.payload) } else { out = string.concat(out, d.payload) }
+        all = string.concat(all, d.payload)
+    }
+    if string.length(d.buf) > 0 {
+        out = string.concat(out, d.buf)
+        all = string.concat(all, d.buf)
+    }
+    heap.free(d)
+    return out, errs, all
+}
+
+demux_combined(raw: string) -> string {
+    _, _, all = demux_split(raw)
+    return all
+}
+
+// ===================================================================
+// Containers (docker.go)
+// ===================================================================
+
+// A container this process created (or looked up). The core keeps its
+// request in `req`, its log follower in `follower`; both are opaque here.
+struct Container {
+    id: string
+    name: string
+    image: string
+    client: *Client
+    session_id: string
+    tty: bool
+    exposed: string[]    // normalized "6379/tcp", in request order
+    running: bool
+    terminated: bool
+    req: ptr
+    follower: ptr
+}
+
+// The container's state (Go's container.State), from inspect.
+struct State {
+    status: string     // created, running, paused, restarting, removing, exited, dead
+    running: bool
+    paused: bool
+    restarting: bool
+    oom_killed: bool
+    dead: bool
+    exit_code: int
+    error: string
+    health: string     // "" when the image has no health check, else starting/healthy/unhealthy
+}
+
+struct ExecResult {
+    exit_code: int
+    stdout: string
+    stderr: string
+    output: string     // stdout and stderr interleaved as they arrived
+}
+
+container_new(cl: *Client, id: string, image: string) -> *Container {
+    c = heap.new(Container)
+    c.client = cl
+    c.id = id
+    c.image = image
+    c.session_id = session_id()
+    return c
+}
+
+// "6379" -> "6379/tcp"; "8080:80/tcp" -> "80/tcp" (the container side).
+normalize_port(p: string) -> string {
+    s = string.trim(p)
+    colon = last_index_of(s, ":")
+    if colon >= 0 { s = string.substring(s, colon + 1, string.length(s)) }
+    if string.index_of(s, "/") < 0 { s = "${s}/tcp" }
+    return s
+}
+
+fn last_index_of(s: string, sub: string) -> int {
+    last = -1
+    i = string.index_of(s, sub)
+    while i >= 0 {
+        last = i
+        i = string.index_of_from(s, sub, i + 1)
+    }
+    return last
+}
+
+// POST /containers/create with a built Config document (taken and freed).
+// Returns the new id.
+create_container(cl: *Client, name: string, cfg: ptr, platform: string) -> (string, string) {
+    q = ""
+    if string.length(name) > 0 { q = "?name=${query_escape(name)}" }
+    if string.length(platform) > 0 {
+        if string.length(q) == 0 { q = "?" } else { q = "${q}&" }
+        q = "${q}platform=${query_escape(platform)}"
+    }
+    body = json_body(cfg)
+    doc, err = api_json(cl, "POST", "/containers/create${q}", body, "create container")
+    if err != "" { return "", err }
+    id = json_str(doc, "Id")
+    json.free(doc)
+    return id, ""
+}
+
+start(c: *Container) -> string {
+    st, b, err = api(c.client, "POST", "/containers/${c.id}/start", "")
+    if err != "" { return "start ${short(c.id)}: ${err}" }
+    if st == 304 { c.running = true; return "" }
+    cerr = api_check("start ${short(c.id)}", st, b)
+    if cerr == "" { c.running = true }
+    return cerr
+}
+
+// Stop with a timeout in seconds (-1: the engine's default).
+stop(c: *Container, timeout_secs: int) -> string {
+    q = ""
+    if timeout_secs >= 0 { q = "?t=${timeout_secs}" }
+    st, b, err = api(c.client, "POST", "/containers/${c.id}/stop${q}", "")
+    if err != "" { return "stop ${short(c.id)}: ${err}" }
+    c.running = false
+    if st == 304 { return "" }
+    return api_check("stop ${short(c.id)}", st, b)
+}
+
+kill(c: *Container, signal: string) -> string {
+    q = ""
+    if string.length(signal) > 0 { q = "?signal=${signal}" }
+    st, b, err = api(c.client, "POST", "/containers/${c.id}/kill${q}", "")
+    if err != "" { return "kill ${short(c.id)}: ${err}" }
+    return api_check("kill ${short(c.id)}", st, b)
+}
+
+// DELETE the container (force: also a running one; volumes: its anonymous
+// volumes). A container already gone is not an error.
+remove(c: *Container, force: bool, volumes: bool) -> string {
+    f = 0
+    if force { f = 1 }
+    v = 0
+    if volumes { v = 1 }
+    st, b, err = api(c.client, "DELETE", "/containers/${c.id}?force=${f}&v=${v}", "")
+    if err != "" { return "remove ${short(c.id)}: ${err}" }
+    if st == 404 { c.terminated = true; return "" }
+    cerr = api_check("remove ${short(c.id)}", st, b)
+    if cerr == "" {
+        c.terminated = true
+        c.running = false
+    }
+    if is_conflict(cerr) && string.contains(cerr, "in progress") == 1 {
+        // "removal of container ... is already in progress"
+        c.terminated = true
+        return ""
+    }
+    return cerr
+}
+
+fn short(id: string) -> string {
+    if string.length(id) > 12 { return string.substring(id, 0, 12) }
+    return id
+}
+
+// The container named name (exactly; GET /containers/{name}/json), with its
+// id, name and image filled in; (null, "") when there is none (Go's
+// findContainerByName).
+find_container_by_name(cl: *Client, name: string) -> (*Container, string) {
+    st, b, err = api(cl, "GET", "/containers/${query_escape(name)}/json", "")
+    if err != "" { return null, "find container ${name}: ${err}" }
+    if st == 404 { return null, "" }
+    cerr = api_check("find container ${name}", st, b)
+    if cerr != "" { return null, cerr }
+    doc, perr = json.parse(b)
+    if perr != "" { return null, "find container ${name}: bad JSON from the engine: ${perr}" }
+    c = container_new(cl, json_str(doc, "Id"), json_str(json_obj(doc, "Config"), "Image"))
+    c.name = name
+    c.tty = json_bool(json_obj(doc, "Config"), "Tty")
+    json.free(doc)
+    return c, ""
+}
+
+// GET /containers/{id}/json: the document, which the caller json.frees.
+inspect(c: *Container) -> (ptr, string) {
+    return api_json(c.client, "GET", "/containers/${c.id}/json", "", "inspect ${short(c.id)}")
+}
+
+state_of(c: *Container) -> (State, string) {
+    s = State { status: "", running: false, paused: false, restarting: false, oom_killed: false, dead: false, exit_code: 0, error: "", health: "" }
+    doc, err = inspect(c)
+    if err != "" { return s, err }
+    st = json_obj(doc, "State")
+    s.status = json_str(st, "Status")
+    s.running = json_bool(st, "Running")
+    s.paused = json_bool(st, "Paused")
+    s.restarting = json_bool(st, "Restarting")
+    s.oom_killed = json_bool(st, "OOMKilled")
+    s.dead = json_bool(st, "Dead")
+    s.exit_code = json_int(st, "ExitCode")
+    s.error = json_str(st, "Error")
+    h = json_obj(st, "Health")
+    if h != null { s.health = json_str(h, "Status") }
+    json.free(doc)
+    c.running = s.running
+    return s, ""
+}
+
+is_running(c: *Container) -> bool {
+    if c == null { return false }
+    s, err = state_of(c)
+    if err != "" { return false }
+    return s.running
+}
+
+// POST /containers/{id}/wait: block until it exits; its exit code.
+wait_exit(c: *Container) -> (int, string) {
+    req = make_request(c.client, "POST", "/containers/${c.id}/wait", 0ns)
+    client.set_header(req, "Content-Length", "0")
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return -1, "wait ${short(c.id)}: ${err}" }
+    st = client.response_status(r)
+    b = client.response_body(r)
+    client.response_free(r)
+    cerr = api_check("wait ${short(c.id)}", st, b)
+    if cerr != "" { return -1, cerr }
+    doc, perr = json.parse(b)
+    if perr != "" { return -1, "wait: ${perr}" }
+    code = json_int(doc, "StatusCode")
+    json.free(doc)
+    return code, ""
+}
+
+// The host port an exposed container port ("6379/tcp", "6379") is published
+// on: (port, "") or (0, error) when it is not (yet) mapped.
+mapped_port(c: *Container, port: string) -> (int, string) {
+    want = normalize_port(port)
+    doc, err = inspect(c)
+    if err != "" { return 0, err }
+    ns = json_obj(doc, "NetworkSettings")
+    ports = json_obj(ns, "Ports")
+    bindings = json_obj(ports, want)
+    if bindings == null || json.json_type(bindings) != json.JSON_ARRAY {
+        json.free(doc)
+        return 0, "port ${want} is not mapped (is it exposed?)"
+    }
+    n = json.json_array_size(bindings)
+    i = 0
+    found = 0
+    while i < n {
+        bnd, _ = json.array_get(bindings, i)
+        hp = json_str(bnd, "HostPort")
+        if string.length(hp) > 0 && found == 0 {
+            v, cerr = string.to_int(hp)
+            if cerr == "" && v > 0 { found = v }
+        }
+        i = i + 1
+    }
+    json.free(doc)
+    if found == 0 { return 0, "port ${want} is not mapped yet" }
+    return found, ""
+}
+
+// Where the container's published ports are reached (Go's Host).
+host(c: *Container) -> (string, string) {
+    return daemon_host(c.client), ""
+}
+
+// The lowest exposed port ("6379/tcp"), from the request, else from inspect.
+lowest_exposed_port(c: *Container) -> string {
+    best = ""
+    bestn = 0
+    for p in c.exposed {
+        num, _ = string.to_int(string.substring(p, 0, string.index_of(p, "/")))
+        if best == "" || num < bestn {
+            best = p
+            bestn = num
+        }
+    }
+    if best != "" { return best }
+    doc, err = inspect(c)
+    if err != "" { return "" }
+    ports = json_obj(json_obj(doc, "NetworkSettings"), "Ports")
+    n = json.object_size(ports)
+    i = 0
+    while i < n {
+        k, _, _ = json.object_entry(ports, i)
+        num, _ = string.to_int(string.substring(k, 0, string.index_of(k, "/")))
+        if best == "" || num < bestn {
+            best = k
+            bestn = num
+        }
+        i = i + 1
+    }
+    json.free(doc)
+    return best
+}
+
+// "proto://host:mapped", or "host:mapped" when proto is "" (Go's
+// PortEndpoint; port "" means the lowest exposed port, Go's Endpoint).
+endpoint(c: *Container, port: string, proto: string) -> (string, string) {
+    p = port
+    if string.length(p) == 0 { p = lowest_exposed_port(c) }
+    if string.length(p) == 0 { return "", "no exposed port" }
+    mp, err = mapped_port(c, p)
+    if err != "" { return "", err }
+    h, _ = host(c)
+    if string.contains(h, ":") == 1 { h = "[${h}]" }
+    if string.length(proto) == 0 { return "${h}:${mp}", "" }
+    return "${proto}://${h}:${mp}", ""
+}
+
+// The container's IP on its first network (Go's ContainerIP).
+container_ip(c: *Container) -> (string, string) {
+    ips, err = container_ips(c)
+    if err != "" { return "", err }
+    if ips.len == 0 { return "", "" }
+    return ips[0], ""
+}
+
+container_ips(c: *Container) -> (string[], string) {
+    string[] ips = []
+    doc, err = inspect(c)
+    if err != "" { return ips, err }
+    nets = json_obj(json_obj(doc, "NetworkSettings"), "Networks")
+    n = json.object_size(nets)
+    i = 0
+    while i < n {
+        _, v, _ = json.object_entry(nets, i)
+        ip = json_str(v, "IPAddress")
+        if string.length(ip) > 0 { ips.push(ip) }
+        i = i + 1
+    }
+    json.free(doc)
+    return ips, ""
+}
+
+networks(c: *Container) -> (string[], string) {
+    string[] names = []
+    doc, err = inspect(c)
+    if err != "" { return names, err }
+    nets = json_obj(json_obj(doc, "NetworkSettings"), "Networks")
+    n = json.object_size(nets)
+    i = 0
+    while i < n {
+        k, _, _ = json.object_entry(nets, i)
+        names.push(k)
+        i = i + 1
+    }
+    json.free(doc)
+    return names, ""
+}
+
+// The container's aliases on one network.
+network_aliases(c: *Container, network: string) -> (string[], string) {
+    string[] out = []
+    doc, err = inspect(c)
+    if err != "" { return out, err }
+    nets = json_obj(json_obj(doc, "NetworkSettings"), "Networks")
+    nv = json_obj(nets, network)
+    al = json_obj(nv, "Aliases")
+    if al != null && json.json_type(al) == json.JSON_ARRAY {
+        n = json.json_array_size(al)
+        i = 0
+        while i < n {
+            v, _ = json.array_get(al, i)
+            s, _ = json.get_string(v)
+            out.push(s)
+            i = i + 1
+        }
+    }
+    json.free(doc)
+    return out, ""
+}
+
+fn logs_raw(c: *Container) -> (string, string) {
+    st, b, err = api(c.client, "GET", "/containers/${c.id}/logs?stdout=1&stderr=1", "")
+    if err != "" { return "", "logs ${short(c.id)}: ${err}" }
+    cerr = api_check("logs ${short(c.id)}", st, b)
+    if cerr != "" { return "", cerr }
+    return b, ""
+}
+
+// The log so far, stdout and stderr in order (Go's Logs).
+logs(c: *Container) -> (string, string) {
+    raw, err = logs_raw(c)
+    if err != "" { return "", err }
+    if c.tty { return raw, "" }
+    return demux_combined(raw), ""
+}
+
+// The log so far as (stdout, stderr, error).
+logs_split(c: *Container) -> (string, string, string) {
+    raw, err = logs_raw(c)
+    if err != "" { return "", "", err }
+    if c.tty { return raw, "", "" }
+    out, errs, _ = demux_split(raw)
+    return out, errs, ""
+}
+
+// A followed log as a stream (raw: multiplexed unless tty): the caller reads
+// it with stream_read and a Demux, and closes it. Ends when the container stops.
+logs_stream(c: *Container, since: long) -> (*Stream, string) {
+    q = "follow=1&stdout=1&stderr=1"
+    if since > 0 { q = "${q}&since=${since}" }
+    return stream_open(c.client, "GET", "/containers/${c.id}/logs?${q}", "", 0ns)
+}
+
+fn strings_json(xs: string[]) -> ptr {
+    a = json.arr()
+    for x in xs { json.push(a, json.str(x)) }
+    return a
+}
+
+// Exec cmd in the container and collect its output and exit code. user,
+// workdir: "" for the container's; env: "K=V" entries.
+exec_with(c: *Container, cmd: string[], user: string, workdir: string, env: string[]) -> (*ExecResult, string) {
+    body = json.obj()
+    json.set(body, "AttachStdout", json.boolean(1))
+    json.set(body, "AttachStderr", json.boolean(1))
+    json.set(body, "Cmd", strings_json(cmd))
+    if string.length(user) > 0 { json.set(body, "User", json.str(user)) }
+    if string.length(workdir) > 0 { json.set(body, "WorkingDir", json.str(workdir)) }
+    if env.len > 0 { json.set(body, "Env", strings_json(env)) }
+    doc, err = api_json(c.client, "POST", "/containers/${c.id}/exec", json_body(body), "exec create")
+    if err != "" { return null, err }
+    eid = json_str(doc, "Id")
+    json.free(doc)
+    // POST /exec/{id}/start, hijacked: the engine answers 101 (or 200) and
+    // then streams the multiplexed output on the connection until the
+    // process ends.
+    req = make_request(c.client, "POST", "/exec/${eid}/start", 0ns)
+    client.set_header(req, "Connection", "Upgrade")
+    client.set_header(req, "Upgrade", "tcp")
+    client.set_body(req, string.bytes("{\"Detach\":false,\"Tty\":false}"), "application/json")
+    r, serr = client.send_stream(req)
+    client.request_free(req)
+    if serr != "" { return null, "exec start: ${serr}" }
+    status = client.response_status(r)
+    raw = ""
+    if status == 101 || status == 200 {
+        sock, early, terr = client.response_take_conn(r)
+        if terr != "" {
+            client.response_free(r)
+            return null, "exec start: ${terr}"
+        }
+        raw = early
+        going = true
+        while going {
+            chunk, rerr = tcp.read(sock, 65536)
+            if rerr != "" || string.length(chunk) == 0 {
+                if rerr == "timeout" { continue }
+                going = false
+            } else {
+                raw = string.concat(raw, chunk)
+            }
+        }
+        tcp.tcp_close(sock)
+        client.response_free(r)
+    } else {
+        b = ""
+        going = true
+        while going {
+            ch = client.response_read(r, 65536)
+            if string.length(ch) == 0 { going = false } else { b = string.concat(b, ch) }
+        }
+        client.response_free(r)
+        return null, api_check("exec start", status, b)
+    }
+    res = heap.new(ExecResult)
+    out, errs, all = demux_split(raw)
+    res.stdout = out
+    res.stderr = errs
+    res.output = all
+    // The exit code: the exec may still be marked running for a moment
+    // after its stream closes.
+    tries = 0
+    while tries < 50 {
+        idoc, ierr = api_json(c.client, "GET", "/exec/${eid}/json", "", "exec inspect")
+        if ierr != "" { return res, ierr }
+        running = json_bool(idoc, "Running")
+        res.exit_code = json_int(idoc, "ExitCode")
+        json.free(idoc)
+        if !running { return res, "" }
+        sleep(20)
+        tries = tries + 1
+    }
+    return res, ""
+}
+
+// Exec: (exit code, stdout and stderr interleaved, error).
+exec(c: *Container, cmd: string[]) -> (int, string, string) {
+    string[] noenv = []
+    res, err = exec_with(c, cmd, "", "", noenv)
+    if res == null { return -1, "", err }
+    code = res.exit_code
+    out = res.output
+    heap.free(res)
+    return code, out, err
+}
+
+// ---- files (file.go, docker.go CopyTo*/CopyFileFromContainer) ----
+
+fn temp_dir() -> (string, string) {
+    return fs.make_temp_dir("", "tcae")
+}
+
+fn dirname(p: string) -> string {
+    i = last_index_of(p, "/")
+    if i < 0 { return "." }
+    if i == 0 { return "/" }
+    return string.substring(p, 0, i)
+}
+
+fn basename(p: string) -> string {
+    i = last_index_of(p, "/")
+    if i < 0 { return p }
+    return string.substring(p, i + 1, string.length(p))
+}
+
+// PUT a tar archive (a file) to extract under dir in the container.
+fn put_archive(c: *Container, dir: string, tar_path: string) -> string {
+    data, _, rerr = fs.read_binary(tar_path)
+    if rerr != "" { return "read archive: ${rerr}" }
+    st, b, err = api_bytes(c.client, "PUT", "/containers/${c.id}/archive?path=${query_escape(dir)}", data, "application/x-tar", 300s)
+    if err != "" { return "copy to ${short(c.id)}: ${err}" }
+    return api_check("copy to ${short(c.id)}:${dir}", st, b)
+}
+
+// The archive entry name for a file at container_path, extracted at "/"
+// (Go's tarFile): the cleaned path without its leading "/"; "." and "/" are
+// not file paths, and a relative path may not climb out of "/".
+fn archive_name(container_path: string) -> (string, string) {
+    p = path.clean(container_path)
+    if p == "." || p == "/" || string.length(p) == 0 { return "", "invalid container file path \"${container_path}\"" }
+    if string.starts_with(p, "/") == 1 { return string.substring(p, 1, string.length(p)), "" }
+    if p == ".." || string.starts_with(p, "../") == 1 { return "", "container file path \"${container_path}\" escapes the archive root" }
+    return p, ""
+}
+
+// Copy bytes into the container as the file container_path, with mode
+// (0o644 is 420). As Go's CopyToContainer, the archive holds the whole path
+// and is extracted at "/", so missing parent directories are made.
+copy_to_container(c: *Container, content: string, container_path: string, mode: int) -> string {
+    name, nerr = archive_name(container_path)
+    if nerr != "" { return "copy to container: ${nerr}" }
+    dir, derr = temp_dir()
+    if derr != "" { return derr }
+    defer fs.remove_tree(dir)
+    src = "${dir}/content"
+    werr = fs.write_binary(src, string.bytes(content))
+    if werr != "" { return "copy to container: ${werr}" }
+    _ = fs.chmod(src, mode)
+    tp = "${dir}/archive.tar"
+    w, terr = tar.writer_create(tp)
+    if terr != "" { return "copy to container: ${terr}" }
+    aerr = tar.writer_add_file(w, name, src)
+    if aerr != "" {
+        tar.writer_abort(w)
+        return "copy to container: ${aerr}"
+    }
+    ferr = tar.writer_finish(w)
+    if ferr != "" { return "copy to container: ${ferr}" }
+    return put_archive(c, "/", tp)
+}
+
+copy_file_to_container(c: *Container, host_path: string, container_path: string, mode: int) -> string {
+    kind, _, _, serr = fs.file_stat(host_path)
+    if serr != "" { return "copy ${host_path}: ${serr}" }
+    if kind == fs.STAT_KIND_DIR {
+        return copy_dir_to_container(c, host_path, container_path, mode)
+    }
+    data, _, rerr = fs.read_binary(host_path)
+    if rerr != "" { return "copy ${host_path}: ${rerr}" }
+    return copy_to_container(c, data, container_path, mode)
+}
+
+fn add_tree(w: ptr, host_dir: string, prefix: string, mode: int) -> string {
+    lst, lerr = fs.list_dir(host_dir)
+    if lerr != "" { return "${host_dir}: ${lerr}" }
+    n = fs.dir_list_count(lst)
+    i = 0
+    while i < n {
+        nm = fs.dir_list_get(lst, i)
+        i = i + 1
+        if nm == "." || nm == ".." { continue }
+        hp = "${host_dir}/${nm}"
+        ap = "${prefix}/${nm}"
+        kind, _, mtime, serr = fs.file_stat(hp)
+        if serr != "" { continue }
+        if kind == fs.STAT_KIND_DIR {
+            derr = tar.writer_add_directory(w, ap, 493, mtime)
+            if derr != "" { fs.dir_list_free(lst); return derr }
+            terr = add_tree(w, hp, ap, mode)
+            if terr != "" { fs.dir_list_free(lst); return terr }
+        } else if kind == fs.STAT_KIND_FILE {
+            if mode > 0 { _ = fs.chmod(hp, mode) }
+            ferr = tar.writer_add_file(w, ap, hp)
+            if ferr != "" { fs.dir_list_free(lst); return ferr }
+        }
+    }
+    fs.dir_list_free(lst)
+    return ""
+}
+
+// Copy a host directory into the container (Go's CopyDirToContainer, and
+// CopyFileToContainer given a directory): the directory keeps its base name
+// and is extracted into the parent of container_path, so it lands at
+// dirname(container_path)/basename(host_dir). Give the path the directory
+// should have ("testdata/data" to "/data" is /data; to "/srv/data",
+// /srv/data), or a path ending in "/" to extract into that directory
+// ("/srv/" gives /srv/data). As in Go, the parent must exist. mode 0 keeps
+// each file's own mode (Go sets every file's mode when one is given; so does
+// this, on the host file itself, so pass 0 for a tree you do not want
+// changed).
+copy_dir_to_container(c: *Container, host_dir: string, container_path: string, mode: int) -> string {
+    dir, derr = temp_dir()
+    if derr != "" { return derr }
+    defer fs.remove_tree(dir)
+    tp = "${dir}/archive.tar"
+    w, terr = tar.writer_create(tp)
+    if terr != "" { return "copy dir: ${terr}" }
+    src = path.clean(host_dir)
+    base = basename(src)
+    _, _, mtime, _ = fs.file_stat(src)
+    aerr = tar.writer_add_directory(w, base, 493, mtime)
+    if aerr == "" { aerr = add_tree(w, src, base, mode) }
+    if aerr != "" {
+        tar.writer_abort(w)
+        return "copy dir: ${aerr}"
+    }
+    ferr = tar.writer_finish(w)
+    if ferr != "" { return "copy dir: ${ferr}" }
+    return put_archive(c, dirname(container_path), tp)
+}
+
+// A file's bytes out of the container (Go's CopyFileFromContainer).
+copy_file_from_container(c: *Container, path: string) -> (string, string) {
+    st, b, err = api(c.client, "GET", "/containers/${c.id}/archive?path=${query_escape(path)}", "")
+    if err != "" { return "", "copy from ${short(c.id)}: ${err}" }
+    cerr = api_check("copy ${path} from ${short(c.id)}", st, b)
+    if cerr != "" { return "", cerr }
+    dir, derr = temp_dir()
+    if derr != "" { return "", derr }
+    defer fs.remove_tree(dir)
+    tp = "${dir}/out.tar"
+    werr = fs.write_binary(tp, string.bytes(b))
+    if werr != "" { return "", werr }
+    r, rerr = tar.reader_open(tp)
+    if rerr != "" { return "", "copy from: ${rerr}" }
+    has, nerr = tar.reader_next(r)
+    if nerr != "" || has != 1 {
+        tar.reader_close(r)
+        return "", "copy from: empty archive"
+    }
+    if tar.entry_kind(r) != tar.KIND_FILE {
+        tar.reader_close(r)
+        return "", "copy from: ${path} is not a regular file"
+    }
+    size = tar.entry_size(r)
+    data = ""
+    while string.length(data) < size {
+        chunk, cn, cherr = tar.entry_read(r, 65536)
+        if cherr != "" || cn == 0 { break }
+        data = string.concat(data, chunk)
+    }
+    tar.reader_close(r)
+    return data, ""
+}
+
+// Container ids (all states) carrying label=value filters, e.g.
+// ["org.testcontainers.sessionId=abc"].
+list_containers(cl: *Client, labels: string[]) -> (string[], string) {
+    string[] ids = []
+    f = json.obj()
+    la = json.arr()
+    for l in labels { json.push(la, json.str(l)) }
+    json.set(f, "label", la)
+    q = query_escape(json_body(f))
+    doc, err = api_json(cl, "GET", "/containers/json?all=1&filters=${q}", "", "list containers")
+    if err != "" { return ids, err }
+    n = json.json_array_size(doc)
+    i = 0
+    while i < n {
+        v, _ = json.array_get(doc, i)
+        ids.push(json_str(v, "Id"))
+        i = i + 1
+    }
+    json.free(doc)
+    return ids, ""
+}
+
+// ===================================================================
+// Images (internal/core/images.go, docker_auth.go, image.go)
+// ===================================================================
+
+// "redis:7-alpine" -> ("docker.io", "library/redis", "7-alpine") style
+// parts: (registry, repository-with-registry-as-written, tag-or-digest).
+// The repository is returned as written (without the tag), which is what
+// the pull API takes as fromImage.
+parse_image(ref: string) -> (string, string, string) {
+    name = ref
+    tag = ""
+    at = string.index_of(name, "@")
+    if at >= 0 {
+        tag = string.substring(name, at, string.length(name))
+        name = string.substring(name, 0, at)
+    } else {
+        colon = last_index_of(name, ":")
+        slash = last_index_of(name, "/")
+        if colon > slash {
+            tag = string.substring(name, colon + 1, string.length(name))
+            name = string.substring(name, 0, colon)
+        }
+    }
+    if string.length(tag) == 0 { tag = "latest" }
+    return image_registry(name), name, tag
+}
+
+// The registry an image comes from: the first path component when it looks
+// like a host (has a dot or a colon, or is localhost), else Docker Hub.
+image_registry(ref: string) -> string {
+    slash = string.index_of(ref, "/")
+    if slash < 0 { return "docker.io" }
+    first = string.substring(ref, 0, slash)
+    if string.contains(first, ".") == 1 || string.contains(first, ":") == 1 || first == "localhost" {
+        return first
+    }
+    return "docker.io"
+}
+
+// TESTCONTAINERS_HUB_IMAGE_NAME_PREFIX applied to a Docker Hub image (Go's
+// prependHubRegistry): "redis:7" -> "<prefix>/redis:7"; an image naming its
+// own registry is left alone.
+hub_prefixed(ref: string) -> string {
+    prefix = config().hub_image_name_prefix
+    if string.length(prefix) == 0 { return ref }
+    slash = string.index_of(ref, "/")
+    if slash >= 0 {
+        first = string.substring(ref, 0, slash)
+        if string.contains(first, ".") == 1 || string.contains(first, ":") == 1 || first == "localhost" {
+            return ref
+        }
+    }
+    if string.ends_with(prefix, "/") == 1 { return "${prefix}${ref}" }
+    return "${prefix}/${ref}"
+}
+
+image_exists(cl: *Client, ref: string) -> bool {
+    st, _, err = api(cl, "GET", "/images/${ref}/json", "")
+    return err == "" && st == 200
+}
+
+image_inspect(cl: *Client, ref: string) -> (ptr, string) {
+    return api_json(cl, "GET", "/images/${ref}/json", "", "inspect image ${ref}")
+}
+
+// The Docker config: DOCKER_AUTH_CONFIG (its JSON), else config.json in
+// DOCKER_CONFIG or ~/.docker (Go's getDockerConfig). null when there is none.
+fn docker_config_doc() -> ptr {
+    text = getenv("DOCKER_AUTH_CONFIG")
+    if string.length(text) == 0 {
+        dir = getenv("DOCKER_CONFIG")
+        if string.length(dir) == 0 { dir = "${home_dir()}/.docker" }
+        path = "${dir}/config.json"
+        if fs.exists(path) == 0 { return null }
+        t, rerr = fs.read(path)
+        if rerr != "" { return null }
+        text = t
+    }
+    doc, perr = json.parse(text)
+    if perr != "" { return null }
+    return doc
+}
+
+// A config key's host: "https://index.docker.io/v1/" -> "index.docker.io",
+// "myreg:5000" -> "myreg:5000" (Go's getRegistryAuth fallback match).
+fn key_host(k: string) -> string {
+    h = k
+    sep = string.index_of(h, "://")
+    if sep >= 0 { h = string.substring(h, sep + 3, string.length(h)) }
+    slash = string.index_of(h, "/")
+    if slash >= 0 { h = string.substring(h, 0, slash) }
+    return h
+}
+
+// The key of obj (auths or credHelpers) that names registry: the registry
+// itself, else a key whose host is the registry. Docker Hub's aliases all
+// match "https://index.docker.io/v1/". "" when none does.
+fn config_key(obj: ptr, registry: string) -> string {
+    if obj == null { return "" }
+    hub = registry == "docker.io" || registry == "index.docker.io" || registry == "registry-1.docker.io" || registry == "registry.hub.docker.com"
+    want = registry
+    if hub { want = "https://index.docker.io/v1/" }
+    v, err = json.object_get(obj, want)
+    if err == "" && v != null { return want }
+    wanth = key_host(want)
+    n = json.object_size(obj)
+    out = ""
+    i = 0
+    while i < n && string.length(out) == 0 {
+        k, _, _ = json.object_entry(obj, i)
+        if key_host(k) == wanth || (hub && key_host(k) == "docker.io") { out = k }
+        i = i + 1
+    }
+    return out
+}
+
+// Run docker-credential-<helper> get with the server on stdin (the
+// credential-helper protocol; Go's dockercfg.GetCredentialsFromHelper).
+// (username, secret, error); a helper that has nothing for the server
+// ("credentials not found") gives ("", "", "").
+credential_helper_get(helper: string, server: string) -> (string, string, string) {
+    prog = "docker-credential-${helper}"
+    argv = list.new()
+    list.add(argv, "get")
+    out, errout, rc, rerr = os.run_full(prog, argv, null, server)
+    list.free(argv)
+    if rerr != "" { return "", "", "credential helper ${prog}: ${rerr}" }
+    if rc != 0 {
+        both = "${out}${errout}"
+        if string.contains(string.to_lower(both), "credentials not found") == 1 { return "", "", "" }
+        return "", "", "credential helper ${prog} get ${server}: exit ${rc}: ${string.trim(both)}"
+    }
+    doc, perr = json.parse(out)
+    if perr != "" { return "", "", "credential helper ${prog}: bad JSON: ${perr}" }
+    user = json_str(doc, "Username")
+    secret = json_str(doc, "Secret")
+    json.free(doc)
+    return user, secret, ""
+}
+
+// The X-Registry-Auth value for a registry ("host:port", or "docker.io")
+// from the Docker config (Go's DockerImageAuth): an "auths" entry's "auth"
+// (base64 user:password), username / password or identitytoken; and, for
+// an auths entry without credentials or a credHelpers entry, what the
+// credential helper says (credHelpers[key], else credsStore): a username of
+// "<token>" makes the secret an identity token. ("", "") when there is
+// nothing for the registry; an error when a helper fails.
+registry_auth_lookup(registry: string) -> (string, string) {
+    doc = docker_config_doc()
+    if doc == null { return "", "" }
+    auths = json_obj(doc, "auths")
+    helpers = json_obj(doc, "credHelpers")
+    store = json_str(doc, "credsStore")
+    user = ""
+    password = ""
+    tok = ""
+    key = config_key(auths, registry)
+    if string.length(key) > 0 {
+        e = json_obj(auths, key)
+        a = json_str(e, "auth")
+        if string.length(a) > 0 {
+            dec, derr = encoding.base64_decode(a)
+            if derr == "" {
+                colon = string.index_of(dec, ":")
+                if colon > 0 {
+                    user = string.substring(dec, 0, colon)
+                    password = string.substring(dec, colon + 1, string.length(dec))
+                }
+            }
+        }
+        if string.length(user) == 0 && string.length(password) == 0 {
+            user = json_str(e, "username")
+            password = json_str(e, "password")
+        }
+        tok = json_str(e, "identitytoken")
+    }
+    if string.length(user) == 0 && string.length(password) == 0 && string.length(tok) == 0 {
+        hkey = config_key(helpers, registry)
+        helper = ""
+        server = key
+        if string.length(hkey) > 0 {
+            helper = json_str(helpers, hkey)
+            server = hkey
+        } else if string.length(key) > 0 {
+            helper = store
+        }
+        if string.length(helper) > 0 {
+            hu, hs, herr = credential_helper_get(helper, server)
+            if herr != "" {
+                json.free(doc)
+                return "", herr
+            }
+            if hu == "<token>" {
+                tok = hs
+            } else {
+                user = hu
+                password = hs
+            }
+        }
+    }
+    json.free(doc)
+    if string.length(user) == 0 && string.length(password) == 0 && string.length(tok) == 0 { return "", "" }
+    o = json.obj()
+    if string.length(user) > 0 || string.length(password) > 0 {
+        json.set(o, "username", json.str(user))
+        json.set(o, "password", json.str(password))
+    }
+    if string.length(tok) > 0 { json.set(o, "identitytoken", json.str(tok)) }
+    json.set(o, "serveraddress", json.str(registry))
+    return base64url(json_body(o)), ""
+}
+
+// registry_auth_lookup without the error: "" when there is nothing (or a
+// credential helper failed).
+registry_auth(registry: string) -> string {
+    a, _ = registry_auth_lookup(registry)
+    return a
+}
+
+// The X-Registry-Auth value for a user and password at a registry
+// ("host:port"): Docker's AuthConfig as JSON, base64url-encoded with padding
+// (Go's registry.EncodeAuthConfig). "" when both are empty.
+encode_registry_auth(user: string, password: string, server: string) -> string {
+    if string.length(user) == 0 && string.length(password) == 0 { return "" }
+    o = json.obj()
+    json.set(o, "username", json.str(user))
+    json.set(o, "password", json.str(password))
+    json.set(o, "serveraddress", json.str(server))
+    return base64url(json_body(o))
+}
+
+fn base64url(s: string) -> string {
+    out = encoding.base64_encode_padded(string.bytes(s))
+    return string.replace_all(string.replace_all(out, "+", "-"), "/", "_")
+}
+
+// Pull an image, draining the progress stream; an "error" message in it is
+// the pull's error (the status is 200 by then).
+pull_image(cl: *Client, ref: string, platform: string) -> string {
+    reg, name, tag = parse_image(ref)
+    q = "fromImage=${query_escape(name)}"
+    if string.starts_with(tag, "@") == 1 {
+        q = "fromImage=${query_escape(name)}${query_escape(tag)}"
+    } else {
+        q = "${q}&tag=${query_escape(tag)}"
+    }
+    if string.length(platform) > 0 { q = "${q}&platform=${query_escape(platform)}" }
+    path = "/images/create?${q}"
+    // Docker pulls from a loopback registry (a registry container's mapped
+    // port) over plain HTTP by default; Podman's compat pull insists on
+    // HTTPS there, so its own pull endpoint is told not to verify TLS, as
+    // a push to one already is (modules/registry's tlsVerify=false).
+    if cl.podman && string.length(platform) == 0 && (string.starts_with(reg, "localhost:") == 1 || string.starts_with(reg, "127.0.0.1:") == 1) {
+        path = "/libpod/images/pull?reference=${query_escape(ref)}&tlsVerify=false"
+    }
+    req = make_request(cl, "POST", path, 0ns)
+    client.set_header(req, "Content-Length", "0")
+    auth, aerr = registry_auth_lookup(reg)
+    if aerr != "" {
+        client.request_free(req)
+        return "pull ${ref}: ${aerr}"
+    }
+    if string.length(auth) > 0 { client.set_header(req, "X-Registry-Auth", auth) }
+    s, err = open_stream_req(req)
+    if err != "" { return "pull ${ref}: ${err}" }
+    s2, cerr = check_stream(s, "pull ${ref}")
+    if cerr != "" { return cerr }
+    perr = ""
+    going = true
+    while going {
+        line, ok = stream_next_line(s2)
+        if !ok { going = false } else {
+            if string.contains(line, "\"error\"") == 1 && string.length(perr) == 0 {
+                doc, jerr = json.parse(line)
+                if jerr == "" {
+                    m = json_str(doc, "error")
+                    if string.length(m) > 0 { perr = "pull ${ref}: ${m}" }
+                    json.free(doc)
+                }
+            }
+        }
+    }
+    serr = stream_error(s2)
+    stream_close(s2)
+    if string.length(perr) > 0 { return perr }
+    if string.length(serr) > 0 { return "pull ${ref}: ${serr}" }
+    return ""
+}
+
+// Build an image from a context directory (tarred with std.tar) and a
+// Dockerfile path inside it. build_args and labels are "K=V" entries.
+// Returns (the tag, the build output, error).
+build_image(cl: *Client, context_dir: string, dockerfile: string, tag: string, build_args: string[], labels: string[]) -> (string, string, string) {
+    dir, derr = temp_dir()
+    if derr != "" { return "", "", derr }
+    defer fs.remove_tree(dir)
+    tp = "${dir}/context.tar"
+    w, terr = tar.writer_create(tp)
+    if terr != "" { return "", "", "build: ${terr}" }
+    aerr = add_tree(w, context_dir, ".", 0)
+    if aerr != "" {
+        tar.writer_abort(w)
+        return "", "", "build: tar the context: ${aerr}"
+    }
+    ferr = tar.writer_finish(w)
+    if ferr != "" { return "", "", "build: ${ferr}" }
+    data, _, rerr = fs.read_binary(tp)
+    if rerr != "" { return "", "", "build: ${rerr}" }
+    df = dockerfile
+    if string.length(df) == 0 { df = "Dockerfile" }
+    q = "t=${query_escape(tag)}&dockerfile=${query_escape(df)}&rm=1&forcerm=1"
+    if build_args.len > 0 {
+        o = json.obj()
+        for kv in build_args {
+            eq = string.index_of(kv, "=")
+            if eq > 0 { json.set(o, string.substring(kv, 0, eq), json.str(string.substring(kv, eq + 1, string.length(kv)))) }
+        }
+        q = "${q}&buildargs=${query_escape(json_body(o))}"
+    }
+    lo = json.obj()
+    add_default_labels(lo)
+    for kv in labels {
+        eq = string.index_of(kv, "=")
+        if eq > 0 { json.set(lo, string.substring(kv, 0, eq), json.str(string.substring(kv, eq + 1, string.length(kv)))) }
+    }
+    q = "${q}&labels=${query_escape(json_body(lo))}"
+    s, serr = stream_open_bytes(cl, "POST", "/build?${q}", data, "application/x-tar", 0ns)
+    if serr != "" { return "", "", "build ${tag}: ${serr}" }
+    out = ""
+    berr = ""
+    going = true
+    while going {
+        line, ok = stream_next_line(s)
+        if !ok { going = false } else {
+            doc, jerr = json.parse(line)
+            if jerr == "" {
+                out = string.concat(out, json_str(doc, "stream"))
+                m = json_str(doc, "error")
+                if string.length(m) > 0 && string.length(berr) == 0 { berr = "build ${tag}: ${m}" }
+                json.free(doc)
+            }
+        }
+    }
+    xerr = stream_error(s)
+    stream_close(s)
+    if string.length(berr) > 0 { return "", out, berr }
+    if string.length(xerr) > 0 { return "", out, "build ${tag}: ${xerr}" }
+    return tag, out, ""
+}
+
+remove_image(cl: *Client, ref: string, force: bool) -> string {
+    f = 0
+    if force { f = 1 }
+    st, b, err = api(cl, "DELETE", "/images/${ref}?force=${f}", "")
+    if err != "" { return "remove image ${ref}: ${err}" }
+    if st == 404 { return "" }
+    return api_check("remove image ${ref}", st, b)
+}
+
+// ===================================================================
+// Networks (network.go, the engine half of network/network.go)
+// ===================================================================
+
+struct Network {
+    id: string
+    name: string
+    driver: string
+    client: *Client
+    removed: bool
+}
+
+// POST /networks/create with a built request document (taken and freed).
+create_network(cl: *Client, req: ptr) -> (*Network, string) {
+    name = json_str(req, "Name")
+    driver = json_str(req, "Driver")
+    doc, err = api_json(cl, "POST", "/networks/create", json_body(req), "create network ${name}")
+    if err != "" { return null, err }
+    n = heap.new(Network)
+    n.id = json_str(doc, "Id")
+    n.name = name
+    n.driver = driver
+    n.client = cl
+    json.free(doc)
+    return n, ""
+}
+
+remove_network(n: *Network) -> string {
+    if n == null || n.removed { return "" }
+    st, b, err = api(n.client, "DELETE", "/networks/${n.id}", "")
+    if err != "" { return "remove network ${n.name}: ${err}" }
+    if st == 404 { n.removed = true; return "" }
+    cerr = api_check("remove network ${n.name}", st, b)
+    if cerr == "" { n.removed = true }
+    return cerr
+}
+
+inspect_network(cl: *Client, id_or_name: string) -> (ptr, string) {
+    return api_json(cl, "GET", "/networks/${id_or_name}", "", "inspect network ${id_or_name}")
+}
+
+// Connect a container to a network with aliases.
+connect_network(cl: *Client, network: string, container_id: string, aliases: string[]) -> string {
+    body = json.obj()
+    json.set(body, "Container", json.str(container_id))
+    es = json.obj()
+    if aliases.len > 0 { json.set(es, "Aliases", strings_json(aliases)) }
+    json.set(body, "EndpointConfig", es)
+    st, b, err = api(cl, "POST", "/networks/${network}/connect", json_body(body))
+    if err != "" { return "connect ${network}: ${err}" }
+    return api_check("connect ${short(container_id)} to ${network}", st, b)
+}
+
+// ===================================================================
+// Volumes
+// ===================================================================
+
+// Create a named volume with the session's labels, so the reaper removes
+// it; one that exists already is left as it is. (Podman does not apply the
+// labels of a mount's VolumeOptions to the volume it creates, so the
+// volume is made here first, for both engines.)
+create_volume(cl: *Client, name: string) -> string {
+    body = json.obj()
+    json.set(body, "Name", json.str(name))
+    labels = json.obj()
+    add_default_labels(labels)
+    json.set(body, "Labels", labels)
+    st, b, err = api(cl, "POST", "/volumes/create", json_body(body))
+    if err != "" { return "create volume ${name}: ${err}" }
+    if st == 409 { return "" }
+    return api_check("create volume ${name}", st, b)
+}
+
+remove_volume(cl: *Client, name: string) -> string {
+    st, b, err = api(cl, "DELETE", "/volumes/${name}?force=1", "")
+    if err != "" { return "remove volume ${name}: ${err}" }
+    if st == 404 { return "" }
+    return api_check("remove volume ${name}", st, b)
+}
+
+// ===================================================================
+// Events
+// ===================================================================
+
+// GET /events as a stream of JSON lines (stream_next_line), filtered by a
+// filters document ({"label":["k=v"],"type":["container"]}) taken and freed,
+// or null. since/until are unix seconds, 0 for none.
+events_open(cl: *Client, filters: ptr, since: long, until: long) -> (*Stream, string) {
+    q = ""
+    if filters != null { q = "filters=${query_escape(json_body(filters))}" }
+    if since > 0 { q = "${q}&since=${since}" }
+    if until > 0 { q = "${q}&until=${until}" }
+    return stream_open(cl, "GET", "/events?${q}", "", 0ns)
+}

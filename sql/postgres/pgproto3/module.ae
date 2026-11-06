@@ -1,0 +1,759 @@
+// Ported from jackc/pgx v5.9.2 pgproto3/{pgproto3.go,frontend.go,chunkreader.go,
+// startup_message.go,ssl_request.go,password_message.go,sasl_initial_response.go,
+// sasl_response.go,query.go,parse.go,bind.go,describe.go,execute.go,sync.go,
+// flush.go,close.go,terminate.go,authentication_ok.go,
+// authentication_cleartext_password.go,authentication_md5_password.go,
+// authentication_sasl.go,authentication_sasl_continue.go,
+// authentication_sasl_final.go,backend_key_data.go,bind_complete.go,
+// close_complete.go,command_complete.go,data_row.go,empty_query_response.go,
+// error_response.go,notice_response.go,no_data.go,notification_response.go,
+// parameter_description.go,parameter_status.go,parse_complete.go,
+// portal_suspended.go,ready_for_query.go,row_description.go,
+// negotiate_protocol_version.go}
+// Copyright (c) 2013-2021 Jack Christensen. MIT License: see sql/LICENSE.
+//
+// sql.postgres.pgproto3: the PostgreSQL wire protocol, version 3.0, as the
+// frontend (client) speaks it: every message a client sends, encoded into a
+// *Buf, and every message a backend sends, decoded by a *Decoder that is
+// fed bytes as they arrive (pgx's Frontend + chunkreader). A few backend
+// encoders are kept for tests (pgx's tests encode with them too).
+//
+// Messages are values of one struct, Msg, whose `kind` is the type byte
+// ('R', 'T', 'D', ...); only the fields of its kind are set. Go's
+// pgproto3 has a type per message; Aether has no interfaces, so one struct
+// with the union of the fields stands in.
+//
+// Not ported: the COPY sub-protocol messages (CopyData, CopyInResponse,
+// CopyOutResponse, CopyBothResponse, CopyDone, CopyFail: a decoded Copy*
+// message is an error for the caller), FunctionCall, GSS/SSPI messages,
+// CancelRequest, the backend side's decoding of frontend messages, the JSON
+// marshalling, and protocol 3.2's variable-length cancel keys.
+
+import std.string
+import std.bytes
+
+exports(
+    Buf, Msg, FieldDescription, Decoder,
+    PROTOCOL_VERSION_30, SSL_REQUEST_CODE, MAX_MESSAGE_BODY_LEN,
+    AUTH_OK, AUTH_CLEARTEXT_PASSWORD, AUTH_MD5_PASSWORD, AUTH_SCM_CREDS, AUTH_GSS,
+    AUTH_GSS_CONT, AUTH_SSPI, AUTH_SASL, AUTH_SASL_CONTINUE, AUTH_SASL_FINAL,
+    new_buf, buf_bytes, buf_len, buf_reset,
+    put_u8, put_u16, put_i32, put_u32, put_cstr, put_raw, begin_message, finish_message,
+    get_u16, get_i32, get_u32,
+    // frontend messages
+    startup_message, ssl_request, password_message, sasl_initial_response,
+    sasl_response, query, parse, bind, describe, execute, sync, flush,
+    close, terminate,
+    // backend messages (for tests)
+    authentication_ok, authentication_md5_password, authentication_sasl,
+    authentication_sasl_continue, authentication_sasl_final, row_description,
+    data_row, command_complete, ready_for_query, error_response, parameter_status,
+    backend_key_data, empty_query_response, parse_complete, bind_complete,
+    // decoding
+    new_decoder, set_max_body_len, feed, next_message, pending, decode, new_field
+)
+
+const PROTOCOL_VERSION_30 = 196608       // 3 << 16
+const SSL_REQUEST_CODE = 80877103
+const MAX_MESSAGE_BODY_LEN = 1073741822  // 0x3fffffff - 1
+
+const AUTH_OK = 0
+const AUTH_CLEARTEXT_PASSWORD = 3
+const AUTH_MD5_PASSWORD = 5
+const AUTH_SCM_CREDS = 6
+const AUTH_GSS = 7
+const AUTH_GSS_CONT = 8
+const AUTH_SSPI = 9
+const AUTH_SASL = 10
+const AUTH_SASL_CONTINUE = 11
+const AUTH_SASL_FINAL = 12
+
+// ---- the write buffer (pgx's []byte dst + internal/pgio) ----
+
+struct Buf {
+    b: byte[]
+}
+
+new_buf() -> *Buf { return heap.new(Buf) }
+buf_bytes(w: *Buf) -> byte[] { return w.b }
+buf_len(w: *Buf) -> int { return w.b.len }
+buf_reset(w: *Buf) {
+    byte[] empty = []
+    w.b = empty
+}
+
+put_u8(w: *Buf, v: int) { w.b.push((v & 255) as byte) }
+put_u16(w: *Buf, v: int) {
+    w.b.push(((v >> 8) & 255) as byte)
+    w.b.push((v & 255) as byte)
+}
+put_i32(w: *Buf, v: long) {
+    w.b.push(((v >> 24) & 255) as byte)
+    w.b.push(((v >> 16) & 255) as byte)
+    w.b.push(((v >> 8) & 255) as byte)
+    w.b.push((v & 255) as byte)
+}
+put_u32(w: *Buf, v: long) { put_i32(w, v) }
+put_raw(w: *Buf, data: byte[]) {
+    for c in data { w.b.push(c) }
+}
+// The string's bytes and a NUL.
+put_cstr(w: *Buf, s: string) {
+    for c in string.bytes(s) { w.b.push(c as byte) }
+    w.b.push(0 as byte)
+}
+
+// beginMessage: the type byte and a length placeholder; returns where the
+// length goes.
+begin_message(w: *Buf, t: int) -> int {
+    put_u8(w, t)
+    sp = w.b.len
+    put_i32(w, -1)
+    return sp
+}
+
+// finishMessage: write the length (which counts itself) at sp.
+finish_message(w: *Buf, sp: int) -> string {
+    n = w.b.len - sp
+    if n > MAX_MESSAGE_BODY_LEN { return "message body too large" }
+    w.b[sp] = ((n >> 24) & 255) as byte
+    w.b[sp + 1] = ((n >> 16) & 255) as byte
+    w.b[sp + 2] = ((n >> 8) & 255) as byte
+    w.b[sp + 3] = (n & 255) as byte
+    return ""
+}
+
+get_u16(b: byte[], at: int) -> int {
+    return ((b[at] as int) << 8) | (b[at + 1] as int)
+}
+get_u32(b: byte[], at: int) -> long {
+    return ((b[at] as long) << 24) | ((b[at + 1] as long) << 16) | ((b[at + 2] as long) << 8) | (b[at + 3] as long)
+}
+get_i32(b: byte[], at: int) -> long {
+    v = get_u32(b, at)
+    if v >= 2147483648 { return v - 4294967296 }
+    return v
+}
+
+// ---- frontend messages ----
+
+// StartupMessage: protocol 3.0 and the parameters, given as name/value
+// pairs in order (Go's is a map, sent in map order; order is free).
+startup_message(w: *Buf, params: string[]) -> string {
+    sp = w.b.len
+    put_i32(w, -1)
+    put_u32(w, PROTOCOL_VERSION_30)
+    i = 0
+    while i + 1 < params.len {
+        put_cstr(w, params[i])
+        put_cstr(w, params[i + 1])
+        i = i + 2
+    }
+    put_u8(w, 0)
+    return finish_message(w, sp)
+}
+
+// SSLRequest: length 8 and the request code, no type byte.
+ssl_request(w: *Buf) -> string {
+    put_i32(w, 8)
+    put_u32(w, SSL_REQUEST_CODE)
+    return ""
+}
+
+password_message(w: *Buf, password: string) -> string {
+    sp = begin_message(w, 112)            // 'p'
+    put_cstr(w, password)
+    return finish_message(w, sp)
+}
+
+sasl_initial_response(w: *Buf, mechanism: string, data: string) -> string {
+    sp = begin_message(w, 112)            // 'p'
+    put_cstr(w, mechanism)
+    put_i32(w, string.length(data))
+    put_raw(w, string.bytes(data))
+    return finish_message(w, sp)
+}
+
+sasl_response(w: *Buf, data: string) -> string {
+    sp = begin_message(w, 112)            // 'p'
+    put_raw(w, string.bytes(data))
+    return finish_message(w, sp)
+}
+
+query(w: *Buf, sql: string) -> string {
+    sp = begin_message(w, 81)             // 'Q'
+    put_cstr(w, sql)
+    return finish_message(w, sp)
+}
+
+// Parse: statement name ("" the unnamed one), the SQL, parameter type OIDs
+// (0 or none: the server infers).
+parse(w: *Buf, name: string, sql: string, param_oids: long[]) -> string {
+    if param_oids.len > 65535 { return "too many parameter types" }
+    sp = begin_message(w, 80)             // 'P'
+    put_cstr(w, name)
+    put_cstr(w, sql)
+    put_u16(w, param_oids.len)
+    for o in param_oids { put_u32(w, o) }
+    return finish_message(w, sp)
+}
+
+// Bind with every parameter and result in text format (no format codes:
+// the protocol's default, text). A null parameter is length -1.
+bind(w: *Buf, portal: string, stmt: string, values: string[], nulls: bool[]) -> string {
+    if values.len > 65535 { return "too many parameters" }
+    sp = begin_message(w, 66)             // 'B'
+    put_cstr(w, portal)
+    put_cstr(w, stmt)
+    put_u16(w, 0)                         // parameter format codes: all text
+    put_u16(w, values.len)
+    i = 0
+    while i < values.len {
+        if i < nulls.len && nulls[i] {
+            put_i32(w, -1)
+        } else {
+            v = values[i]
+            put_i32(w, string.length(v))
+            put_raw(w, string.bytes(v))
+        }
+        i = i + 1
+    }
+    put_u16(w, 0)                         // result format codes: all text
+    return finish_message(w, sp)
+}
+
+// Describe a statement ('S') or a portal ('P').
+describe(w: *Buf, object_type: int, name: string) -> string {
+    sp = begin_message(w, 68)             // 'D'
+    put_u8(w, object_type)
+    put_cstr(w, name)
+    return finish_message(w, sp)
+}
+
+// Execute a portal; max_rows 0 is all.
+execute(w: *Buf, portal: string, max_rows: long) -> string {
+    sp = begin_message(w, 69)             // 'E'
+    put_cstr(w, portal)
+    put_u32(w, max_rows)
+    return finish_message(w, sp)
+}
+
+sync(w: *Buf) -> string {
+    sp = begin_message(w, 83)             // 'S'
+    return finish_message(w, sp)
+}
+
+flush(w: *Buf) -> string {
+    sp = begin_message(w, 72)             // 'H'
+    return finish_message(w, sp)
+}
+
+// Close a statement ('S') or a portal ('P').
+close(w: *Buf, object_type: int, name: string) -> string {
+    sp = begin_message(w, 67)             // 'C'
+    put_u8(w, object_type)
+    put_cstr(w, name)
+    return finish_message(w, sp)
+}
+
+terminate(w: *Buf) -> string {
+    sp = begin_message(w, 88)             // 'X'
+    return finish_message(w, sp)
+}
+
+// ---- backend messages, encoded (for tests) ----
+
+fn auth(w: *Buf, t: int) -> int {
+    sp = begin_message(w, 82)             // 'R'
+    put_u32(w, t)
+    return sp
+}
+
+authentication_ok(w: *Buf) -> string { return finish_message(w, auth(w, AUTH_OK)) }
+
+authentication_md5_password(w: *Buf, salt: byte[]) -> string {
+    sp = auth(w, AUTH_MD5_PASSWORD)
+    put_raw(w, salt)
+    return finish_message(w, sp)
+}
+
+authentication_sasl(w: *Buf, mechanisms: string[]) -> string {
+    sp = auth(w, AUTH_SASL)
+    for m in mechanisms { put_cstr(w, m) }
+    put_u8(w, 0)
+    return finish_message(w, sp)
+}
+
+authentication_sasl_continue(w: *Buf, data: string) -> string {
+    sp = auth(w, AUTH_SASL_CONTINUE)
+    put_raw(w, string.bytes(data))
+    return finish_message(w, sp)
+}
+
+authentication_sasl_final(w: *Buf, data: string) -> string {
+    sp = auth(w, AUTH_SASL_FINAL)
+    put_raw(w, string.bytes(data))
+    return finish_message(w, sp)
+}
+
+row_description(w: *Buf, fields: FieldDescription[]) -> string {
+    if fields.len > 65535 { return "too many fields" }
+    sp = begin_message(w, 84)             // 'T'
+    put_u16(w, fields.len)
+    for f in fields {
+        put_cstr(w, f.name)
+        put_u32(w, f.table_oid)
+        put_u16(w, f.table_attribute_number)
+        put_u32(w, f.data_type_oid)
+        put_u16(w, f.data_type_size)
+        put_i32(w, f.type_modifier)
+        put_u16(w, f.format)
+    }
+    return finish_message(w, sp)
+}
+
+data_row(w: *Buf, values: string[], nulls: bool[]) -> string {
+    if values.len > 65535 { return "too many values" }
+    sp = begin_message(w, 68)             // 'D'
+    put_u16(w, values.len)
+    i = 0
+    while i < values.len {
+        if i < nulls.len && nulls[i] {
+            put_i32(w, -1)
+        } else {
+            put_i32(w, string.length(values[i]))
+            put_raw(w, string.bytes(values[i]))
+        }
+        i = i + 1
+    }
+    return finish_message(w, sp)
+}
+
+command_complete(w: *Buf, tag: string) -> string {
+    sp = begin_message(w, 67)             // 'C'
+    put_cstr(w, tag)
+    return finish_message(w, sp)
+}
+
+ready_for_query(w: *Buf, tx_status: int) -> string {
+    sp = begin_message(w, 90)             // 'Z'
+    put_u8(w, tx_status)
+    return finish_message(w, sp)
+}
+
+// ErrorResponse from field-code/value pairs, e.g. ["S", "ERROR", "C", "42601", ...].
+error_response(w: *Buf, pairs: string[]) -> string {
+    sp = begin_message(w, 69)             // 'E'
+    i = 0
+    while i + 1 < pairs.len {
+        put_u8(w, string.bytes(pairs[i])[0])
+        put_cstr(w, pairs[i + 1])
+        i = i + 2
+    }
+    put_u8(w, 0)
+    return finish_message(w, sp)
+}
+
+parameter_status(w: *Buf, name: string, value: string) -> string {
+    sp = begin_message(w, 83)             // 'S'
+    put_cstr(w, name)
+    put_cstr(w, value)
+    return finish_message(w, sp)
+}
+
+backend_key_data(w: *Buf, pid: long, secret: long) -> string {
+    sp = begin_message(w, 75)             // 'K'
+    put_u32(w, pid)
+    put_u32(w, secret)
+    return finish_message(w, sp)
+}
+
+empty_query_response(w: *Buf) -> string { return finish_message(w, begin_message(w, 73)) }
+parse_complete(w: *Buf) -> string { return finish_message(w, begin_message(w, 49)) }
+bind_complete(w: *Buf) -> string { return finish_message(w, begin_message(w, 50)) }
+
+// ---- backend messages, decoded ----
+
+struct FieldDescription {
+    name: string
+    table_oid: long
+    table_attribute_number: int
+    data_type_oid: long
+    data_type_size: int
+    type_modifier: long
+    format: int
+}
+
+new_field(name: string, data_type_oid: long) -> FieldDescription {
+    return FieldDescription { name: name, table_oid: 0, table_attribute_number: 0, data_type_oid: data_type_oid, data_type_size: -1, type_modifier: -1, format: 0 }
+}
+
+// One backend message. `kind` is the type byte; the fields of that kind
+// are set:
+//   'R' auth_type, salt (MD5: 4 bytes), mechanisms (SASL), data (SASL
+//       continue / final)
+//   'K' pid, secret_key           'S' name, value         'Z' tx_status
+//   'T' fields                    'D' values, nulls       'C' tag
+//   'E' / 'N' severity ... routine (the ErrorResponse fields)
+//   't' param_oids                'A' pid, name (channel), value (payload)
+//   'v' newest_minor, unrecognized
+//   '1' '2' '3' 'I' 'n' 's'       no fields
+struct Msg {
+    kind: int
+    auth_type: int
+    salt: byte[]
+    mechanisms: string[]
+    data: string
+    pid: long
+    secret_key: byte[]
+    name: string
+    value: string
+    tx_status: int
+    fields: FieldDescription[]
+    values: string[]
+    nulls: bool[]
+    tag: string
+    param_oids: long[]
+    newest_minor: long
+    unrecognized: string[]
+    // ErrorResponse / NoticeResponse
+    severity: string
+    severity_unlocalized: string
+    code: string
+    text: string               // the 'M' field (Go's Message; `message` is a keyword here)
+    detail: string
+    hint: string
+    position: int
+    internal_position: int
+    internal_query: string
+    where_: string
+    schema_name: string
+    table_name: string
+    column_name: string
+    data_type_name: string
+    constraint_name: string
+    file: string
+    line: int
+    routine: string
+}
+
+fn new_msg(kind: int) -> *Msg {
+    m = heap.new(Msg)
+    m.kind = kind
+    m.data = ""
+    m.name = ""
+    m.value = ""
+    m.tag = ""
+    m.severity = ""
+    m.severity_unlocalized = ""
+    m.code = ""
+    m.text = ""
+    m.detail = ""
+    m.hint = ""
+    m.internal_query = ""
+    m.where_ = ""
+    m.schema_name = ""
+    m.table_name = ""
+    m.column_name = ""
+    m.data_type_name = ""
+    m.constraint_name = ""
+    m.file = ""
+    m.routine = ""
+    return m
+}
+
+fn index_nul(b: byte[], from: int) -> int {
+    i = from
+    while i < b.len {
+        if b[i] == 0 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn str_of(b: byte[], from: int, to: int) -> string {
+    if to <= from { return "" }
+    return bytes.string_from_slice(b[from..to])
+}
+
+fn copy_of(b: byte[], from: int, to: int) -> byte[] {
+    byte[] out = []
+    i = from
+    while i < to {
+        out.push(b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn invalid(what: string) -> string { return "${what} body is invalid " }
+fn bad_len(what: string, want: int, got: int) -> string {
+    return "${what} body must have length of ${want}, but it is ${got}"
+}
+
+fn decode_auth(m: *Msg, b: byte[]) -> string {
+    if b.len < 4 { return "authentication message too short" }
+    t = get_u32(b, 0) as int
+    m.auth_type = t
+    if t == AUTH_OK || t == AUTH_CLEARTEXT_PASSWORD {
+        if b.len != 4 { return bad_len("AuthenticationOk", 4, b.len) }
+        return ""
+    }
+    if t == AUTH_MD5_PASSWORD {
+        if b.len != 8 { return bad_len("AuthenticationMD5Password", 8, b.len) }
+        m.salt = copy_of(b, 4, 8)
+        return ""
+    }
+    if t == AUTH_SASL {
+        rest = 4
+        while b.len - rest > 1 {
+            idx = index_nul(b, rest)
+            if idx < 0 { return "AuthenticationSASL body is invalid unterminated string" }
+            m.mechanisms.push(str_of(b, rest, idx))
+            rest = idx + 1
+        }
+        return ""
+    }
+    if t == AUTH_SASL_CONTINUE || t == AUTH_SASL_FINAL {
+        m.data = str_of(b, 4, b.len)
+        return ""
+    }
+    if t == AUTH_GSS || t == AUTH_GSS_CONT { return "GSS authentication is not supported" }
+    if t == AUTH_SCM_CREDS { return "AuthTypeSCMCreds is unimplemented" }
+    if t == AUTH_SSPI { return "AuthTypeSSPI is unimplemented" }
+    return "unknown authentication type: ${t}"
+}
+
+fn decode_error_fields(m: *Msg, b: byte[]) -> string {
+    i = 0
+    while true {
+        if i >= b.len { return "EOF" }
+        k = b[i] as int
+        if k == 0 { return "" }
+        end = index_nul(b, i + 1)
+        if end < 0 { return "EOF" }
+        v = str_of(b, i + 1, end)
+        i = end + 1
+        if k == 83 { m.severity = v }                  // S
+        else if k == 86 { m.severity_unlocalized = v } // V
+        else if k == 67 { m.code = v }                 // C
+        else if k == 77 { m.text = v }                 // M
+        else if k == 68 { m.detail = v }               // D
+        else if k == 72 { m.hint = v }                 // H
+        else if k == 80 { m.position = atoi(v) }       // P
+        else if k == 112 { m.internal_position = atoi(v) } // p
+        else if k == 113 { m.internal_query = v }      // q
+        else if k == 87 { m.where_ = v }               // W
+        else if k == 115 { m.schema_name = v }         // s
+        else if k == 116 { m.table_name = v }          // t
+        else if k == 99 { m.column_name = v }          // c
+        else if k == 100 { m.data_type_name = v }      // d
+        else if k == 110 { m.constraint_name = v }     // n
+        else if k == 70 { m.file = v }                 // F
+        else if k == 76 { m.line = atoi(v) }           // L
+        else if k == 82 { m.routine = v }              // R
+    }
+}
+
+fn atoi(s: string) -> int {
+    v, err = string.to_int(s)
+    if err != "" { return 0 }
+    return v
+}
+
+fn decode_row_description(m: *Msg, b: byte[]) -> string {
+    if b.len < 2 { return invalid("RowDescription") }
+    n = get_u16(b, 0)
+    rp = 2
+    i = 0
+    while i < n {
+        idx = index_nul(b, rp)
+        if idx < 0 { return invalid("RowDescription") }
+        name = str_of(b, rp, idx)
+        rp = idx + 1
+        if b.len - rp < 18 { return invalid("RowDescription") }
+        f = FieldDescription {
+            name: name,
+            table_oid: get_u32(b, rp),
+            table_attribute_number: get_u16(b, rp + 4),
+            data_type_oid: get_u32(b, rp + 6),
+            data_type_size: get_u16(b, rp + 10),
+            type_modifier: get_i32(b, rp + 12),
+            format: get_u16(b, rp + 16)
+        }
+        if f.data_type_size >= 32768 { f.data_type_size = f.data_type_size - 65536 }
+        m.fields.push(f)
+        rp = rp + 18
+        i = i + 1
+    }
+    return ""
+}
+
+fn decode_data_row(m: *Msg, b: byte[]) -> string {
+    if b.len < 2 { return invalid("DataRow") }
+    n = get_u16(b, 0)
+    rp = 2
+    i = 0
+    while i < n {
+        if b.len - rp < 4 { return invalid("DataRow") }
+        vlen = get_i32(b, rp) as int
+        rp = rp + 4
+        if vlen == -1 {
+            m.values.push("")
+            m.nulls.push(true)
+        } else {
+            if vlen < 0 || b.len - rp < vlen { return invalid("DataRow") }
+            m.values.push(str_of(b, rp, rp + vlen))
+            m.nulls.push(false)
+            rp = rp + vlen
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn decode_cstr_body(b: byte[], what: string) -> (string, string) {
+    idx = index_nul(b, 0)
+    if idx != b.len - 1 { return "", invalid(what) }
+    return str_of(b, 0, idx), ""
+}
+
+// Decode one message body of type t (pgx's Frontend.Receive switch and the
+// messages' Decode methods).
+decode(t: int, b: byte[]) -> (*Msg, string) {
+    m = new_msg(t)
+    err = ""
+    if t == 82 { err = decode_auth(m, b) }                       // R
+    else if t == 49 || t == 50 || t == 51 || t == 73 || t == 110 || t == 115 {
+        // ParseComplete, BindComplete, CloseComplete, EmptyQueryResponse, NoData, PortalSuspended
+        if b.len != 0 { err = bad_len("message", 0, b.len) }
+    }
+    else if t == 67 {                                             // C CommandComplete
+        tag, e = decode_cstr_body(b, "CommandComplete")
+        m.tag = tag
+        err = e
+    }
+    else if t == 68 { err = decode_data_row(m, b) }              // D
+    else if t == 69 || t == 78 { err = decode_error_fields(m, b) } // E, N
+    else if t == 75 {                                             // K BackendKeyData
+        if b.len < 8 { err = bad_len("BackendKeyData", 8, b.len) } else {
+            m.pid = get_u32(b, 0)
+            m.secret_key = copy_of(b, 4, b.len)
+        }
+    }
+    else if t == 83 {                                             // S ParameterStatus
+        i1 = index_nul(b, 0)
+        i2 = -1
+        if i1 >= 0 { i2 = index_nul(b, i1 + 1) }
+        if i1 < 0 || i2 < 0 { err = invalid("ParameterStatus") } else {
+            m.name = str_of(b, 0, i1)
+            m.value = str_of(b, i1 + 1, i2)
+        }
+    }
+    else if t == 84 { err = decode_row_description(m, b) }       // T
+    else if t == 90 {                                             // Z ReadyForQuery
+        if b.len != 1 { err = bad_len("ReadyForQuery", 1, b.len) } else { m.tx_status = b[0] as int }
+    }
+    else if t == 116 {                                            // t ParameterDescription
+        if b.len < 2 { err = invalid("ParameterDescription") } else {
+            n = (b.len - 2) / 4
+            i = 0
+            while i < n {
+                m.param_oids.push(get_u32(b, 2 + i * 4))
+                i = i + 1
+            }
+        }
+    }
+    else if t == 65 {                                             // A NotificationResponse
+        if b.len < 4 { err = invalid("NotificationResponse") } else {
+            m.pid = get_u32(b, 0)
+            i1 = index_nul(b, 4)
+            i2 = -1
+            if i1 >= 0 { i2 = index_nul(b, i1 + 1) }
+            if i1 < 0 || i2 < 0 { err = invalid("NotificationResponse") } else {
+                m.name = str_of(b, 4, i1)
+                m.value = str_of(b, i1 + 1, i2)
+            }
+        }
+    }
+    else if t == 118 {                                            // v NegotiateProtocolVersion
+        if b.len < 8 { err = bad_len("NegotiateProtocolVersion", 8, b.len) } else {
+            m.newest_minor = get_u32(b, 0)
+            count = get_u32(b, 4)
+            rp = 8
+            k = 0
+            while k < count && err == "" {
+                end = index_nul(b, rp)
+                if end < 0 { err = invalid("NegotiateProtocolVersion") } else {
+                    m.unrecognized.push(str_of(b, rp, end))
+                    rp = end + 1
+                }
+                k = k + 1
+            }
+        }
+    }
+    else if t == 71 || t == 72 || t == 87 || t == 100 || t == 99 {
+        err = "the COPY protocol is not supported"
+    }
+    else if t == 86 { err = "FunctionCallResponse is not supported" }
+    else { err = "unknown message type: ${string.from_char(t)}" }
+    if err != "" { return null, err }
+    return m, ""
+}
+
+// ---- the decoder: pgx's Frontend.Receive (next_message) over a chunkreader ----
+//
+// Bytes are fed as they arrive (feed); next_message returns the next whole
+// message, or (null, "") when more bytes are needed, so a message split
+// across reads, even inside its header, comes out whole (pgx's
+// partialMsg).
+
+struct Decoder {
+    buf: byte[]
+    pos: int
+    max_body_len: int     // 0: no limit
+}
+
+new_decoder() -> *Decoder {
+    d = heap.new(Decoder)
+    d.pos = 0
+    d.max_body_len = 0
+    return d
+}
+
+set_max_body_len(d: *Decoder, n: int) { d.max_body_len = n }
+
+// Bytes received and not yet decoded.
+pending(d: *Decoder) -> int { return d.buf.len - d.pos }
+
+feed(d: *Decoder, data: byte[]) {
+    if d.pos > 0 && d.pos >= d.buf.len {
+        byte[] fresh = []
+        d.buf = fresh
+        d.pos = 0
+    } else if d.pos > 65536 {
+        rest = copy_of(d.buf, d.pos, d.buf.len)
+        d.buf = rest
+        d.pos = 0
+    }
+    for c in data { d.buf.push(c) }
+}
+
+// The next message: (msg, ""), (null, "") when the bytes so far end
+// mid-message, or (null, error) for a malformed one.
+next_message(d: *Decoder) -> (*Msg, string) {
+    avail = d.buf.len - d.pos
+    if avail < 5 { return null, "" }
+    t = d.buf[d.pos] as int
+    mlen = get_i32(d.buf, d.pos + 1)
+    if mlen < 4 { return null, "invalid message length: ${mlen}" }
+    body_len = (mlen - 4) as int
+    if d.max_body_len > 0 && body_len > d.max_body_len {
+        return null, "invalid body length: expected at most ${d.max_body_len}, but got ${body_len}"
+    }
+    if avail < 5 + body_len { return null, "" }
+    start = d.pos + 5
+    body = copy_of(d.buf, start, start + body_len)
+    d.pos = start + body_len
+    return decode(t, body)
+}

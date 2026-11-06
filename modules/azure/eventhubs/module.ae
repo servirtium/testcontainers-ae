@@ -1,0 +1,464 @@
+// Ported from testcontainers-go modules/azure/eventhubs/eventhubs.go,
+// options.go and config.go
+//
+// modules.azure.eventhubs: the Azure Event Hubs emulator, with the Azurite
+// container it needs (modules.azurite) on a network of its own.
+//
+//     import modules.azure.eventhubs
+//
+//     e, err = eventhubs.run("mcr.microsoft.com/azure-messaging/eventhubs-emulator:2.1.0") {
+//         accept_eula()
+//         azurite_image("mcr.microsoft.com/azure-storage/azurite:3.36.0")
+//         config_file("modules/azure/eventhubs/testdata/eventhubs_config.json")
+//     }
+//     defer eventhubs.terminate(e)       // the emulator, then the Azurite and network it owns
+//     cs, _ = eventhubs.connection_string(e)
+//
+// An Azurite you already run can be shared instead (Go's WithAzuriteContainer):
+//
+//     azurite_container(azc, net.name, "azurite")
+//
+// then the caller owns Azurite and the network, and terminate leaves them alone.
+// The container itself is not kept (Go only uses it for the AzuriteContainer
+// accessor, which is the module's own Azurite or null).
+//
+// azurite_image / azurite_env are Go's WithAzurite(img, opts...) (a block
+// cannot carry arbitrary options, so the ones the Go tests use); it and
+// azurite_container are mutually exclusive, and run reports the conflict (and
+// a null container or empty network name) as "eventhubs option: ...".
+//
+// The emulator's config can be a text (config), a file (config_file) or built
+// here and passed with config_object, Go's NewConfig / WithConfigObject:
+//
+//     cfg = eventhubs.config_new()
+//     ns = eventhubs.config_namespace(cfg, eventhubs.EMULATOR_NAMESPACE_NAME)
+//     eh = eventhubs.config_entity(ns, "eh1", 2)
+//     eventhubs.config_consumer_group(eh, "cg1")
+//     err = eventhubs.config_validate(cfg)       // "" or the errors, one a line
+//     eventhubs.run(img) { accept_eula(); config_object(cfg) }
+//
+// Errors found while building (empty names, partition counts outside 1-32)
+// are kept on the config and come back from config_validate with the
+// whole-tree ones (one namespace, at most 10 entities, 20 consumer groups,
+// unique names), as errors.Join does in Go.
+//
+// Status: compile-checked only (alpha; no engine was used to port it).
+//
+// Not ported: Go's MustNewConfig (a panic), and the Azure Event Hubs SDK
+// code of its docs.
+
+import std.string
+import std.json
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+import testcontainers.network
+import modules.azurite
+
+exports(
+    EventHubsContainer, run, terminate, connection_string, connection_string_for,
+    azurite_container_of, accept_eula, azurite_image, azurite_env, azurite_container,
+    config, config_file, config_object,
+    Config, NamespaceConfig, EntityConfig, config_new, config_logging_type,
+    config_namespace, config_namespace_type, config_entity, config_consumer_group,
+    config_validate, config_json,
+    PORT, HTTP_PORT, CONFIG_FILE, EMULATOR_NAMESPACE_NAME, DEFAULT_AZURITE_IMAGE,
+    eventhubs_request_new, eventhubs_request_free
+)
+
+const PORT = "5672/tcp"
+const HTTP_PORT = "5300/tcp"
+const ALIAS_EVENTHUBS = "eventhubs"
+const ALIAS_AZURITE = "azurite"
+const DEFAULT_AZURITE_IMAGE = "mcr.microsoft.com/azure-storage/azurite:3.36.0"
+const CONFIG_FILE = "/Eventhubs_Emulator/ConfigFiles/Config.json"
+
+// The emulator supports exactly one namespace and its name cannot change.
+const EMULATOR_NAMESPACE_NAME = "emulatorns1"
+const MAX_ENTITIES_PER_NAMESPACE = 10
+const MAX_PARTITION_COUNT = 32
+const MAX_CONSUMER_GROUPS_PER_ENTITY = 20
+
+const SET_AZURITE_IMAGE = "eventhubs.azurite_image"
+const SET_AZURITE_ENV = "eventhubs.azurite_env"      // KEY=value, one a line
+const SET_EXT_NET = "eventhubs.azurite_net"          // WithAzuriteContainer's network
+const SET_EXT_ALIAS = "eventhubs.azurite_alias"
+const SET_OWNED_OPT = "eventhubs.module_azurite"     // WithAzurite was used
+const SET_ERROR = "eventhubs.error"                  // the first option error
+
+struct EventHubsContainer {
+    container: *docker.Container
+    azurite: *docker.Container     // the module's own, null for a shared one
+    net: *docker.Network           // the module's own, null for a shared one
+    owned: bool
+}
+
+eventhubs_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.expose(r, HTTP_PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(PORT),
+        wait.for_listening_port(HTTP_PORT),
+        wait.for_http("/health") { with_port(HTTP_PORT); with_status(200) }
+    ]))
+    return r
+}
+
+eventhubs_request_free(p: ptr) { tc.request_free(p) }
+
+fn fail(_ctx: ptr, msg: string) {
+    if !tc.req_has_setting(_ctx, SET_ERROR) { tc.set_setting(_ctx, SET_ERROR, msg) }
+}
+
+// Go's WithAcceptEULA.
+accept_eula(_ctx: ptr) { tc.env(_ctx, "ACCEPT_EULA", "Y") }
+
+// Go's WithAzurite image: the Azurite the module starts for the emulator.
+azurite_image(_ctx: ptr, img: string) {
+    if tc.req_has_setting(_ctx, SET_EXT_NET) {
+        fail(_ctx, "eventhubs: WithAzurite and WithAzuriteContainer are mutually exclusive")
+        return
+    }
+    tc.set_setting(_ctx, SET_AZURITE_IMAGE, img)
+    tc.set_setting(_ctx, SET_OWNED_OPT, "1")
+}
+
+// An environment variable for the module's Azurite container (Go's
+// WithAzurite(img, testcontainers.WithEnv(...))); call it again for more.
+azurite_env(_ctx: ptr, key: string, value: string) {
+    if tc.req_has_setting(_ctx, SET_EXT_NET) {
+        fail(_ctx, "eventhubs: WithAzurite and WithAzuriteContainer are mutually exclusive")
+        return
+    }
+    line = "${key}=${value}"
+    if tc.req_has_setting(_ctx, SET_AZURITE_ENV) { line = "${tc.req_setting(_ctx, SET_AZURITE_ENV)}\n${line}" }
+    tc.set_setting(_ctx, SET_AZURITE_ENV, line)
+    tc.set_setting(_ctx, SET_OWNED_OPT, "1")
+}
+
+// Go's WithAzuriteContainer: share an Azurite you run, which is on the network
+// named net under alias ("" is "azurite"). The caller owns both.
+azurite_container(_ctx: ptr, azc: ptr, net: string, alias: string) {
+    if azc == null { fail(_ctx, "eventhubs: azurite container is nil"); return }
+    if string.length(net) == 0 { fail(_ctx, "eventhubs: docker network is nil"); return }
+    if tc.req_has_setting(_ctx, SET_OWNED_OPT) {
+        fail(_ctx, "eventhubs: WithAzuriteContainer and WithAzurite are mutually exclusive")
+        return
+    }
+    if tc.req_has_setting(_ctx, SET_EXT_NET) {
+        fail(_ctx, "eventhubs: WithAzuriteContainer called more than once")
+        return
+    }
+    a = alias
+    if string.length(a) == 0 { a = ALIAS_AZURITE }
+    tc.set_setting(_ctx, SET_EXT_NET, net)
+    tc.set_setting(_ctx, SET_EXT_ALIAS, a)
+}
+
+// Go's WithConfig from the JSON text.
+config(_ctx: ptr, content: string) { tc.file_content(_ctx, content, CONFIG_FILE, 420) }
+
+// Go's WithConfig from a file on the host.
+config_file(_ctx: ptr, host_path: string) { tc.file(_ctx, host_path, CONFIG_FILE, 420) }
+
+// Go's WithConfigObject: the config built with config_new (validated here).
+config_object(_ctx: ptr, cfg: *Config) {
+    if cfg == null { fail(_ctx, "eventhubs: config is nil"); return }
+    errs = config_validate(cfg)
+    if string.length(errs) > 0 { fail(_ctx, "eventhubs: invalid config: ${errs}"); return }
+    tc.file_content(_ctx, config_json(cfg), CONFIG_FILE, 420)
+}
+
+fn split_lines(s: string) -> string[] {
+    string[] out = []
+    if string.length(s) == 0 { return out }
+    rest = s
+    i = string.index_of(rest, "\n")
+    while i >= 0 {
+        out.push(string.substring(rest, 0, i))
+        rest = string.substring(rest, i + 1, string.length(rest))
+        i = string.index_of(rest, "\n")
+    }
+    out.push(rest)
+    return out
+}
+
+builder run(image: string) with eventhubs_request_new -> (*EventHubsContainer, string) {
+    r = _builder
+    if r == null { r = eventhubs_request_new() }
+    // the options first, as Go applies them, then the EULA
+    if tc.req_has_setting(r, SET_ERROR) {
+        msg = tc.req_setting(r, SET_ERROR)
+        eventhubs_request_free(r)
+        return null, "eventhubs option: ${msg}"
+    }
+    if string.to_upper(tc.req_env(r, "ACCEPT_EULA")) != "Y" {
+        eventhubs_request_free(r)
+        return null, "run eventhubs: EULA not accepted. Please use the accept_eula option to accept the EULA"
+    }
+
+    e = heap.new(EventHubsContainer)
+    e.container = null
+    e.azurite = null
+    e.net = null
+    e.owned = !tc.req_has_setting(r, SET_EXT_NET)
+
+    if tc.req_has_setting(r, SET_EXT_NET) {
+        // a shared Azurite: point the emulator at its alias, join its network
+        alias = tc.req_setting(r, SET_EXT_ALIAS)
+        tc.env(r, "BLOB_SERVER", alias)
+        tc.env(r, "METADATA_SERVER", alias)
+        tc.network_alias(r, tc.req_setting(r, SET_EXT_NET), ALIAS_EVENTHUBS)
+    } else {
+        // module-managed Azurite: a new network, Azurite first
+        aimg = DEFAULT_AZURITE_IMAGE
+        if tc.req_has_setting(r, SET_AZURITE_IMAGE) { aimg = tc.req_setting(r, SET_AZURITE_IMAGE) }
+        aenv = split_lines(tc.req_setting(r, SET_AZURITE_ENV))
+        net, nerr = network.new_random()
+        if nerr != "" {
+            eventhubs_request_free(r)
+            return null, "new azurite network: ${nerr}"
+        }
+        e.net = net
+        a, aerr = azurite.run(aimg) {
+            tc.network_alias(net.name, ALIAS_AZURITE)
+            for kv in aenv {
+                eq = string.index_of(kv, "=")
+                if eq > 0 { tc.env(string.substring(kv, 0, eq), string.substring(kv, eq + 1, string.length(kv))) }
+            }
+        }
+        e.azurite = a
+        if aerr != "" {
+            eventhubs_request_free(r)
+            terminate(e)
+            return null, "run azurite container: ${aerr}"
+        }
+        tc.env(r, "BLOB_SERVER", ALIAS_AZURITE)
+        tc.env(r, "METADATA_SERVER", ALIAS_AZURITE)
+        tc.network_alias(r, net.name, ALIAS_EVENTHUBS)
+    }
+
+    c, err = tc.run_request(r, image)
+    e.container = c
+    if err != "" { return e, "run eventhubs: ${err}" }
+    return e, ""
+}
+
+// Go's Terminate: the emulator, and, only when this module created them, the
+// Azurite container and its network. A shared Azurite and network are left
+// untouched. Null-safe. Returns the errors joined.
+terminate(e: *EventHubsContainer) -> string {
+    if e == null { return "" }
+    errs = ""
+    if e.container != null {
+        err = tc.terminate(e.container)
+        if err != "" { errs = "${errs}terminate eventhubs container: ${err}; " }
+    }
+    if e.owned {
+        if e.azurite != null {
+            err = tc.terminate(e.azurite)
+            if err != "" { errs = "${errs}terminate azurite container: ${err}; " }
+        }
+        if e.net != null {
+            err = network.remove(e.net)
+            if err != "" { errs = "${errs}remove azurite network: ${err}; " }
+        }
+    }
+    return errs
+}
+
+// The Azurite container the module started (Go's AzuriteContainer); null when
+// a shared one was given.
+azurite_container_of(e: *EventHubsContainer) -> *docker.Container { return e.azurite }
+
+// Endpoint=sb://<host:port>;SharedAccessKeyName=<azurite account>;SharedAccessKey=<azurite key>;UseDevelopmentEmulator=true;
+connection_string_for(host_port: string) -> string {
+    return "Endpoint=sb://${host_port};SharedAccessKeyName=${azurite.ACCOUNT_NAME};SharedAccessKey=${azurite.ACCOUNT_KEY};UseDevelopmentEmulator=true;"
+}
+
+connection_string(e: *EventHubsContainer) -> (string, string) {
+    ep, err = tc.endpoint(e.container, PORT, "")
+    if err != "" { return "", "port endpoint: ${err}" }
+    return connection_string_for(ep), ""
+}
+
+// ---- the emulator config (Go's Config, NewConfig and its options) ----
+
+struct EntityConfig {
+    cfg: *Config
+    name: string
+    partitions: int
+    groups: string[]
+}
+
+struct NamespaceConfig {
+    cfg: *Config
+    kind: string
+    name: string
+    entities: ptr[]
+}
+
+struct Config {
+    logging: string
+    namespaces: ptr[]
+    errs: string[]
+}
+
+// Go's NewConfig defaults: logging type "File", no namespaces.
+config_new() -> *Config {
+    c = heap.new(Config)
+    c.logging = "File"
+    return c
+}
+
+// Go's WithLoggingType.
+config_logging_type(cfg: *Config, t: string) {
+    if string.length(t) == 0 {
+        cfg.errs.push("config: logging type is empty")
+        return
+    }
+    cfg.logging = t
+}
+
+// Go's WithNamespace: appends a namespace of type "EventHub" and returns it
+// for config_entity. An empty name is an error and the namespace (still
+// returned, so later calls are safe) is not part of the config.
+config_namespace(cfg: *Config, name: string) -> *NamespaceConfig {
+    ns = heap.new(NamespaceConfig)
+    ns.cfg = cfg
+    ns.kind = "EventHub"
+    ns.name = name
+    if string.length(name) == 0 {
+        cfg.errs.push("config: namespace name is empty")
+        return ns
+    }
+    cfg.namespaces.push(ns as ptr)
+    return ns
+}
+
+// Go's WithNamespaceType: override the type ("" is an error).
+config_namespace_type(ns: *NamespaceConfig, t: string) {
+    if string.length(t) == 0 {
+        ns.cfg.errs.push("config: namespace type is empty")
+        return
+    }
+    ns.kind = t
+}
+
+// Go's WithEntity: an event hub of 1-32 partitions. An empty name or a bad
+// count is an error and the entity (still returned) is not part of the config.
+config_entity(ns: *NamespaceConfig, name: string, partitions: int) -> *EntityConfig {
+    e = heap.new(EntityConfig)
+    e.cfg = ns.cfg
+    e.name = name
+    e.partitions = partitions
+    if string.length(name) == 0 {
+        ns.cfg.errs.push("config: entity name is empty in namespace \"${ns.name}\"")
+        return e
+    }
+    if partitions < 1 || partitions > MAX_PARTITION_COUNT {
+        ns.cfg.errs.push("config: entity \"${name}\": partition count must be 1-${MAX_PARTITION_COUNT}, got ${partitions}")
+        return e
+    }
+    ns.entities.push(e as ptr)
+    return e
+}
+
+// Go's WithConsumerGroup.
+config_consumer_group(e: *EntityConfig, name: string) {
+    if string.length(name) == 0 {
+        e.cfg.errs.push("config: consumer group name is empty in entity \"${e.name}\"")
+        return
+    }
+    e.groups.push(name)
+}
+
+fn has_name(seen: string[], name: string) -> bool {
+    for s in seen { if s == name { return true } }
+    return false
+}
+
+// The errors found while building plus Go's whole-tree validation, one per
+// line; "" when the config is valid.
+config_validate(cfg: *Config) -> string {
+    string[] errs = []
+    for e in cfg.errs { errs.push(e) }
+    if string.length(cfg.logging) == 0 { errs.push("config: logging type is empty") }
+    if cfg.namespaces.len > 1 {
+        errs.push("config: emulator supports only 1 namespace, got ${cfg.namespaces.len}")
+    }
+    for np in cfg.namespaces {
+        ns = np as *NamespaceConfig
+        if string.to_lower(ns.name) != string.to_lower(EMULATOR_NAMESPACE_NAME) {
+            errs.push("config: namespace name \"${ns.name}\" is not valid: emulator preset namespace name cannot be changed from \"${EMULATOR_NAMESPACE_NAME}\"")
+        }
+        if ns.entities.len > MAX_ENTITIES_PER_NAMESPACE {
+            errs.push("config: namespace \"${ns.name}\" has ${ns.entities.len} entities, emulator limit is ${MAX_ENTITIES_PER_NAMESPACE}")
+        }
+        string[] entity_names = []
+        for ep in ns.entities {
+            en = ep as *EntityConfig
+            if has_name(entity_names, en.name) {
+                errs.push("config: namespace \"${ns.name}\" duplicate entity name \"${en.name}\"")
+            }
+            entity_names.push(en.name)
+            if en.groups.len > MAX_CONSUMER_GROUPS_PER_ENTITY {
+                errs.push("config: namespace \"${ns.name}\" entity \"${en.name}\" has ${en.groups.len} consumer groups, emulator limit is ${MAX_CONSUMER_GROUPS_PER_ENTITY}")
+            }
+            string[] group_names = []
+            for g in en.groups {
+                if has_name(group_names, g) {
+                    errs.push("config: namespace \"${ns.name}\" entity \"${en.name}\" duplicate consumer group name \"${g}\"")
+                }
+                group_names.push(g)
+            }
+        }
+    }
+    out = ""
+    for x in errs {
+        if string.length(out) > 0 { out = "${out}\n" }
+        out = "${out}${x}"
+    }
+    return out
+}
+
+// The config as the emulator reads it (Go's json.Marshal of Config); the
+// partition count is a JSON string, as the emulator's schema has it.
+config_json(cfg: *Config) -> string {
+    root = json.obj()
+    uc = json.obj()
+    nsl = json.arr()
+    for np in cfg.namespaces {
+        ns = np as *NamespaceConfig
+        no = json.obj()
+        json.set(no, "Type", json.str(ns.kind))
+        json.set(no, "Name", json.str(ns.name))
+        ents = json.arr()
+        for ep in ns.entities {
+            en = ep as *EntityConfig
+            eo = json.obj()
+            json.set(eo, "Name", json.str(en.name))
+            json.set(eo, "PartitionCount", json.str("${en.partitions}"))
+            cgs = json.arr()
+            for g in en.groups {
+                go = json.obj()
+                json.set(go, "Name", json.str(g))
+                json.push(cgs, go)
+            }
+            json.set(eo, "ConsumerGroups", cgs)
+            json.push(ents, eo)
+        }
+        json.set(no, "Entities", ents)
+        json.push(nsl, no)
+    }
+    json.set(uc, "NamespaceConfig", nsl)
+    lo = json.obj()
+    json.set(lo, "Type", json.str(cfg.logging))
+    json.set(uc, "LoggingConfig", lo)
+    json.set(root, "UserConfig", uc)
+    text, serr = json.encode(root)
+    json.free(root)
+    if serr != "" { return "" }
+    return text
+}

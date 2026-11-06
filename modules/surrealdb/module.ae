@@ -1,0 +1,82 @@
+// Ported from testcontainers-go modules/surrealdb/surrealdb.go
+//
+// modules.surrealdb: a SurrealDB container (in-memory, `surreal start`).
+//
+//     import modules.surrealdb
+//
+//     c, err = surrealdb.run("surrealdb/surrealdb:v1.1.1") {
+//         authentication()
+//         username("root"); password("root")
+//     }
+//     defer tc.terminate(c)
+//     ws, _ = surrealdb.url(c)            // "ws://localhost:32771/rpc"
+//     http, _ = surrealdb.sql_url(c)      // "http://localhost:32771/sql"
+//
+// Go's SurrealDBContainer only embeds the container, so run returns the
+// plain *docker.Container. sql_url is an addition: the HTTP /sql endpoint
+// the Go test derives from the WebSocket URL by hand. Not ported: the
+// deprecated RunContainer, and the examples/ child module (it uses the Go
+// SurrealDB SDK).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, url, sql_url, username, password, authentication, strict_mode,
+    allow_all_caps, PORT, DEFAULT_USER, DEFAULT_PASSWORD,
+    surrealdb_request_new, surrealdb_request_free
+)
+
+const PORT = "8000/tcp"
+const DEFAULT_USER = "root"
+const DEFAULT_PASSWORD = "root"
+
+// Go's moduleOpts: env defaults, the port, wait for the web server log line,
+// and the command "start".
+surrealdb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.env(r, "SURREAL_USER", DEFAULT_USER)
+    tc.env(r, "SURREAL_PASS", DEFAULT_PASSWORD)
+    tc.env(r, "SURREAL_AUTH", "false")
+    tc.env(r, "SURREAL_STRICT", "false")
+    tc.env(r, "SURREAL_CAPS_ALLOW_ALL", "false")
+    tc.env(r, "SURREAL_PATH", "memory")
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_log("Started web server on "))
+    tc.cmd(r, ["start"])
+    return r
+}
+
+surrealdb_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithUsername / WithPassword: the superuser created at start.
+username(_ctx: ptr, user: string) { tc.env(_ctx, "SURREAL_USER", user) }
+password(_ctx: ptr, pw: string) { tc.env(_ctx, "SURREAL_PASS", pw) }
+// Go's WithAuthentication, WithStrictMode, WithAllowAllCaps.
+authentication(_ctx: ptr) { tc.env(_ctx, "SURREAL_AUTH", "true") }
+strict_mode(_ctx: ptr) { tc.env(_ctx, "SURREAL_STRICT", "true") }
+allow_all_caps(_ctx: ptr) { tc.env(_ctx, "SURREAL_CAPS_ALLOW_ALL", "true") }
+
+builder run(image: string) with surrealdb_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = surrealdb_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run surrealdb: ${err}" }
+    return c, ""
+}
+
+// "ws://host:port/rpc" (Go's URL).
+url(c: *docker.Container) -> (string, string) {
+    ep, err = tc.endpoint(c, PORT, "ws")
+    if err != "" { return "", err }
+    return "${ep}/rpc", ""
+}
+
+// "http://host:port/sql": the same server's HTTP query endpoint.
+sql_url(c: *docker.Container) -> (string, string) {
+    ep, err = tc.endpoint(c, PORT, "http")
+    if err != "" { return "", err }
+    return "${ep}/sql", ""
+}

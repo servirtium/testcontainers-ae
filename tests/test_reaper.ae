@@ -1,0 +1,146 @@
+// Ported from testcontainers-go reaper_test.go, reaper_cleanup_test.go, podman_test.go
+//
+// Ryuk: started once per session with the engine's socket, kept connected;
+// a process that dies without cleaning up has its containers and networks
+// removed after it is gone. And the TESTCONTAINERS_RYUK_DISABLED path.
+
+import std.spec
+import std.string
+import std.os
+import std.list
+import std.json
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+
+fn field(out: string, key: string) -> string {
+    lines = string.split(out, "\n")
+    n = string.string_array_size(lines)
+    v = ""
+    i = 0
+    while i < n {
+        l = string.string_array_get(lines, i)
+        if string.starts_with(l, "${key} ") == 1 { v = string.substring(l, string.length(key) + 1, string.length(l)) }
+        i = i + 1
+    }
+    string.string_array_free(lines)
+    return v
+}
+
+// Run a fixture in a child process with extra environment.
+fn child(fixture: string, envs: string) -> (string, int) {
+    argv = list.new()
+    list.add(argv, "-c")
+    list.add(argv, "${envs} ae run tests/fixtures/${fixture} 2>&1")
+    out, code, err = os.run_capture("/bin/sh", argv, null)
+    list.free(argv)
+    if err != "" { return "spawn: ${err}", -1 }
+    return out, code
+}
+
+fn reaper_container(cl: *docker.Client, session: string) -> (*docker.Container, int) {
+    string[] want = []
+    want.push("${docker.LABEL_SESSION_ID}=${session}")
+    want.push("${docker.LABEL_RYUK}=true")
+    ids, _ = docker.list_containers(cl, want)
+    if ids.len == 0 { return null, 0 }
+    return docker.container_new(cl, ids[0], tc.RYUK_IMAGE), ids.len
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+    if docker.config().ryuk_disabled {
+        spec.skip_all_if(fw, 1, "TESTCONTAINERS_RYUK_DISABLED is set")
+        return spec.run_summary(fw)
+    }
+
+    spec.describe(fw, "the reaper") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("starts once per session, with the engine's socket, and stays connected") callback {
+            c1, err = tc.run("alpine:3") { cmd(["sleep", "300"]) }
+            testing.cleanup_container(c1)
+            spec.assert_ok(err, "the first container")
+            spec.assert_true(tc.reaper_running(), "a reaper connection")
+            c2, err2 = tc.run("alpine:3") { cmd(["sleep", "300"]) }
+            testing.cleanup_container(c2)
+            spec.assert_ok(err2, "the second container")
+            cl, _ = docker.client()
+            r, count = reaper_container(cl, tc.session_id())
+            spec.assert_eq(count, 1, "one reaper for the session")
+            if r == null { return }
+            doc, _ = docker.inspect(r)
+            hc, _ = json.object_get(doc, "HostConfig")
+            binds, _ = json.object_get(hc, "Binds")
+            bj, _ = json.encode(binds)
+            sock = docker.engine_socket_for_mounts(cl)
+            spec.assert_contains(bj, "${sock}:/var/run/docker.sock", "the engine socket is mounted")
+            if docker.is_podman(cl) {
+                pv, _ = json.object_get(hc, "Privileged")
+                spec.assert_eq(json.json_get_bool(pv), 1, "privileged on Podman")
+                spec.assert_false(string.starts_with(sock, "/var/folders") == 1, "the socket inside the machine, not the Mac's: ${sock}")
+            }
+            cfg, _ = json.object_get(doc, "Config")
+            lv, _ = json.object_get(cfg, "Labels")
+            lj, _ = json.encode(lv)
+            spec.assert_contains(lj, "\"org.testcontainers.reap\":\"false\"", "the reaper does not reap itself")
+            spec.assert_contains(lj, "\"org.testcontainers.ryuk\":\"true\"", "marked as the reaper")
+            json.free(doc)
+            st, _ = docker.state_of(r)
+            spec.assert_true(st.running, "the reaper is running")
+        }
+
+        spec.it("removes what a crashed process left, after it is gone") callback {
+            session = "tcae-crash-${string.substring(tc.session_id(), 0, 12)}"
+            out, code = child("leak_child.ae", "TESTCONTAINERS_SESSION_ID=${session}")
+            spec.assert_eq(code, 3, "the child crashed as planned (output: ${out})")
+            cid = field(out, "CONTAINER")
+            nid = field(out, "NETWORK")
+            spec.assert_str_eq(field(out, "REAPER"), "true", "the child had a reaper")
+            spec.assert_true(string.length(cid) > 0, "the child's container: ${out}")
+            if string.length(cid) == 0 { return }
+            cl, _ = docker.client()
+            leaked = docker.container_new(cl, cid, "")
+            _, ierr = docker.inspect(leaked)
+            spec.assert_ok(ierr, "the leaked container exists right after the crash")
+            // Ryuk waits ryuk.reconnection.timeout (10s) after the last
+            // connection closes, then removes everything with the labels.
+            t0 = os.now_monotonic_ms()
+            gone = false
+            while !gone && os.now_monotonic_ms() - t0 < 90000 {
+                _, e = docker.inspect(leaked)
+                if docker.is_not_found(e) { gone = true } else { sleep(1000) }
+            }
+            spec.assert_true(gone, "the leaked container was reaped")
+            net_gone = false
+            t1 = os.now_monotonic_ms()
+            while !net_gone && os.now_monotonic_ms() - t1 < 30000 {
+                _, ne = docker.inspect_network(cl, nid)
+                if docker.is_not_found(ne) { net_gone = true } else { sleep(1000) }
+            }
+            spec.assert_true(net_gone, "the leaked network was reaped")
+            // and the reaper went too (auto-remove once it has nothing to watch)
+            rgone = false
+            t2 = os.now_monotonic_ms()
+            while !rgone && os.now_monotonic_ms() - t2 < 60000 {
+                _, rc = reaper_container(cl, session)
+                if rc == 0 { rgone = true } else { sleep(1000) }
+            }
+            spec.assert_true(rgone, "the crashed session's reaper removed itself")
+        }
+
+        spec.it("is not started with TESTCONTAINERS_RYUK_DISABLED=true; terminate cleans up") callback {
+            session = "tcae-noryuk-${string.substring(tc.session_id(), 0, 12)}"
+            out, code = child("no_reaper_child.ae", "TESTCONTAINERS_RYUK_DISABLED=true TESTCONTAINERS_SESSION_ID=${session}")
+            spec.assert_eq(code, 0, "the child ran (output: ${out})")
+            spec.assert_str_eq(field(out, "REAPER"), "false", "no reaper connection")
+            spec.assert_str_eq(field(out, "SESSION_CONTAINERS"), "1", "only the test's container in the session")
+            spec.assert_str_eq(field(out, "REAP_LABEL"), "0", "no reap label without a reaper")
+            spec.assert_str_eq(field(out, "TERMINATE"), "''", "terminate")
+            spec.assert_str_eq(field(out, "AFTER"), "0", "nothing left")
+        }
+    }
+
+    return spec.run_summary(fw)
+}

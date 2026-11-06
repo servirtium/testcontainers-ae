@@ -1,0 +1,214 @@
+// Ported from testcontainers-go modules/etcd/etcd_test.go, etcd_unit_test.go
+//
+// A real etcd (v3 JSON gateway): POST /v3/kv/put then /v3/kv/range with
+// base64 keys, on one node and on a three-node cluster (each node read
+// through its own published client port), plus etcdctl member list through
+// exec, the data dir option, and the command line options in the container.
+
+import std.spec
+import std.string
+import std.encoding
+import std.json
+import std.http.client
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.etcd
+
+const IMAGE = "gcr.io/etcd-development/etcd:v3.5.14"
+
+// One HTTP request: (status, body, error). hdrs are "Name: value" lines.
+fn http_do(method: string, url: string, hdrs: string[], body: string) -> (int, string, string) {
+    req = client.request(method, url)
+    client.set_timeout(req, 15s)
+    for h in hdrs {
+        colon = string.index_of(h, ":")
+        client.set_header(req, string.substring(h, 0, colon), string.trim(string.substring(h, colon + 1, string.length(h))))
+    }
+    if string.length(body) > 0 { client.set_body(req, string.bytes(body), "application/json") }
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    st = client.response_status(r)
+    b = client.response_body(r)
+    client.response_free(r)
+    return st, b, ""
+}
+
+fn basic(user: string, pw: string) -> string {
+    return "Authorization: Basic ${encoding.base64_encode_padded(string.bytes("${user}:${pw}"))}"
+}
+// Run returns before the gateway is ready (as in Go), so retry for up to 15s.
+fn gateway(endpoint: string, body: string) -> (string, string) {
+    last = ""
+    tries = 0
+    while tries < 150 {
+        st, resp, err = http_do("POST", endpoint, [], body)
+        if err == "" && st == 200 { return resp, "" }
+        last = "status ${st}, error '${err}': ${resp}"
+        tries = tries + 1
+        sleep(100)
+    }
+    return "", last
+}
+
+fn b64(s: string) -> string { return encoding.base64_encode_padded(string.bytes(s)) }
+
+// Go's testPutGet: put through the first endpoint, read through every one.
+fn put_get(e: *etcd.EtcdContainer, want_endpoints: int) {
+    eps, err = etcd.client_endpoints(e)
+    spec.assert_ok(err, "client endpoints")
+    spec.assert_eq(eps.len, want_endpoints, "endpoint count")
+    if eps.len == 0 { return }
+    key = b64("sample_key")
+    value = b64("sample_value")
+    _p, perr = gateway("${eps[0]}/v3/kv/put", "{\"key\":\"${key}\",\"value\":\"${value}\"}")
+    spec.assert_ok(perr, "put")
+    for ep in eps {
+        resp, rerr = gateway("${ep}/v3/kv/range", "{\"key\":\"${key}\"}")
+        spec.assert_ok(rerr, "range through ${ep}")
+        spec.assert_contains(resp, "\"count\":\"1\"", "one key through ${ep}: ${resp}")
+        spec.assert_contains(resp, "\"key\":\"${key}\"", "the key")
+        spec.assert_contains(resp, "\"value\":\"${value}\"", "the value we put")
+    }
+}
+
+// The container's Config.Cmd, joined with spaces.
+fn container_cmd(c: *docker.Container) -> string {
+    doc, err = tc.inspect(c)
+    if err != "" { return "" }
+    cfg, _ = json.object_get(doc, "Config")
+    cmdv, _ = json.object_get(cfg, "Cmd")
+    out = ""
+    n = json.json_array_size(cmdv)
+    i = 0
+    while i < n {
+        v, _ = json.array_get(cmdv, i)
+        s, _ = json.get_string(v)
+        if string.length(out) > 0 { out = "${out} " }
+        out = "${out}${s}"
+        i = i + 1
+    }
+    json.free(doc)
+    return out
+}
+
+// The container's Config.Env, as JSON text.
+fn container_env(c: *docker.Container) -> string {
+    doc, err = tc.inspect(c)
+    if err != "" { return "" }
+    cfg, _ = json.object_get(doc, "Config")
+    ev, _ = json.object_get(cfg, "Env")
+    envs, _ = json.encode(ev)
+    json.free(doc)
+    return envs
+}
+
+// Register every container of the cluster, then its network, for cleanup.
+fn cleanup_etcd(e: *etcd.EtcdContainer) {
+    if e == null { return }
+    for ch in e.children { testing.cleanup_container((ch as *etcd.EtcdContainer).container) }
+    testing.cleanup_container(e.container)
+    testing.cleanup_network(e.net)
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/etcd") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("lists itself as a member (TestRun)") callback {
+            e, err = etcd.run(IMAGE)
+            cleanup_etcd(e)
+            spec.assert_ok(err, "etcd starts")
+            if err != "" { return }
+            // retry: the server is not ready when run returns
+            out = ""
+            code = 1
+            tries = 0
+            while tries < 100 && code != 0 {
+                code, out, _ = tc.exec(e.container, ["etcdctl", "member", "list"])
+                tries = tries + 1
+                if code != 0 { sleep(150) }
+            }
+            spec.assert_eq(code, 0, "etcdctl member list: ${out}")
+            spec.assert_contains(out, "default", "the member's name")
+        }
+
+        spec.it("runs with the data dir (TestRunWithDataDir)") callback {
+            e, err = etcd.run(IMAGE) { data_dir() }
+            cleanup_etcd(e)
+            spec.assert_ok(err, "etcd starts")
+            if err != "" { return }
+            spec.assert_contains(container_cmd(e.container), "--data-dir=/data.etcd", "the flag")
+            put_get(e, 1)
+            // the official image has no ls or chmod, so the data dir is checked
+            // by etcd's own state: the member list works with it
+            code, out, eerr = tc.exec(e.container, ["etcdctl", "member", "list"])
+            spec.assert_ok(eerr, "etcdctl")
+            spec.assert_eq(code, 0, "member list exit: ${out}")
+        }
+
+        spec.it("puts and gets on a single node (TestPutGet/single_node)") callback {
+            e, err = etcd.run(IMAGE)
+            cleanup_etcd(e)
+            spec.assert_ok(err, "etcd starts")
+            if err != "" { return }
+            put_get(e, 1)
+            cep, _ = etcd.client_endpoint(e)
+            pep, _ = etcd.peer_endpoint(e)
+            cp, _ = tc.mapped_port(e.container, etcd.CLIENT_PORT)
+            pp, _ = tc.mapped_port(e.container, etcd.PEER_PORT)
+            spec.assert_str_eq(cep, "http://localhost:${cp}", "client endpoint shape")
+            spec.assert_str_eq(pep, "http://localhost:${pp}", "peer endpoint shape")
+        }
+
+        spec.it("puts and gets on three nodes (TestPutGet/multiple_nodes)") callback {
+            e, err = etcd.run(IMAGE) {
+                nodes(["etcd-1", "etcd-2", "etcd-3"])
+                cluster_token("tcae-token")
+                tc.env("TCAE_CALLER", "node-2-too")
+            }
+            cleanup_etcd(e)
+            spec.assert_ok(err, "etcd cluster starts")
+            if err != "" { return }
+            spec.assert_eq(e.children.len, 2, "two child nodes")
+            spec.assert_true(e.net != null, "a cluster network")
+            cmd = container_cmd(e.container)
+            spec.assert_contains(cmd, "--name=etcd-1", "node name")
+            spec.assert_contains(cmd, "--initial-cluster=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380", "initial cluster")
+            spec.assert_contains(cmd, "--initial-cluster-token=tcae-token", "the token")
+            put_get(e, 3)
+            peers, perr = etcd.peer_endpoints(e)
+            spec.assert_ok(perr, "peer endpoints")
+            spec.assert_eq(peers.len, 3, "three peer endpoints")
+            // all three are members
+            code, out, eerr = tc.exec(e.container, ["etcdctl", "member", "list"])
+            spec.assert_ok(eerr, "etcdctl")
+            spec.assert_eq(code, 0, "member list exit: ${out}")
+            spec.assert_contains(out, "etcd-2", "member 2")
+            spec.assert_contains(out, "etcd-3", "member 3")
+            // the caller's options reach node 2 (Go re-applies them to every
+            // node); the module's own options are no node's environment
+            node2 = e.children[0] as *etcd.EtcdContainer
+            spec.assert_contains(container_env(node2.container), "\"TCAE_CALLER=node-2-too\"", "the caller's env on node 2")
+            spec.assert_false(string.contains(container_env(e.container), "tcae-token") == 1, "no module setting in the env")
+        }
+
+        spec.it("appends additional args last (WithAdditionalArgs)") callback {
+            e, err = etcd.run(IMAGE) {
+                additional_args("--log-level=warn")
+                additional_args("--max-txn-ops=64")
+            }
+            cleanup_etcd(e)
+            spec.assert_ok(err, "etcd starts")
+            if err != "" { return }
+            cmd = container_cmd(e.container)
+            spec.assert_true(string.ends_with(cmd, "--log-level=warn --max-txn-ops=64") == 1, "last on the command: ${cmd}")
+            put_get(e, 1)
+        }
+    }
+    return spec.run_summary(fw)
+}

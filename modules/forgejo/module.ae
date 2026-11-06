@@ -1,0 +1,160 @@
+// Ported from testcontainers-go modules/forgejo/forgejo.go
+//
+// modules.forgejo: a Forgejo (Git forge) container on SQLite, with an admin
+// user created once the server is up (a post-ready hook running
+// `forgejo admin user create` as the `git` user, as Go does).
+//
+//     import modules.forgejo
+//
+//     f, err = forgejo.run("codeberg.org/forgejo/forgejo:11") {
+//         admin_credentials("me", "secret-pw", "me@example.org")
+//         config("server", "DOMAIN", "forge.test")
+//     }
+//     defer tc.terminate(f.container)
+//     url, _ = forgejo.connection_string(f)      // "http://localhost:32771"
+//
+// Go's option errors (empty credentials, "__" in a config section/key)
+// cannot be returned by a setter here: they are left on the request and
+// `run` returns them without starting a container.
+//
+// Not ported: nothing from forgejo.go.
+
+import std.string
+import std.json
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    ForgejoContainer, run, connection_string, ssh_connection_string,
+    admin_credentials, config, HTTP_PORT, SSH_PORT, DEFAULT_USER,
+    DEFAULT_PASSWORD, DEFAULT_EMAIL, forgejo_request_new, forgejo_request_free
+)
+
+const HTTP_PORT = "3000/tcp"
+const SSH_PORT = "22/tcp"
+const DEFAULT_USER = "forgejo-admin"
+const DEFAULT_PASSWORD = "forgejo-admin"
+const DEFAULT_EMAIL = "admin@forgejo.local"
+
+const ERR_KEY = "forgejo.error"
+
+struct ForgejoContainer {
+    container: *docker.Container
+    admin_username: string
+    admin_password: string
+}
+
+forgejo_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, SSH_PORT)
+    tc.wait_for(r, wait.for_http("/api/healthz") { with_port(HTTP_PORT) })
+    tc.env(r, "FORGEJO__database__DB_TYPE", "sqlite3")
+    tc.env(r, "FORGEJO__security__INSTALL_LOCK", "true")
+    tc.env(r, "FORGEJO_ADMIN_USERNAME", DEFAULT_USER)
+    tc.env(r, "FORGEJO_ADMIN_PASSWORD", DEFAULT_PASSWORD)
+    tc.env(r, "FORGEJO_ADMIN_EMAIL", DEFAULT_EMAIL)
+    return r
+}
+
+forgejo_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithAdminCredentials: all three must be non-empty (checked at run).
+admin_credentials(_ctx: ptr, username: string, password: string, email: string) {
+    if string.length(username) == 0 || string.length(password) == 0 || string.length(email) == 0 {
+        tc.set_setting(_ctx, ERR_KEY, "WithAdminCredentials: username, password, and email must not be empty")
+        return
+    }
+    tc.env(_ctx, "FORGEJO_ADMIN_USERNAME", username)
+    tc.env(_ctx, "FORGEJO_ADMIN_PASSWORD", password)
+    tc.env(_ctx, "FORGEJO_ADMIN_EMAIL", email)
+}
+
+// Go's WithConfig: app.ini [section] key = value, as FORGEJO__section__key.
+config(_ctx: ptr, section: string, key: string, value: string) {
+    if string.length(section) == 0 || string.length(key) == 0 {
+        tc.set_setting(_ctx, ERR_KEY, "WithConfig: section and key must not be empty (got section=\"${section}\", key=\"${key}\")")
+        return
+    }
+    if string.contains(section, "__") == 1 || string.contains(key, "__") == 1 {
+        tc.set_setting(_ctx, ERR_KEY, "WithConfig: section and key must not contain \"__\" (got section=\"${section}\", key=\"${key}\")")
+        return
+    }
+    tc.env(_ctx, "FORGEJO__${section}__${key}", value)
+}
+
+// The value of NAME in "NAME=value" entries ("" when absent).
+fn env_value(entries: string[], name: string) -> string {
+    prefix = "${name}="
+    out = ""
+    for e in entries {
+        if string.starts_with(e, prefix) == 1 { out = string.substring(e, string.length(prefix), string.length(e)) }
+    }
+    return out
+}
+
+// Go's adminHook: read the credentials back from the container's own
+// environment and create the admin user as `git`.
+fn create_admin(c: *docker.Container) -> string {
+    doc, ierr = tc.inspect(c)
+    if ierr != "" { return "inspect forgejo: ${ierr}" }
+    cfg, _ = json.object_get(doc, "Config")
+    envv, _ = json.object_get(cfg, "Env")
+    string[] entries = []
+    n = json.json_array_size(envv)
+    i = 0
+    while i < n {
+        v, _ = json.array_get(envv, i)
+        s, _ = json.get_string(v)
+        entries.push(s)
+        i = i + 1
+    }
+    json.free(doc)
+    username = env_value(entries, "FORGEJO_ADMIN_USERNAME")
+    password = env_value(entries, "FORGEJO_ADMIN_PASSWORD")
+    email = env_value(entries, "FORGEJO_ADMIN_EMAIL")
+    if string.length(username) == 0 { username = DEFAULT_USER }
+    if string.length(password) == 0 { password = DEFAULT_PASSWORD }
+    if string.length(email) == 0 { email = DEFAULT_EMAIL }
+    string[] no_env = []
+    res, xerr = tc.exec_with(c, [
+        "forgejo", "admin", "user", "create",
+        "--username", username, "--password", password, "--email", email,
+        "--admin", "--must-change-password=false"
+    ], "git", "", no_env)
+    if xerr != "" { return "create admin user: ${xerr}" }
+    if res.exit_code != 0 { return "create admin user: exit code ${res.exit_code}: ${res.output}" }
+    return ""
+}
+
+builder run(image: string) with forgejo_request_new -> (*ForgejoContainer, string) {
+    r = _builder
+    if r == null { r = forgejo_request_new() }
+    e = tc.req_setting(r, ERR_KEY)
+    if string.length(e) > 0 {
+        tc.request_free(r)
+        return null, "run forgejo: ${e}"
+    }
+    user = tc.req_env(r, "FORGEJO_ADMIN_USERNAME")
+    pw = tc.req_env(r, "FORGEJO_ADMIN_PASSWORD")
+    tc.on_post_ready(r, |c: *docker.Container| { return create_admin(c) })
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run forgejo: ${err}" }
+    f = heap.new(ForgejoContainer)
+    f.container = c
+    f.admin_username = user
+    f.admin_password = pw
+    if err != "" { return f, "run forgejo: ${err}" }
+    return f, ""
+}
+
+// "http://host:port" (Go's ConnectionString).
+connection_string(f: *ForgejoContainer) -> (string, string) {
+    return tc.endpoint(f.container, HTTP_PORT, "http")
+}
+
+// "host:port" of the SSH port (Go's SSHConnectionString).
+ssh_connection_string(f: *ForgejoContainer) -> (string, string) {
+    return tc.endpoint(f.container, SSH_PORT, "")
+}

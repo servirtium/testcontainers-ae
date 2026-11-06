@@ -1,0 +1,212 @@
+// Ported from testcontainers-go modules/mongodb/mongodb.go, modules/mongodb/cli.go,
+// modules/mongodb/mount/entrypoint-tc.sh
+//
+// modules.mongodb: a MongoDB container, optionally a single-node replica
+// set, optionally with a root user.
+//
+//     import modules.mongodb
+//
+//     m, err = mongodb.run("mongo:6") {
+//         username("tester")
+//         password("testerpass")
+//         replica_set("rs")
+//         tc.env("TZ", "UTC")                  // a core option, qualified
+//     }
+//     defer tc.terminate(m.container)
+//     url, _ = mongodb.connection_string(m)
+//     // "mongodb://tester:testerpass@localhost:32771/?replicaSet=rs"
+//
+// Like Go, run checks the finished request after the caller's block: user
+// and password go together ("if you specify username or password, you must
+// provide both of them"), and a replica set arranges the rest: `--replSet`
+// in the command, with authentication also `--keyFile` and Go's embedded
+// entrypoint wrapper (ENTRYPOINT_SCRIPT, below, copied to /tmp/entrypoint-tc.sh,
+// which makes the key file); a post-start hook runs rs.initiate with the
+// container's IP through mongosh (or mongo), and the wait strategy gains an
+// exec check of rs.status().ok, all within a 60s deadline.
+//
+// The entrypoint script is held as text here (file_content), because a
+// module has no embed: Go's mount/entrypoint-tc.sh, verbatim, in a heredoc.
+//
+// connection_string does not percent-encode the credentials as Go's url.UserPassword
+// does (plain user names and passwords are unaffected).
+//
+// Not ported: the atlaslocal sub-module (a separate Go module around
+// mongodb-atlas-local, with its own client) and the deprecated RunContainer;
+// Go's tests' mongotest shell relay (they drive the official shell from the
+// host; the test here speaks OP_MSG to the mapped port instead).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    MongoDBContainer, run, connection_string, username, password, replica_set,
+    PORT, DEFAULT_IMAGE, ENTRYPOINT_PATH, KEY_FILE_PATH, REPLICA_SET_ENV_KEY,
+    mongodb_request_new, mongodb_request_free
+)
+
+const PORT = "27017/tcp"
+const DEFAULT_IMAGE = "mongo:6"
+const ENTRYPOINT_PATH = "/tmp/entrypoint-tc.sh"
+const KEY_FILE_PATH = "/tmp/mongo_keyfile"
+const REPLICA_SET_ENV_KEY = "testcontainers.mongodb.replicaset_name"
+
+struct MongoDBContainer {
+    container: *docker.Container
+    username: string
+    password: string
+    replica_set: string
+}
+
+// Go's mount/entrypoint-tc.sh, verbatim: a heredoc is literal (no ${}
+// interpolation, no escapes). The heredoc drops the newline before its
+// closing marker, so entrypoint_script puts the file's last newline back.
+const ENTRYPOINT_SCRIPT = <<SH
+#!/bin/bash
+
+set -Eeuo pipefail
+
+# detect mongo user and group
+function get_user_group() {
+  user_group=$(cut -d: -f1,5 /etc/passwd | grep mongo)
+  echo "${user_group}"
+}
+
+# detect the entrypoint
+function get_entrypoint() {
+  entrypoint=$(find /usr/local/bin -name 'docker-entrypoint.*')
+  if [[ "${entrypoint}" == *.py ]]; then
+    entrypoint="python3 ${entrypoint}"
+  else
+    entrypoint="exec ${entrypoint}"
+  fi
+  echo "${entrypoint}"
+}
+
+ENTRYPOINT=$(get_entrypoint)
+MONGO_USER_GROUP=$(get_user_group)
+
+# Create the keyfile
+openssl rand -base64 756 > "${MONGO_KEYFILE}"
+
+# Set the permissions and ownership of the keyfile
+chown "${MONGO_USER_GROUP}" "${MONGO_KEYFILE}"
+chmod 400 "${MONGO_KEYFILE}"
+
+${ENTRYPOINT} "$@"
+SH
+
+fn entrypoint_script() -> string { return string.concat(ENTRYPOINT_SCRIPT, "\n") }
+
+// The module's defaults: the port, and Go's two waits (the log line, then
+// the port).
+mongodb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_log("Waiting for connections"),
+        wait.for_listening_port(PORT)
+    ]))
+    return r
+}
+
+mongodb_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithUsername / WithPassword: the root user created at first start.
+username(_ctx: ptr, user: string) { tc.env(_ctx, "MONGO_INITDB_ROOT_USERNAME", user) }
+password(_ctx: ptr, pw: string) { tc.env(_ctx, "MONGO_INITDB_ROOT_PASSWORD", pw) }
+
+// Go's WithReplicaSet: a single-node replica set of this name.
+replica_set(_ctx: ptr, name: string) { tc.env(_ctx, REPLICA_SET_ENV_KEY, name) }
+
+// Go's mongoCli.eval: the shell command that runs one JavaScript snippet
+// with mongosh, falling back to the legacy mongo shell (mongo:4).
+fn eval_cmd(user: string, pw: string, js: string) -> string[] {
+    auth = ""
+    if string.length(user) > 0 && string.length(pw) > 0 { auth = "--username ${user} --password ${pw}" }
+    quoted = "\"${js}\""
+    string[] cmd = []
+    cmd.push("sh")
+    cmd.push("-c")
+    cmd.push("mongosh ${auth} --quiet --eval ${quoted} || mongo ${auth} --quiet --eval ${quoted}")
+    return cmd
+}
+
+// Go's initiateReplicaSet: wait for rs.status().ok after the post-start
+// hook that runs rs.initiate with the container's IP.
+fn initiate_replica_set(r: ptr, user: string, pw: string, rs: string) {
+    tc.additional_wait(r, wait.for_exec(eval_cmd(user, pw, "rs.status().ok")))
+    tc.wait_deadline(r, 60s)
+    init_cmd = eval_cmd(user, pw, "rs.initiate({ _id: '${rs}', members: [ { _id: 0, host: 'IP:27017' } ] })")
+    tc.on_post_start(r, |c: *docker.Container| {
+        ip, err = tc.container_ip(c)
+        if err != "" { return "container ip: ${err}" }
+        string[] cmd = []
+        for a in init_cmd { cmd.push(string.replace_all(a, "IP:27017", "${ip}:27017")) }
+        return wait.until_ready(wait.for_exec(cmd), c)
+    })
+}
+
+// Go's configureReplicaset, on the finished request.
+fn configure_replica_set(r: ptr, user: string, pw: string, rs: string) {
+    tc.cmd_arg(r, "--replSet")
+    tc.cmd_arg(r, rs)
+    if string.length(user) == 0 || string.length(pw) == 0 {
+        initiate_replica_set(r, "", "", rs)
+        return
+    }
+    // withAuthReplicaset: Go's entrypoint wrapper makes a key file.
+    tc.file_content(r, entrypoint_script(), ENTRYPOINT_PATH, 493)
+    tc.entrypoint(r, [ENTRYPOINT_PATH])
+    tc.env(r, "MONGO_KEYFILE", KEY_FILE_PATH)
+    tc.cmd_arg(r, "--keyFile")
+    tc.cmd_arg(r, KEY_FILE_PATH)
+    initiate_replica_set(r, user, pw, rs)
+}
+
+builder run(image: string) with mongodb_request_new -> (*MongoDBContainer, string) {
+    r = _builder
+    if r == null { r = mongodb_request_new() }
+    user = tc.req_env(r, "MONGO_INITDB_ROOT_USERNAME")
+    pw = tc.req_env(r, "MONGO_INITDB_ROOT_PASSWORD")
+    rs = tc.req_env(r, REPLICA_SET_ENV_KEY)
+    if (string.length(user) > 0) != (string.length(pw) > 0) {
+        tc.request_free(r)
+        return null, "run mongodb: if you specify username or password, you must provide both of them"
+    }
+    if string.length(user) > 0 {
+        // With a root user the image starts a temporary mongod to create it,
+        // stops it and starts the real one: both log the line, only the
+        // second serves clients (Go's single wait can pass on the first).
+        tc.wait_for(r, wait.for_all([
+            wait.for_log("Waiting for connections") { with_occurrence(2) },
+            wait.for_listening_port(PORT)
+        ]))
+    }
+    if string.length(rs) > 0 { configure_replica_set(r, user, pw, rs) }
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run mongodb: ${err}" }
+    m = heap.new(MongoDBContainer)
+    m.container = c
+    m.username = user
+    m.password = pw
+    m.replica_set = rs
+    if err != "" { return m, "run mongodb: ${err}" }
+    return m, ""
+}
+
+// "mongodb://[user:password@]host:port/[?replicaSet=name]" (Go's
+// ConnectionString; credentials are in only when both are set).
+connection_string(m: *MongoDBContainer) -> (string, string) {
+    ep, err = tc.endpoint(m.container, PORT, "")
+    if err != "" { return "", err }
+    auth = ""
+    if string.length(m.username) > 0 && string.length(m.password) > 0 {
+        auth = "${m.username}:${m.password}@"
+    }
+    q = ""
+    if string.length(m.replica_set) > 0 { q = "?replicaSet=${m.replica_set}" }
+    return "mongodb://${auth}${ep}/${q}", ""
+}

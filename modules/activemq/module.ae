@@ -1,0 +1,97 @@
+// Ported from testcontainers-go modules/activemq/activemq.go
+//
+// modules.activemq: an Apache ActiveMQ Classic container (OpenWire broker on
+// 61616, web console and Jolokia REST on 8161).
+//
+//     import modules.activemq
+//
+//     a, err = activemq.run("apache/activemq-classic:5.18.7") {
+//         admin_credentials("user", "pw")
+//     }
+//     defer tc.terminate(a.container)
+//     broker, _ = activemq.broker_url(a)        // "tcp://localhost:32771"
+//     console, _ = activemq.web_console_url(a)  // "http://localhost:32772"
+//
+// admin_credentials sets ACTIVEMQ_WEB_USER / ACTIVEMQ_WEB_PASSWORD as Go does;
+// note that apache/activemq-classic:5.18.7 does not act on them (its console
+// still accepts admin/admin only, seen with curl), so the test uses the defaults.
+//
+// Not ported: nothing is left out (the Go module has no JMS client helper;
+// Go's example uses the Artemis/stomp clients, which std lacks).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    Container, run, broker_url, web_console_url, admin_user, admin_password,
+    admin_credentials, BROKER_PORT, WEB_CONSOLE_PORT, DEFAULT_IMAGE,
+    activemq_request_new, activemq_request_free
+)
+
+const BROKER_PORT = "61616/tcp"
+const WEB_CONSOLE_PORT = "8161/tcp"
+const DEFAULT_IMAGE = "apache/activemq-classic:5.18.7"
+const DEFAULT_ADMIN_USER = "admin"
+const DEFAULT_ADMIN_PASSWORD = "admin"
+
+struct Container {
+    container: *docker.Container
+    user: string
+    password: string
+}
+
+activemq_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, BROKER_PORT)
+    tc.expose(r, WEB_CONSOLE_PORT)
+    tc.env(r, "ACTIVEMQ_BROKER_NAME", "localhost")
+    tc.env(r, "ACTIVEMQ_WEB_USER", DEFAULT_ADMIN_USER)
+    tc.env(r, "ACTIVEMQ_WEB_PASSWORD", DEFAULT_ADMIN_PASSWORD)
+    tc.wait_for(r, wait.for_all([
+        wait.for_log(".*Apache ActiveMQ.*started.*") { as_regexp() },
+        wait.for_listening_port(BROKER_PORT)
+    ]))
+    return r
+}
+
+activemq_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithAdminCredentials.
+admin_credentials(_ctx: ptr, user: string, password: string) {
+    tc.env(_ctx, "ACTIVEMQ_WEB_USER", user)
+    tc.env(_ctx, "ACTIVEMQ_WEB_PASSWORD", password)
+}
+
+builder run(image: string) with activemq_request_new -> (*Container, string) {
+    r = _builder
+    if r == null { r = activemq_request_new() }
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run activemq: ${err}" }
+    a = heap.new(Container)
+    a.container = c
+    // Go reports the defaults even when WithAdminCredentials changed the env;
+    // here the accessors report what the container was really given.
+    a.user = tc.req_env(r, "ACTIVEMQ_WEB_USER")
+    a.password = tc.req_env(r, "ACTIVEMQ_WEB_PASSWORD")
+    if err != "" { return a, "run activemq: ${err}" }
+    return a, ""
+}
+
+admin_user(a: *Container) -> string { return a.user }
+admin_password(a: *Container) -> string { return a.password }
+
+// "tcp://host:port" of the OpenWire broker.
+broker_url(a: *Container) -> (string, string) {
+    hp, err = tc.endpoint(a.container, BROKER_PORT, "")
+    if err != "" { return "", err }
+    return "tcp://${hp}", ""
+}
+
+// "http://host:port" of the web console.
+web_console_url(a: *Container) -> (string, string) {
+    hp, err = tc.endpoint(a.container, WEB_CONSOLE_PORT, "")
+    if err != "" { return "", err }
+    return "http://${hp}", ""
+}

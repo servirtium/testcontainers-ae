@@ -1,0 +1,197 @@
+// Ported from testcontainers-go modules/postgres/postgres.go, modules/postgres/options.go, modules/postgres/wait_strategies.go
+//
+// modules.postgres: a PostgreSQL container. The second model: a module whose
+// container carries state of its own (user, password, database, snapshot)
+// keeps it in a struct that holds the *docker.Container, as Go's
+// PostgresContainer embeds the container.
+//
+//     pg, err = postgres.run("postgres:16-alpine") {
+//         database("app")
+//         username("app")
+//         password("secret")
+//         init_script("testdata/schema.sql")
+//         basic_wait_strategies()
+//     }
+//     defer tc.terminate(pg.container)
+//     url, _ = postgres.connection_string(pg, "sslmode=disable")
+//
+// Like Go's module, no SQL wait by default; a test adds wait.for_sql (Go's
+// ForSQL) through this repository's `sql` and its pgx port, sql.postgres
+// (tests/test_postgres.ae, TestContainerWithWaitForSQL). Not ported: Go's
+// WithSQLDriver and the sql.DB half of Snapshot/Restore, which here run
+// their SQL through psql in the container, Go's own fallback path.
+// Not ported either: WithSSLCert (certificate files and an entrypoint wrapper;
+// a follow-up), the deprecated RunContainer.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    PostgresContainer, run, connection_string, database, username, password,
+    init_script, ordered_init_scripts, config_file, basic_wait_strategies,
+    snapshot, restore, psql, PORT, DEFAULT_USER, DEFAULT_PASSWORD,
+    DEFAULT_SNAPSHOT_NAME, postgres_request_new, postgres_request_free
+)
+
+const PORT = "5432/tcp"
+const DEFAULT_USER = "postgres"
+const DEFAULT_PASSWORD = "postgres"
+const DEFAULT_SNAPSHOT_NAME = "migrated_template"
+
+struct PostgresContainer {
+    container: *docker.Container
+    user: string
+    password: string
+    db_name: string
+    snapshot_name: string
+}
+
+// The module's defaults (Go's moduleOpts): credentials, the port, and
+// postgres -c fsync=off. Like Go, no wait strategy unless asked for:
+// basic_wait_strategies() is the one Go recommends.
+postgres_request_new() -> ptr {
+    r = tc.request_new()
+    tc.env(r, "POSTGRES_USER", DEFAULT_USER)
+    tc.env(r, "POSTGRES_PASSWORD", DEFAULT_PASSWORD)
+    tc.env(r, "POSTGRES_DB", DEFAULT_USER)
+    tc.expose(r, PORT)
+    tc.cmd(r, ["postgres", "-c", "fsync=off"])
+    return r
+}
+
+postgres_request_free(p: ptr) { tc.request_free(p) }
+
+// ---- options ----
+
+database(_ctx: ptr, name: string) { tc.env(_ctx, "POSTGRES_DB", name) }
+password(_ctx: ptr, pw: string) { tc.env(_ctx, "POSTGRES_PASSWORD", pw) }
+// "" is the default user, as in Go.
+username(_ctx: ptr, user: string) {
+    u = user
+    if string.length(u) == 0 { u = DEFAULT_USER }
+    tc.env(_ctx, "POSTGRES_USER", u)
+}
+
+fn base_name(p: string) -> string {
+    i = string.index_of(p, "/")
+    rest = p
+    while i >= 0 {
+        rest = string.substring(rest, i + 1, string.length(rest))
+        i = string.index_of(rest, "/")
+    }
+    return rest
+}
+
+// Go's WithInitScripts, one script a call: copied into
+// /docker-entrypoint-initdb.d, run in name order at first start.
+init_script(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, "/docker-entrypoint-initdb.d/${base_name(host_path)}", 493)
+}
+
+// Go's WithOrderedInitScripts: run in the order given (000-, 001- prefixes).
+ordered_init_scripts(_ctx: ptr, host_paths: string[]) {
+    i = 0
+    for p in host_paths {
+        prefix = string.pad_start("${i}", 3, 48)
+        tc.file(_ctx, p, "/docker-entrypoint-initdb.d/${prefix}-${base_name(p)}", 493)
+        i = i + 1
+    }
+}
+
+// Go's WithConfigFile: /etc/postgresql.conf, and -c config_file=...
+config_file(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, "/etc/postgresql.conf", 493)
+    tc.cmd_arg(_ctx, "-c")
+    tc.cmd_arg(_ctx, "config_file=/etc/postgresql.conf")
+}
+
+// Go's BasicWaitStrategies: the ready log line twice (the init run restarts
+// the server), and the port listening.
+basic_wait_strategies(_ctx: ptr) {
+    tc.additional_wait(_ctx, wait.for_log("database system is ready to accept connections") { with_occurrence(2) })
+    tc.additional_wait(_ctx, wait.for_listening_port(PORT))
+}
+
+// Run a PostgreSQL container (Go's postgres.Run). The credentials are read
+// back from the container's environment, so whatever the block set is what
+// connection_string uses.
+builder run(image: string) with postgres_request_new -> (*PostgresContainer, string) {
+    r = _builder
+    if r == null { r = postgres_request_new() }
+    user = tc.req_env(r, "POSTGRES_USER")
+    pw = tc.req_env(r, "POSTGRES_PASSWORD")
+    db = tc.req_env(r, "POSTGRES_DB")
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run postgres: ${err}" }
+    pg = heap.new(PostgresContainer)
+    pg.container = c
+    pg.user = user
+    pg.password = pw
+    pg.db_name = db
+    pg.snapshot_name = DEFAULT_SNAPSHOT_NAME
+    if err != "" { return pg, "run postgres: ${err}" }
+    return pg, ""
+}
+
+// "postgres://user:password@host:port/db?args" (Go's ConnectionString;
+// args are joined with &, e.g. "sslmode=disable").
+connection_string(pg: *PostgresContainer, args: string) -> (string, string) {
+    ep, err = tc.endpoint(pg.container, PORT, "")
+    if err != "" { return "", err }
+    return "postgres://${pg.user}:${pg.password}@${ep}/${pg.db_name}?${args}", ""
+}
+
+// Run SQL through psql in the container, as the module's user, against db.
+// (output, error); an SQL error is an error with psql's output.
+psql(pg: *PostgresContainer, db: string, sql: string) -> (string, string) {
+    code, out, err = tc.exec(pg.container, ["psql", "-v", "ON_ERROR_STOP=1", "-U", pg.user, "-d", db, "-tA", "-c", sql])
+    if err != "" { return "", err }
+    if code != 0 { return out, "psql exited ${code}: ${out}" }
+    return out, ""
+}
+
+fn exec_all(pg: *PostgresContainer, cmds: string[]) -> string {
+    for c in cmds {
+        _, err = psql(pg, "postgres", c)
+        if err != "" { return "could not execute restore command ${c}: ${err}" }
+    }
+    return ""
+}
+
+fn check_snapshot(pg: *PostgresContainer, name: string) -> (string, string) {
+    n = pg.snapshot_name
+    if string.length(name) > 0 { n = name }
+    if pg.db_name == "postgres" {
+        return "", "cannot restore the postgres system database as it cannot be dropped to be restored"
+    }
+    return n, ""
+}
+
+// Go's Snapshot: copy the database to a template (name "" is the default,
+// migrated_template), to restore to later.
+snapshot(pg: *PostgresContainer, name: string) -> string {
+    n, err = check_snapshot(pg, name)
+    if err != "" { return err }
+    string[] cmds = []
+    cmds.push("UPDATE pg_database SET datistemplate = FALSE WHERE datname = '${n}'")
+    cmds.push("DROP DATABASE IF EXISTS \"${n}\"")
+    cmds.push("CREATE DATABASE \"${n}\" WITH TEMPLATE \"${pg.db_name}\" OWNER \"${pg.user}\"")
+    cmds.push("ALTER DATABASE \"${n}\" WITH is_template = TRUE")
+    e = exec_all(pg, cmds)
+    if e != "" { return e }
+    pg.snapshot_name = n
+    return ""
+}
+
+// Go's Restore: drop the database and recreate it from the snapshot.
+restore(pg: *PostgresContainer, name: string) -> string {
+    n, err = check_snapshot(pg, name)
+    if err != "" { return err }
+    string[] cmds = []
+    cmds.push("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${pg.db_name}' AND pid <> pg_backend_pid()")
+    cmds.push("DROP DATABASE IF EXISTS \"${pg.db_name}\" with (FORCE)")
+    cmds.push("CREATE DATABASE \"${pg.db_name}\" WITH TEMPLATE \"${n}\" OWNER \"${pg.user}\"")
+    return exec_all(pg, cmds)
+}

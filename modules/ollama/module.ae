@@ -1,0 +1,116 @@
+// Ported from testcontainers-go modules/ollama/ollama.go and options.go
+//
+// modules.ollama: an Ollama server container (port 11434).
+//
+//     import modules.ollama
+//
+//     c, err = ollama.run("ollama/ollama:0.5.7")
+//     defer tc.terminate(c)
+//     url, _ = ollama.connection_string(c)        // "http://localhost:32771"
+//     code, _, _ = tc.exec(c, ["ollama", "pull", "all-minilm"])
+//
+// Like Go, run asks for all GPUs when the engine reports an "nvidia" runtime.
+//
+// commit is ported (POST /commit, same "already exists" guard) but not
+// exercised by the test, since it is meant for an image holding a pulled
+// model and the test pulls none.
+//
+// Not ported: WithUseLocal (Go's option that runs a host `ollama serve`
+// process instead of a container, 800 lines of a fake Container over an OS
+// process), the deprecated RunContainer, and the ollama client SDK used in
+// Go's tests and examples.
+
+import std.string
+import std.json
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, connection_string, commit, PORT, DEFAULT_IMAGE,
+    ollama_request_new, ollama_request_free
+)
+
+const PORT = "11434/tcp"
+const DEFAULT_IMAGE = "ollama/ollama:0.5.7"
+
+ollama_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_listening_port(PORT) { with_startup_timeout(60s) })
+    return r
+}
+
+ollama_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's withGpu: a GPU request when the engine has the nvidia runtime.
+fn engine_has_nvidia() -> bool {
+    cl, cerr = docker.client()
+    if cerr != "" { return false }
+    doc, err = docker.api_json(cl, "GET", "/info", "", "info")
+    if err != "" { return false }
+    rt, rerr = json.object_get(doc, "Runtimes")
+    found = false
+    if rerr == "" {
+        nv, nerr = json.object_get(rt, "nvidia")
+        if nerr == "" { found = true }
+    }
+    json.free(doc)
+    return found
+}
+
+builder run(image: string) with ollama_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = ollama_request_new() }
+    if engine_has_nvidia() {
+        tc.host_config_modifier(r, |hc: ptr| {
+            req = json.obj()
+            json.set(req, "Count", json.from_int(-1))
+            caps = json.arr()
+            inner = json.arr()
+            json.push(inner, json.str("gpu"))
+            json.push(caps, inner)
+            json.set(req, "Capabilities", caps)
+            devs = json.arr()
+            json.push(devs, req)
+            json.set(hc, "DeviceRequests", devs)
+        })
+    }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run ollama: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" (Go's ConnectionString).
+connection_string(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "http")
+}
+
+// Go's Commit: commit the container's file system into a new image named
+// target_image (name:tag), which must not exist yet; for an image that holds
+// a pulled model.
+commit(c: *docker.Container, target_image: string) -> string {
+    cl, cerr = docker.client()
+    if cerr != "" { return cerr }
+    st0, _, e0 = docker.api(cl, "GET", "/images/${docker.query_escape(target_image)}/json", "")
+    if e0 != "" { return "listing images ${e0}" }
+    if st0 == 200 { return "image ${target_image} already exists" }
+    repo = target_image
+    tag = ""
+    n = string.length(target_image)
+    i = 0
+    while i < n {
+        ch = string.char_at(target_image, i)
+        if ch == 47 { tag = "" }
+        if ch == 58 && string.index_of_from(target_image, "/", i) < 0 {
+            repo = string.substring(target_image, 0, i)
+            tag = string.substring(target_image, i + 1, n)
+        }
+        i = i + 1
+    }
+    path = "/commit?container=${tc.id(c)}&repo=${docker.query_escape(repo)}"
+    if string.length(tag) > 0 { path = "${path}&tag=${docker.query_escape(tag)}" }
+    st, body, err = docker.api(cl, "POST", path, "{\"Labels\":{\"org.testcontainers.sessionId\":\"\"}}")
+    if err != "" { return "committing container ${err}" }
+    return docker.api_check("committing container", st, body)
+}

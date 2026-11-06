@@ -1,0 +1,238 @@
+// Ported from testcontainers-go modules/dockermcpgateway/dockermcpgateway.go and options.go
+//
+// modules.dockermcpgateway: the Docker MCP Gateway (docker/mcp-gateway) in
+// SSE mode on port 8811, with the engine's socket mounted so it can start the
+// MCP servers you ask for as sibling containers.
+//
+//     import modules.dockermcpgateway
+//
+//     g, err = dockermcpgateway.run("docker/mcp-gateway:latest") {
+//         tools("duckduckgo", ["fetch_content", "search"])
+//         secret("github.personal_access_token", "token")
+//     }
+//     defer dockermcpgateway.terminate(g)
+//     url, _ = dockermcpgateway.gateway_endpoint(g)     // "http://localhost:32771"
+//
+// The gateway itself is a plain container and needs only an engine socket;
+// the MCP servers it launches are pulled from Docker Hub's MCP catalog.
+//
+// Differences from Go: the container is a *McpGateway holding the tools;
+// Go's Tools() map is tools_of(g, server) (the tools for one server, in the
+// order given) and servers(g). The secrets file is written in the order the
+// keys were set (Go ranges a map, so its order is random).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    McpGateway, run, terminate, container_of, gateway_endpoint, tools_of, servers,
+    tools, secret, secrets, PORT, SECRETS_PATH, DEFAULT_IMAGE,
+    dockermcpgateway_request_new, dockermcpgateway_request_free
+)
+
+const PORT = "8811/tcp"
+const SECRETS_PATH = "/testcontainers/app/secrets"
+const DEFAULT_IMAGE = "docker/mcp-gateway:latest"
+
+const S_TOOLS = "mcpgw.tools"        // "server\ttool\n" lines
+const S_SECRETS = "mcpgw.secrets"    // "key=value\n" lines
+const S_ERROR = "mcpgw.error"
+
+struct McpGateway {
+    container: *docker.Container
+    tools_text: string
+}
+
+dockermcpgateway_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(PORT),
+        wait.for_log(".*Start sse server on port.*") { as_regexp() }
+    ]))
+    return r
+}
+
+dockermcpgateway_request_free(p: ptr) { tc.request_free(p) }
+
+fn fail(r: ptr, msg: string) {
+    if string.length(tc.req_setting(r, S_ERROR)) == 0 { tc.set_setting(r, S_ERROR, msg) }
+}
+
+fn has_line(text: string, line: string) -> bool {
+    return string.contains("\n${text}", "\n${line}\n") == 1
+}
+
+// Go's WithTools: tools of one server; repeated calls for a server add the
+// tools not already there.
+tools(_ctx: ptr, server: string, names: string[]) {
+    if string.length(server) == 0 { fail(_ctx, "server cannot be empty")
+        return }
+    if names.len == 0 { fail(_ctx, "tools cannot be empty")
+        return }
+    for t in names {
+        if string.length(t) == 0 { fail(_ctx, "tool cannot be empty")
+            return }
+    }
+    cur = tc.req_setting(_ctx, S_TOOLS)
+    for t in names {
+        line = "${server}\t${t}"
+        if !has_line(cur, line) { cur = "${cur}${line}\n" }
+    }
+    tc.set_setting(_ctx, S_TOOLS, cur)
+}
+
+// Go's WithSecret: a secret passed to the gateway (--secrets file); setting a
+// key again replaces its value.
+secret(_ctx: ptr, key: string, value: string) {
+    if string.length(key) == 0 { fail(_ctx, "secret key cannot be empty")
+        return }
+    lines = string.split(tc.req_setting(_ctx, S_SECRETS), "\n")
+    n = string.string_array_size(lines)
+    out = ""
+    found = false
+    prefix = "${key}="
+    i = 0
+    while i < n {
+        l = string.string_array_get(lines, i)
+        if string.length(l) > 0 {
+            if string.starts_with(l, prefix) == 1 {
+                out = "${out}${prefix}${value}\n"
+                found = true
+            } else {
+                out = "${out}${l}\n"
+            }
+        }
+        i = i + 1
+    }
+    string.string_array_free(lines)
+    if !found { out = "${out}${prefix}${value}\n" }
+    tc.set_setting(_ctx, S_SECRETS, out)
+}
+
+// Go's WithSecrets: several at once, as parallel arrays of keys and values.
+secrets(_ctx: ptr, keys: string[], values: string[]) {
+    if keys.len == 0 { fail(_ctx, "secrets cannot be empty")
+        return }
+    i = 0
+    while i < keys.len {
+        secret(_ctx, keys[i], values[i])
+        i = i + 1
+    }
+}
+
+builder run(image: string) with dockermcpgateway_request_new -> (*McpGateway, string) {
+    r = _builder
+    if r == null { r = dockermcpgateway_request_new() }
+    perr = tc.req_setting(r, S_ERROR)
+    if string.length(perr) > 0 {
+        tc.request_free(r)
+        return null, perr
+    }
+    cl, cerr = docker.client()
+    if cerr != "" {
+        tc.request_free(r)
+        return null, "run mcp gateway: ${cerr}"
+    }
+    tc.bind(r, docker.engine_socket_for_mounts(cl), "/var/run/docker.sock")
+    // Podman's SELinux denies a container the engine socket unless it is
+    // privileged (as the core does for Ryuk)
+    if docker.is_podman(cl) { tc.privileged(r) }
+
+    tools_text = tc.req_setting(r, S_TOOLS)
+    // --servers=<s> then its --tools=<t>..., servers in first-seen order
+    tc.cmd_arg(r, "--transport=sse")
+    seen = ""
+    lines = string.split(tools_text, "\n")
+    n = string.string_array_size(lines)
+    i = 0
+    while i < n {
+        l = string.string_array_get(lines, i)
+        tab = string.index_of(l, "\t")
+        if tab > 0 {
+            srv = string.substring(l, 0, tab)
+            if string.contains(seen, "\n${srv}\n") == 0 {
+                seen = "${seen}\n${srv}\n"
+                tc.cmd_arg(r, "--servers=${srv}")
+                j = 0
+                while j < n {
+                    l2 = string.string_array_get(lines, j)
+                    if string.starts_with(l2, "${srv}\t") == 1 {
+                        tc.cmd_arg(r, "--tools=${string.substring(l2, tab + 1, string.length(l2))}")
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    string.string_array_free(lines)
+
+    sec = tc.req_setting(r, S_SECRETS)
+    if string.length(sec) > 0 {
+        tc.cmd_arg(r, "--secrets=${SECRETS_PATH}")
+        tc.file_content(r, sec, SECRETS_PATH, 420)
+    }
+
+    g = heap.new(McpGateway)
+    g.container = null
+    g.tools_text = tools_text
+    c, err = tc.run_request(r, image)
+    g.container = c
+    if err != "" { return g, "run mcp gateway: ${err}" }
+    return g, ""
+}
+
+terminate(g: *McpGateway) -> string {
+    if g == null { return "" }
+    return tc.terminate(g.container)
+}
+
+container_of(g: *McpGateway) -> *docker.Container { return g.container }
+
+// "http://host:port" of the SSE endpoint's base.
+gateway_endpoint(g: *McpGateway) -> (string, string) {
+    ep, err = tc.endpoint(g.container, PORT, "http")
+    if err != "" { return "", "port endpoint: ${err}" }
+    return ep, ""
+}
+
+// The servers given tools, in first-seen order.
+servers(g: *McpGateway) -> string[] {
+    string[] out = []
+    lines = string.split(g.tools_text, "\n")
+    n = string.string_array_size(lines)
+    i = 0
+    while i < n {
+        l = string.string_array_get(lines, i)
+        tab = string.index_of(l, "\t")
+        if tab > 0 {
+            srv = string.substring(l, 0, tab)
+            dup = false
+            for o in out { if o == srv { dup = true } }
+            if !dup { out.push(srv) }
+        }
+        i = i + 1
+    }
+    string.string_array_free(lines)
+    return out
+}
+
+// Go's Tools()[server].
+tools_of(g: *McpGateway, server: string) -> string[] {
+    string[] out = []
+    lines = string.split(g.tools_text, "\n")
+    n = string.string_array_size(lines)
+    i = 0
+    while i < n {
+        l = string.string_array_get(lines, i)
+        if string.starts_with(l, "${server}\t") == 1 {
+            out.push(string.substring(l, string.length(server) + 1, string.length(l)))
+        }
+        i = i + 1
+    }
+    string.string_array_free(lines)
+    return out
+}

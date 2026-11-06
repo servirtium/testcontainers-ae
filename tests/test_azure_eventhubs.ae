@@ -1,0 +1,416 @@
+// Ported from testcontainers-go modules/azure/eventhubs/config_test.go,
+// eventhubs_test.go and examples_test.go (ExampleRun, _withAzuriteContainer,
+// _withConfigObject, ExampleNewConfig)
+//
+// Compile-checked only. The config builder's tests, the option conflict and
+// nil-guard checks, the EULA refusal and the connection string run for real,
+// engine-free. The cases that start the emulator and Azurite run only with
+// TCAE_LIVE_EVENTHUBS=1 and an engine.
+// Not ported: TestMustNewConfig_panicsOnInvalid (no MustNewConfig).
+
+import std.spec
+import std.string
+import std.os
+import std.file
+import std.json
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.network
+import testcontainers.testing
+import modules.azurite
+import modules.azure.eventhubs
+
+struct Standin { x: int }
+
+const IMAGE = "mcr.microsoft.com/azure-messaging/eventhubs-emulator:2.1.0"
+const AZURITE_IMAGE = "mcr.microsoft.com/azure-storage/azurite:3.36.0"
+const CONFIG = "modules/azure/eventhubs/testdata/eventhubs_config.json"
+
+// 1 when TCAE_LIVE_EVENTHUBS=1 and an engine answers. The variable is read
+// first so that nothing touches an engine unless asked to.
+fn live_on() -> int {
+    if os.getenv("TCAE_LIVE_EVENTHUBS") != "1" { return 0 }
+    return testing.engine_ok()
+}
+
+fn inspect_env_has(c: *docker.Container, entry: string) -> int {
+    doc, err = tc.inspect(c)
+    if err != "" { return 0 }
+    cfg, _ = json.object_get(doc, "Config")
+    envv, _ = json.object_get(cfg, "Env")
+    n = json.json_array_size(envv)
+    found = 0
+    k = 0
+    while k < n {
+        ev, _ = json.array_get(envv, k)
+        e, _ = json.get_string(ev)
+        if e == entry { found = 1 }
+        k = k + 1
+    }
+    json.free(doc)
+    return found
+}
+
+fn inspect_image(c: *docker.Container) -> string {
+    doc, err = tc.inspect(c)
+    if err != "" { return "" }
+    cfg, _ = json.object_get(doc, "Config")
+    iv, _ = json.object_get(cfg, "Image")
+    img, _ = json.get_string(iv)
+    json.free(doc)
+    return img
+}
+
+// A config with one entity in the emulator's namespace.
+fn one_entity(name: string, partitions: int) -> *eventhubs.Config {
+    cfg = eventhubs.config_new()
+    ns = eventhubs.config_namespace(cfg, eventhubs.EMULATOR_NAMESPACE_NAME)
+    eventhubs.config_entity(ns, name, partitions)
+    return cfg
+}
+
+main() {
+    fw = spec.init()
+    live = live_on()
+
+    spec.describe(fw, "modules/azure/eventhubs config (config_test.go)") {
+        spec.it("builds the canonical config (TestNewConfig_happyPath)") callback {
+            cfg = eventhubs.config_new()
+            eventhubs.config_logging_type(cfg, "File")
+            ns = eventhubs.config_namespace(cfg, eventhubs.EMULATOR_NAMESPACE_NAME)
+            eh = eventhubs.config_entity(ns, "eh1", 1)
+            eventhubs.config_consumer_group(eh, "cg1")
+            spec.assert_str_eq(eventhubs.config_validate(cfg), "", "valid")
+            spec.assert_str_eq(eventhubs.config_json(cfg),
+                "{\"UserConfig\":{\"NamespaceConfig\":[{\"Type\":\"EventHub\",\"Name\":\"emulatorns1\",\"Entities\":[{\"Name\":\"eh1\",\"PartitionCount\":\"1\",\"ConsumerGroups\":[{\"Name\":\"cg1\"}]}]}],\"LoggingConfig\":{\"Type\":\"File\"}}}",
+                "the shape of testdata/eventhubs_config.json; PartitionCount is a string")
+        }
+
+        spec.it("defaults the logging type to File (TestNewConfig_defaultLoggingType)") callback {
+            cfg = one_entity("eh1", 1)
+            spec.assert_str_eq(eventhubs.config_validate(cfg), "", "valid")
+            spec.assert_contains(eventhubs.config_json(cfg), "\"LoggingConfig\":{\"Type\":\"File\"}", "File")
+        }
+
+        spec.it("stringifies the partition count (TestNewConfig_partitionCountStringified)") callback {
+            cfg = one_entity("e", 3)
+            spec.assert_contains(eventhubs.config_json(cfg), "\"PartitionCount\":\"3\"", "a JSON string")
+        }
+
+        spec.it("rejects an empty namespace name") callback {
+            cfg = eventhubs.config_new()
+            eventhubs.config_namespace(cfg, "")
+            spec.assert_contains(eventhubs.config_validate(cfg), "namespace name is empty", "the error")
+        }
+
+        spec.it("rejects a namespace name other than the emulator's") callback {
+            cfg = eventhubs.config_new()
+            ns = eventhubs.config_namespace(cfg, "mynamespace")
+            eventhubs.config_entity(ns, "eh1", 1)
+            errs = eventhubs.config_validate(cfg)
+            spec.assert_contains(errs, "namespace name", "the error")
+            spec.assert_contains(errs, "cannot be changed from", "and why")
+        }
+
+        spec.it("accepts the namespace name in any case (TestNewConfig_caseInsensitiveNamespaceName)") callback {
+            cfg = eventhubs.config_new()
+            ns = eventhubs.config_namespace(cfg, "emulatorNs1")
+            eventhubs.config_entity(ns, "eh1", 1)
+            spec.assert_str_eq(eventhubs.config_validate(cfg), "", "valid")
+            spec.assert_contains(eventhubs.config_json(cfg), "\"Name\":\"emulatorNs1\"", "stored as given")
+        }
+
+        spec.it("rejects two namespaces") callback {
+            cfg = eventhubs.config_new()
+            ns1 = eventhubs.config_namespace(cfg, eventhubs.EMULATOR_NAMESPACE_NAME)
+            eventhubs.config_entity(ns1, "eh1", 1)
+            ns2 = eventhubs.config_namespace(cfg, eventhubs.EMULATOR_NAMESPACE_NAME)
+            eventhubs.config_entity(ns2, "eh2", 1)
+            spec.assert_contains(eventhubs.config_validate(cfg), "emulator supports only 1 namespace", "the error")
+        }
+
+        spec.it("rejects an empty entity name") callback {
+            spec.assert_contains(eventhubs.config_validate(one_entity("", 1)), "entity name is empty", "the error")
+        }
+
+        spec.it("rejects partition counts outside 1-32") callback {
+            spec.assert_contains(eventhubs.config_validate(one_entity("eh1", 0)), "partition count must be 1", "zero")
+            spec.assert_contains(eventhubs.config_validate(one_entity("eh1", -5)), "partition count must be 1", "negative")
+            spec.assert_contains(eventhubs.config_validate(one_entity("eh1", 33)), "partition count must be 1", "over the limit")
+            spec.assert_str_eq(eventhubs.config_validate(one_entity("eh1", 32)), "", "32 is the limit")
+        }
+
+        spec.it("rejects more than 10 entities") callback {
+            cfg = eventhubs.config_new()
+            ns = eventhubs.config_namespace(cfg, eventhubs.EMULATOR_NAMESPACE_NAME)
+            i = 1
+            while i <= 11 {
+                eventhubs.config_entity(ns, "eh${i}", 1)
+                i = i + 1
+            }
+            spec.assert_contains(eventhubs.config_validate(cfg), "entities, emulator limit is 10", "the error")
+        }
+
+        spec.it("rejects more than 20 consumer groups per entity") callback {
+            cfg = eventhubs.config_new()
+            ns = eventhubs.config_namespace(cfg, eventhubs.EMULATOR_NAMESPACE_NAME)
+            eh = eventhubs.config_entity(ns, "eh1", 1)
+            i = 1
+            while i <= 21 {
+                eventhubs.config_consumer_group(eh, "cg${i}")
+                i = i + 1
+            }
+            spec.assert_contains(eventhubs.config_validate(cfg), "consumer groups, emulator limit is 20", "the error")
+        }
+
+        spec.it("rejects an empty consumer group name") callback {
+            cfg = eventhubs.config_new()
+            ns = eventhubs.config_namespace(cfg, eventhubs.EMULATOR_NAMESPACE_NAME)
+            eh = eventhubs.config_entity(ns, "eh1", 1)
+            eventhubs.config_consumer_group(eh, "")
+            spec.assert_contains(eventhubs.config_validate(cfg), "consumer group name is empty", "the error")
+        }
+
+        spec.it("rejects an empty logging type") callback {
+            cfg = eventhubs.config_new()
+            eventhubs.config_logging_type(cfg, "")
+            spec.assert_contains(eventhubs.config_validate(cfg), "logging type is empty", "the error")
+        }
+
+        spec.it("rejects duplicate entity and consumer group names") callback {
+            cfg = eventhubs.config_new()
+            ns = eventhubs.config_namespace(cfg, eventhubs.EMULATOR_NAMESPACE_NAME)
+            eventhubs.config_entity(ns, "eh1", 1)
+            eh = eventhubs.config_entity(ns, "eh1", 2)
+            eventhubs.config_consumer_group(eh, "cg1")
+            eventhubs.config_consumer_group(eh, "cg1")
+            errs = eventhubs.config_validate(cfg)
+            spec.assert_contains(errs, "duplicate entity name", "entities")
+            spec.assert_contains(errs, "duplicate consumer group name", "consumer groups")
+        }
+
+        spec.it("aggregates several errors (multiple errors aggregated)") callback {
+            cfg = eventhubs.config_new()
+            eventhubs.config_namespace(cfg, "")
+            eventhubs.config_logging_type(cfg, "")
+            errs = eventhubs.config_validate(cfg)
+            spec.assert_contains(errs, "namespace name is empty", "the first")
+            spec.assert_contains(errs, "logging type is empty", "the second")
+        }
+
+        spec.it("composes several entities (TestNewConfig_multipleEntities)") callback {
+            cfg = eventhubs.config_new()
+            ns = eventhubs.config_namespace(cfg, eventhubs.EMULATOR_NAMESPACE_NAME)
+            eh1 = eventhubs.config_entity(ns, "eh1", 2)
+            eventhubs.config_consumer_group(eh1, "cg1")
+            eventhubs.config_consumer_group(eh1, "$Default")
+            eh2 = eventhubs.config_entity(ns, "eh2", 1)
+            eventhubs.config_consumer_group(eh2, "cg1")
+            spec.assert_str_eq(eventhubs.config_validate(cfg), "", "valid")
+            spec.assert_str_eq(eventhubs.config_json(cfg),
+                "{\"UserConfig\":{\"NamespaceConfig\":[{\"Type\":\"EventHub\",\"Name\":\"emulatorns1\",\"Entities\":[{\"Name\":\"eh1\",\"PartitionCount\":\"2\",\"ConsumerGroups\":[{\"Name\":\"cg1\"},{\"Name\":\"$Default\"}]},{\"Name\":\"eh2\",\"PartitionCount\":\"1\",\"ConsumerGroups\":[{\"Name\":\"cg1\"}]}]}],\"LoggingConfig\":{\"Type\":\"File\"}}}",
+                "two entities, in order")
+        }
+
+        spec.it("overrides the namespace type (TestNewConfig_withNamespaceType)") callback {
+            cfg = eventhubs.config_new()
+            ns = eventhubs.config_namespace(cfg, eventhubs.EMULATOR_NAMESPACE_NAME)
+            eventhubs.config_namespace_type(ns, "CustomType")
+            eventhubs.config_entity(ns, "eh1", 1)
+            spec.assert_str_eq(eventhubs.config_validate(cfg), "", "valid")
+            spec.assert_contains(eventhubs.config_json(cfg), "\"Type\":\"CustomType\"", "the type")
+        }
+    }
+
+    spec.describe(fw, "modules/azure/eventhubs") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("has the module's defaults and options (engine-free)") callback {
+            r = eventhubs.eventhubs_request_new()
+            exposed = tc.req_exposed(r)
+            spec.assert_eq(exposed.len, 2, "AMQP and HTTP ports")
+            spec.assert_str_eq(exposed[0], "5672/tcp", "AMQP port")
+            spec.assert_str_eq(exposed[1], "5300/tcp", "HTTP port")
+            eventhubs.accept_eula(r)
+            spec.assert_str_eq(tc.req_env(r, "ACCEPT_EULA"), "Y", "accept_eula")
+            eventhubs.azurite_env(r, "A", "1")
+            eventhubs.azurite_env(r, "B", "2")
+            spec.assert_str_eq(tc.req_setting(r, "eventhubs.azurite_env"), "A=1\nB=2", "azurite env accumulates")
+            eventhubs.config(r, "{}")
+            eventhubs.eventhubs_request_free(r)
+        }
+
+        spec.it("formats the connection string with Azurite's account (engine-free)") callback {
+            spec.assert_str_eq(eventhubs.connection_string_for("localhost:5672"),
+                "Endpoint=sb://localhost:5672;SharedAccessKeyName=${azurite.ACCOUNT_NAME};SharedAccessKey=${azurite.ACCOUNT_KEY};UseDevelopmentEmulator=true;", "Go's connection string format")
+        }
+
+        spec.it("fails without the EULA (TestEventHubs_noEULA, engine-free)") callback {
+            e, err = eventhubs.run(IMAGE)
+            spec.assert_null(e as ptr, "nothing was started")
+            spec.assert_contains(err, "EULA not accepted", "the error says why")
+        }
+
+        spec.it("refuses a nil container or network (TestEventHubs_withAzuriteContainer_nilGuards, engine-free)") callback {
+            e1, err1 = eventhubs.run(IMAGE) {
+                accept_eula()
+                azurite_container(null, "some-net", "azurite")
+            }
+            spec.assert_null(e1 as ptr, "nothing was started")
+            spec.assert_contains(err1, "azurite container is nil", "nil container")
+        }
+
+        spec.it("refuses both ways of getting an Azurite (TestEventHubs_withAzuriteContainer_conflict)") callback {
+            // a stand-in for a running container: only its being non-null matters to the option
+            c = heap.new(Standin)
+            e1, err1 = eventhubs.run(IMAGE) {
+                accept_eula()
+                azurite_image(AZURITE_IMAGE)
+                azurite_container(c, "some-net", "azurite")
+            }
+            spec.assert_null(e1 as ptr, "nothing was started")
+            spec.assert_contains(err1, "mutually exclusive", "WithAzurite then WithAzuriteContainer")
+            e2, err2 = eventhubs.run(IMAGE) {
+                accept_eula()
+                azurite_container(c, "some-net", "azurite")
+                azurite_image(AZURITE_IMAGE)
+            }
+            spec.assert_null(e2 as ptr, "nothing was started")
+            spec.assert_contains(err2, "mutually exclusive", "WithAzuriteContainer then WithAzurite")
+            e3, err3 = eventhubs.run(IMAGE) {
+                accept_eula()
+                azurite_container(c, "some-net", "azurite")
+                azurite_container(c, "some-net", "azurite")
+            }
+            spec.assert_null(e3 as ptr, "nothing was started")
+            spec.assert_contains(err3, "called more than once", "twice")
+            heap.free(c)
+        }
+
+        spec.it("refuses an invalid or nil config object (TestEventHubs_withConfigObject_nil, engine-free)") callback {
+            e1, err1 = eventhubs.run(IMAGE) {
+                accept_eula()
+                config_object(null)
+            }
+            spec.assert_null(e1 as ptr, "nothing was started")
+            spec.assert_contains(err1, "config is nil", "nil config")
+            bad = eventhubs.config_new()
+            eventhubs.config_namespace(bad, "")
+            e2, err2 = eventhubs.run(IMAGE) {
+                accept_eula()
+                config_object(bad)
+            }
+            spec.assert_null(e2 as ptr, "nothing was started")
+            spec.assert_contains(err2, "namespace name is empty", "the config's own error")
+        }
+
+        spec.it_when(live, "starts the emulator and its Azurite (ExampleRun, TestEventHubs_topology)", "set TCAE_LIVE_EVENTHUBS=1 and have an engine") callback {
+            e, err = eventhubs.run(IMAGE) {
+                accept_eula()
+                azurite_image(AZURITE_IMAGE)
+                azurite_env("TESTCONTAINERS_TEST_VAR", "test")
+            }
+            if e != null {
+                testing.cleanup_container(e.container)
+                testing.cleanup_container(e.azurite)
+                testing.cleanup_network(e.net)
+            }
+            spec.assert_ok(err, "eventhubs starts")
+            if err != "" { return }
+            st, serr = tc.state_of(e.container)
+            spec.assert_ok(serr, "state")
+            spec.assert_true(st.running, "state.Running")
+            cs, cerr = eventhubs.connection_string(e)
+            spec.assert_ok(cerr, "connection string")
+            spec.assert_true(string.starts_with(cs, "Endpoint=sb://") == 1, "an sb:// endpoint: ${cs}")
+
+            // both containers belong to the same network
+            eh_nets, e1 = tc.networks(e.container)
+            spec.assert_ok(e1, "eventhubs networks")
+            spec.assert_eq(eh_nets.len, 1, "one network")
+            az = eventhubs.azurite_container_of(e)
+            az_nets, e2 = tc.networks(az)
+            spec.assert_ok(e2, "azurite networks")
+            spec.assert_eq(az_nets.len, 1, "one network")
+            spec.assert_str_eq(az_nets[0], eh_nets[0], "the same network")
+
+            // azurite image and custom option
+            spec.assert_str_eq(inspect_image(az), AZURITE_IMAGE, "azurite image")
+            spec.assert_eq(inspect_env_has(az, "TESTCONTAINERS_TEST_VAR=test"), 1, "azurite_env reached the container")
+        }
+
+        spec.it_when(live, "copies the config into the container (TestEventHubs_withConfig)", "set TCAE_LIVE_EVENTHUBS=1 and have an engine") callback {
+            want, rerr = file.read(CONFIG)
+            spec.assert_ok(rerr, "read the fixture")
+            e, err = eventhubs.run(IMAGE) {
+                accept_eula()
+                azurite_image(AZURITE_IMAGE)
+                config(want)
+            }
+            if e != null {
+                testing.cleanup_container(e.container)
+                testing.cleanup_container(e.azurite)
+                testing.cleanup_network(e.net)
+            }
+            spec.assert_ok(err, "eventhubs starts")
+            if err != "" { return }
+            got, cerr = tc.copy_file_from_container(e.container, "/Eventhubs_Emulator/ConfigFiles/Config.json")
+            spec.assert_ok(cerr, "copy the config back")
+            spec.assert_str_eq(got, want, "the config is where the emulator reads it")
+        }
+
+        spec.it_when(live, "shares an Azurite the caller owns (ExampleRun_withAzuriteContainer, TestEventHubs_withAzuriteContainer)", "set TCAE_LIVE_EVENTHUBS=1 and have an engine") callback {
+            nw, nerr = network.new_random()
+            testing.cleanup_network(nw)
+            spec.assert_ok(nerr, "network")
+            if nerr != "" { return }
+            azc, aerr = azurite.run(AZURITE_IMAGE) {
+                tc.network_alias(nw.name, "azurite")
+                tc.entrypoint_arg("--skipApiVersionCheck")
+            }
+            testing.cleanup_container(azc)
+            spec.assert_ok(aerr, "azurite starts")
+            if aerr != "" { return }
+            e, err = eventhubs.run(IMAGE) {
+                accept_eula()
+                azurite_container(azc, nw.name, "azurite")
+            }
+            if e != null { testing.cleanup_container(e.container) }
+            spec.assert_ok(err, "eventhubs starts")
+            if err != "" { return }
+            own = eventhubs.azurite_container_of(e)
+            spec.assert_null(own as ptr, "the module did not start an Azurite")
+            spec.assert_str_eq(eventhubs.terminate(e), "", "terminate the emulator")
+            // terminate leaves the caller's Azurite running
+            ast, serr = tc.state_of(azc)
+            spec.assert_ok(serr, "azurite state")
+            spec.assert_true(ast.running, "the shared Azurite is still running")
+        }
+
+        spec.it_when(live, "starts with a built config (ExampleRun_withConfigObject)", "set TCAE_LIVE_EVENTHUBS=1 and have an engine") callback {
+            cfg = eventhubs.config_new()
+            ns = eventhubs.config_namespace(cfg, eventhubs.EMULATOR_NAMESPACE_NAME)
+            eh1 = eventhubs.config_entity(ns, "eh1", 2)
+            eventhubs.config_consumer_group(eh1, "cg1")
+            eventhubs.config_consumer_group(eh1, "$Default")
+            eh2 = eventhubs.config_entity(ns, "eh2", 1)
+            eventhubs.config_consumer_group(eh2, "cg1")
+            spec.assert_str_eq(eventhubs.config_validate(cfg), "", "valid")
+            e, err = eventhubs.run(IMAGE) {
+                accept_eula()
+                config_object(cfg)
+            }
+            if e != null {
+                testing.cleanup_container(e.container)
+                testing.cleanup_container(e.azurite)
+                testing.cleanup_network(e.net)
+            }
+            spec.assert_ok(err, "eventhubs starts")
+            if err != "" { return }
+            got, cerr = tc.copy_file_from_container(e.container, "/Eventhubs_Emulator/ConfigFiles/Config.json")
+            spec.assert_ok(cerr, "copy the config back")
+            spec.assert_str_eq(got, eventhubs.config_json(cfg), "the built config is in the container")
+        }
+    }
+    return spec.run_summary(fw)
+}

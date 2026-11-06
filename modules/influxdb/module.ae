@@ -1,0 +1,177 @@
+// Ported from testcontainers-go modules/influxdb/influxdb.go
+//
+// modules.influxdb: an InfluxDB container, v1 or v2 (HTTP 8086, 8088).
+//
+//     import modules.influxdb
+//
+//     c, err = influxdb.run("influxdb:2.7.11") {
+//         v2_auth("org", "bucket", "username", "password")
+//         v2_admin_token("influxdbv2token")
+//     }
+//     defer tc.terminate(c)
+//     url, _ = influxdb.connection_url(c)       // "http://localhost:32771"
+//
+// Go's options that can fail (an empty org, a token already set the other
+// way) return an error from Run. A setter has no result here, so it leaves the
+// first such error as a module setting and `run` returns it before anything
+// is created, with the same message as Go.
+//
+// v2_retention takes a Duration and sets it as whole seconds ("3600s"), where
+// Go sends Duration.String() ("1h0m0s"); both are durations InfluxDB parses.
+//
+// Not ported: the deprecated RunContainer, MustConnectionUrl (no Must*), and
+// the influxdb client code of Go's examples.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, connection_url, username, password, database, config_file,
+    v2, v2_auth, v2_secrets_auth, v2_retention, v2_admin_token,
+    v2_secrets_admin_token, init_db, HTTP_PORT, DEFAULT_IMAGE,
+    influxdb_request_new, influxdb_request_free
+)
+
+const HTTP_PORT = "8086/tcp"
+const DEFAULT_IMAGE = "influxdb:1.8"
+const SECRETS_PATH = "/run/secrets"
+const SET_ERROR = "influxdb.error"
+
+fn health_ready(body: string) -> bool {
+    return string.contains(body, "\"status\":\"pass\"") == 1 || string.contains(body, "\"status\": \"pass\"") == 1
+}
+
+fn health_wait() -> *wait.Strategy {
+    return wait.for_http("/health") { with_response_matcher(|body: string| -> health_ready(body)) }
+}
+
+influxdb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, "8088/tcp")
+    tc.env(r, "INFLUXDB_BIND_ADDRESS", ":8088")
+    tc.env(r, "INFLUXDB_HTTP_BIND_ADDRESS", ":8086")
+    tc.env(r, "INFLUXDB_REPORTING_DISABLED", "true")
+    tc.env(r, "INFLUXDB_MONITOR_STORE_ENABLED", "false")
+    tc.env(r, "INFLUXDB_HTTP_HTTPS_ENABLED", "false")
+    tc.env(r, "INFLUXDB_HTTP_AUTH_ENABLED", "false")
+    tc.wait_for(r, health_wait())
+    return r
+}
+
+influxdb_request_free(p: ptr) { tc.request_free(p) }
+
+// the first failing option wins (Go stops at the first)
+fn fail(_ctx: ptr, msg: string) {
+    if !tc.req_has_setting(_ctx, SET_ERROR) { tc.set_setting(_ctx, SET_ERROR, msg) }
+}
+
+fn env_set(_ctx: ptr, key: string) -> bool {
+    return tc.req_has_env(_ctx, key) && string.length(tc.req_env(_ctx, key)) > 0
+}
+
+// ---- options ----
+
+// Go's WithUsername, WithPassword, WithDatabase (v1 INFLUXDB_*).
+username(_ctx: ptr, name: string) { tc.env(_ctx, "INFLUXDB_USER", name) }
+password(_ctx: ptr, pw: string) { tc.env(_ctx, "INFLUXDB_PASSWORD", pw) }
+database(_ctx: ptr, name: string) { tc.env(_ctx, "INFLUXDB_DATABASE", name) }
+
+// Go's WithConfigFile: /etc/influxdb/influxdb.conf.
+config_file(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, "/etc/influxdb/influxdb.conf", 493)
+}
+
+// Go's withV2: returns false (and records the error) when org or bucket is empty.
+fn with_v2(_ctx: ptr, org: string, bucket: string) -> bool {
+    if string.length(org) == 0 { fail(_ctx, "organization name is required"); return false }
+    if string.length(bucket) == 0 { fail(_ctx, "bucket name is required"); return false }
+    tc.env(_ctx, "DOCKER_INFLUXDB_INIT_ORG", org)
+    tc.env(_ctx, "DOCKER_INFLUXDB_INIT_BUCKET", bucket)
+    tc.env(_ctx, "DOCKER_INFLUXDB_INIT_MODE", "setup")
+    return true
+}
+
+// Go's WithV2: InfluxDB 2 setup with an organization and a bucket.
+v2(_ctx: ptr, org: string, bucket: string) { with_v2(_ctx, org, bucket) }
+
+// Go's WithV2Auth: v2 plus the initial user's name and password.
+v2_auth(_ctx: ptr, org: string, bucket: string, user: string, pw: string) {
+    if string.length(user) == 0 { fail(_ctx, "username is required"); return }
+    if string.length(pw) == 0 { fail(_ctx, "password is required"); return }
+    if !with_v2(_ctx, org, bucket) { return }
+    if env_set(_ctx, "DOCKER_INFLUXDB_INIT_USERNAME_FILE") || env_set(_ctx, "DOCKER_INFLUXDB_INIT_PASSWORD_FILE") {
+        fail(_ctx, "username and password file already set, use either WithV2Auth or WithV2SecretsAuth")
+        return
+    }
+    tc.env(_ctx, "DOCKER_INFLUXDB_INIT_USERNAME", user)
+    tc.env(_ctx, "DOCKER_INFLUXDB_INIT_PASSWORD", pw)
+}
+
+// Go's WithV2SecretsAuth: the user and password are files under /run/secrets.
+v2_secrets_auth(_ctx: ptr, org: string, bucket: string, username_file: string, password_file: string) {
+    if string.length(username_file) == 0 { fail(_ctx, "username file is required"); return }
+    if string.length(password_file) == 0 { fail(_ctx, "password file is required"); return }
+    if env_set(_ctx, "DOCKER_INFLUXDB_INIT_USERNAME") || env_set(_ctx, "DOCKER_INFLUXDB_INIT_PASSWORD") {
+        fail(_ctx, "username and password already set, use either WithV2Auth or WithV2SecretsAuth")
+        return
+    }
+    if !with_v2(_ctx, org, bucket) { return }
+    tc.env(_ctx, "DOCKER_INFLUXDB_INIT_USERNAME_FILE", "${SECRETS_PATH}/${username_file}")
+    tc.env(_ctx, "DOCKER_INFLUXDB_INIT_PASSWORD_FILE", "${SECRETS_PATH}/${password_file}")
+}
+
+// Go's WithV2Retention: the default bucket's retention (whole seconds).
+v2_retention(_ctx: ptr, retention: Duration) {
+    secs = retention / 1s
+    if secs == 0 { fail(_ctx, "retention is required"); return }
+    tc.env(_ctx, "DOCKER_INFLUXDB_INIT_RETENTION", "${secs}s")
+}
+
+// Go's WithV2AdminToken.
+v2_admin_token(_ctx: ptr, token: string) {
+    if string.length(token) == 0 { fail(_ctx, "admin token is required"); return }
+    if env_set(_ctx, "DOCKER_INFLUXDB_INIT_ADMIN_TOKEN_FILE") {
+        fail(_ctx, "admin token file already set, use either WithV2AdminToken or WithV2SecretsAdminToken")
+        return
+    }
+    tc.env(_ctx, "DOCKER_INFLUXDB_INIT_ADMIN_TOKEN", token)
+}
+
+// Go's WithV2SecretsAdminToken: the token is a file under /run/secrets.
+v2_secrets_admin_token(_ctx: ptr, token_file: string) {
+    if string.length(token_file) == 0 { fail(_ctx, "admin token file is required"); return }
+    if env_set(_ctx, "DOCKER_INFLUXDB_INIT_ADMIN_TOKEN") {
+        fail(_ctx, "admin token already set, use either WithV2AdminToken or WithV2SecretsAdminToken")
+        return
+    }
+    tc.env(_ctx, "DOCKER_INFLUXDB_INIT_ADMIN_TOKEN_FILE", "${SECRETS_PATH}/${token_file}")
+}
+
+// Go's WithInitDb: copies <src_path>/docker-entrypoint-initdb.d to / and also
+// waits for the init server's shutdown and the health check.
+init_db(_ctx: ptr, src_path: string) {
+    tc.file(_ctx, "${src_path}/docker-entrypoint-initdb.d", "/", 493)
+    tc.additional_wait(_ctx, wait.for_log("Server shutdown completed"))
+    tc.additional_wait(_ctx, health_wait())
+}
+
+builder run(image: string) with influxdb_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = influxdb_request_new() }
+    if tc.req_has_setting(r, SET_ERROR) {
+        msg = tc.req_setting(r, SET_ERROR)
+        tc.request_free(r)
+        return null, "run influxdb: ${msg}"
+    }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run influxdb: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" (Go's ConnectionUrl).
+connection_url(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, HTTP_PORT, "http")
+}

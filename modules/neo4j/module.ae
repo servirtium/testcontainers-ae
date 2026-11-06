@@ -1,0 +1,138 @@
+// Ported from testcontainers-go modules/neo4j/neo4j.go, modules/neo4j/config.go
+//
+// modules.neo4j: a Neo4j graph database (Bolt on 7687, HTTP on 7474).
+//
+//     import modules.neo4j
+//
+//     c, err = neo4j.run("neo4j:4.4") {
+//         admin_password("secret")
+//         labs_plugin([neo4j.APOC])
+//         neo4j_setting("dbms.tx_log.rotation.size", "42M")
+//     }
+//     defer tc.terminate(c)
+//     bolt, _ = neo4j.bolt_url(c)        // "neo4j://localhost:32771"
+//
+// Authentication is off (NEO4J_AUTH=none) unless admin_password is given.
+// Go's option errors (an AUTH setting alongside admin_password) cannot be
+// returned by a setter here, so they are left on the request and `run`
+// returns them without starting a container, as Go does.
+//
+// Not ported: WithLogger (the core has no logger on the request) and the
+// overwrite warning Go logs from WithNeo4jSetting; Go's examples use the
+// neo4j-go-driver.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, bolt_url, without_authentication, admin_password, labs_plugin,
+    neo4j_setting, neo4j_settings, accept_commercial_license_agreement,
+    accept_evaluation_license_agreement,
+    BOLT_PORT, HTTP_PORT, HTTPS_PORT, DEFAULT_IMAGE,
+    APOC, APOC_CORE, BLOOM, GRAPH_DATA_SCIENCE, NEO_SEMANTICS, STREAMS,
+    neo4j_request_new, neo4j_request_free
+)
+
+const BOLT_PORT = "7687/tcp"
+const HTTP_PORT = "7474/tcp"
+const HTTPS_PORT = "7473/tcp"
+const DEFAULT_IMAGE = "neo4j:4.4"
+
+// Go's LabsPlugin values.
+const APOC = "apoc"
+const APOC_CORE = "apoc-core"
+const BLOOM = "bloom"
+const GRAPH_DATA_SCIENCE = "graph-data-science"
+const NEO_SEMANTICS = "n10s"
+const STREAMS = "streams"
+
+const ERR_KEY = "neo4j.error"
+
+neo4j_request_new() -> ptr {
+    r = tc.request_new()
+    tc.env(r, "NEO4J_AUTH", "none")
+    tc.expose(r, BOLT_PORT)
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, HTTPS_PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_log("Bolt enabled on"),
+        wait.for_http("/") { with_port(HTTP_PORT); with_status(200) }
+    ]))
+    return r
+}
+
+neo4j_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithoutAuthentication.
+without_authentication(_ctx: ptr) { admin_password(_ctx, "") }
+
+// Go's WithAdminPassword: the user is neo4j; "" means no authentication.
+admin_password(_ctx: ptr, password: string) {
+    pwd = "none"
+    if string.length(password) > 0 { pwd = "neo4j/${password}" }
+    tc.env(_ctx, "NEO4J_AUTH", pwd)
+}
+
+// Go's WithLabsPlugin: NEO4JLABS_PLUGINS=["apoc","bloom"].
+labs_plugin(_ctx: ptr, plugins: string[]) {
+    if plugins.len == 0 { return }
+    joined = ""
+    for p in plugins {
+        if string.length(joined) > 0 { joined = "${joined}\",\"" }
+        joined = "${joined}${p}"
+    }
+    tc.env(_ctx, "NEO4JLABS_PLUGINS", "[\"${joined}\"]")
+}
+
+// Go's formatNeo4jConfig: "dbms.tx_log.rotation.size" is
+// NEO4J_dbms_tx__log_rotation_size ("_" doubles, "." becomes "_").
+fn format_config(name: string) -> string {
+    return "NEO4J_${string.replace_all(string.replace_all(name, "_", "__"), ".", "_")}"
+}
+
+// Go's WithNeo4jSetting: any Neo4j setting by its configuration name. A
+// later value replaces an earlier one. "AUTH" is refused (it is the default
+// NEO4J_AUTH, so Go always refuses it: use admin_password).
+neo4j_setting(_ctx: ptr, key: string, value: string) {
+    k = format_config(key)
+    if tc.req_has_env(_ctx, k) && key == "AUTH" {
+        tc.set_setting(_ctx, ERR_KEY, "setting \"${k}\" is not permitted, WithAdminPassword has already been set")
+        return
+    }
+    tc.env(_ctx, k, value)
+}
+
+// Go's WithNeo4jSettings: several at once, as key, value pairs.
+neo4j_settings(_ctx: ptr, keys: string[], values: string[]) {
+    i = 0
+    while i < keys.len && i < values.len {
+        neo4j_setting(_ctx, keys[i], values[i])
+        i = i + 1
+    }
+}
+
+// Go's WithAcceptCommercialLicenseAgreement (enterprise images).
+accept_commercial_license_agreement(_ctx: ptr) { tc.env(_ctx, "NEO4J_ACCEPT_LICENSE_AGREEMENT", "yes") }
+
+// Go's WithAcceptEvaluationLicenseAgreement.
+accept_evaluation_license_agreement(_ctx: ptr) { tc.env(_ctx, "NEO4J_ACCEPT_LICENSE_AGREEMENT", "eval") }
+
+builder run(image: string) with neo4j_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = neo4j_request_new() }
+    e = tc.req_setting(r, ERR_KEY)
+    if string.length(e) > 0 {
+        tc.request_free(r)
+        return null, "run neo4j: ${e}"
+    }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run neo4j: ${err}" }
+    return c, ""
+}
+
+// "neo4j://host:port" (Go's BoltUrl).
+bolt_url(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, BOLT_PORT, "neo4j")
+}

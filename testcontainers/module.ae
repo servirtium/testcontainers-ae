@@ -1,0 +1,1316 @@
+// Ported from testcontainers-go testcontainers.go, container.go, generic.go, options.go, lifecycle.go, docker.go (CreateContainer, Start, Stop, Terminate, log production), reaper.go, logconsumer.go, mounts.go, docker_mounts.go, image.go (substitutors), cleanup.go
+//
+// testcontainers: throwaway containers for tests.
+//
+//     import testcontainers as tc
+//     import testcontainers.wait
+//
+//     c, err = tc.run("redis:7-alpine") {
+//         expose("6379/tcp")
+//         wait_for(wait.for_log("Ready to accept connections"))
+//     }
+//     defer tc.terminate(c)
+//
+// run is a builder: the block runs first and fills a Request through the
+// setters below (the compiler hands each one the request as _ctx), then run
+// pulls or builds the image, creates, copies files in, starts and waits.
+// See DESIGN.md.
+
+import std.string
+import std.json
+import std.tcp
+import std.os
+import std.uuid
+import std.worker
+import std.sync
+import std.list
+import testcontainers.docker
+import testcontainers.wait
+
+exports(
+    // the request and its setters
+    Request, FileSpec, Hook, CmdSpec, request_new, request_free, run, run_request, create,
+    expose, env, cmd, cmd_arg, entrypoint, entrypoint_arg, label, name, hostname,
+    workdir, user, privileged, extra_host, cap_add, cap_drop, shm_size, auto_remove,
+    network_mode, bind, bind_ro, volume, tmpfs, with_network, network_alias,
+    file, file_content, wait_for, additional_wait, wait_deadline, log_consumer,
+    config_modifier, host_config_modifier, endpoint_settings_modifier,
+    on_pre_build, on_post_build, on_pre_create, on_post_create, on_pre_start,
+    on_post_start, on_post_ready, on_pre_stop, on_post_stop, on_pre_terminate,
+    on_post_terminate, startup_command, after_ready_command, always_pull, platform,
+    image_substitutor, from_dockerfile, build_arg, build_tag, keep_built_image,
+    print_build_log, no_start, unset_env, set_setting, host_access_port, with_image,
+    reuse_by_name, container_request, parallel, PARALLEL_WORKERS,
+    // reading and copying a request (for modules)
+    req_image, req_env, req_has_env, req_env_keys, req_env_list, req_cmd,
+    req_has_cmd_arg, req_entrypoint, req_exposed, req_networks, req_network_aliases, req_first_network_alias, req_strategy, req_setting, req_has_setting,
+    request_copy,
+    // container operations
+    id, name_of, image_of, session_id, host, mapped_port, endpoint, inspect,
+    state_of, is_running, start, stop, terminate, terminate_graceful, logs,
+    logs_split, logs_follow, exec, exec_with, copy_to_container,
+    copy_file_to_container, copy_dir_to_container, copy_file_from_container,
+    container_ip, container_ips, networks, network_aliases,
+    // engine and reaper
+    engine_available, reaper_running, reaper_start, reaper_disable_for_test, stage_name,
+    STAGE_PRE_BUILD, STAGE_POST_BUILD, STAGE_PRE_CREATE, STAGE_POST_CREATE,
+    STAGE_PRE_START, STAGE_POST_START, STAGE_POST_READY, STAGE_PRE_STOP,
+    STAGE_POST_STOP, STAGE_PRE_TERMINATE, STAGE_POST_TERMINATE,
+    RYUK_IMAGE, HOST_INTERNAL, HOST_GATEWAY
+)
+
+const RYUK_IMAGE = "testcontainers/ryuk:0.14.0"
+
+// parallel's worker count when it is given 0 (Go's defaultWorkersCount).
+const PARALLEL_WORKERS = 8
+
+// The name a container reaches the test's host by (Go's HostInternal), once
+// the request has a host_access_port.
+const HOST_INTERNAL = "host.testcontainers.internal"
+// The engine-side address it resolves to: Docker's and Podman's special
+// extra-host value for "the host this engine runs for".
+const HOST_GATEWAY = "host-gateway"
+
+const STAGE_PRE_BUILD = 1
+const STAGE_POST_BUILD = 2
+const STAGE_PRE_CREATE = 3
+const STAGE_POST_CREATE = 4
+const STAGE_PRE_START = 5
+const STAGE_POST_START = 6
+const STAGE_POST_READY = 7
+const STAGE_PRE_STOP = 8
+const STAGE_POST_STOP = 9
+const STAGE_PRE_TERMINATE = 10
+const STAGE_POST_TERMINATE = 11
+
+// A file to copy in before start (Go's ContainerFile).
+struct FileSpec {
+    host_path: string
+    content: string
+    is_content: bool
+    target: string
+    mode: int
+}
+
+// One lifecycle hook: |c: *docker.Container| { ...; return "" }.
+struct Hook {
+    stage: int
+    f: fn
+}
+
+struct CmdSpec {
+    args: string[]
+}
+
+// Go's ContainerRequest, filled by the setters. Opaque to callers: build it
+// with the setters, read it with the req_* functions.
+struct Request {
+    image: string
+    name: string
+    env: string[]
+    cmd: string[]
+    has_cmd: bool
+    entrypoint: string[]
+    has_entrypoint: bool
+    exposed: string[]
+    labels: string[]
+    hostname: string
+    workdir: string
+    user: string
+    privileged: bool
+    auto_remove: bool
+    network_mode: string
+    extra_hosts: string[]
+    cap_add: string[]
+    cap_drop: string[]
+    shm_size: long
+    binds: string[]
+    volume_names: string[]
+    volume_targets: string[]
+    tmpfs_targets: string[]
+    tmpfs_options: string[]
+    networks: string[]
+    alias_networks: string[]
+    alias_names: string[]
+    files: FileSpec[]
+    strategy: *wait.Strategy
+    wait_deadline_ms: long
+    log_consumers: fn[]
+    hooks: Hook[]
+    config_mods: fn[]
+    host_config_mods: fn[]
+    endpoint_mods: fn[]
+    startup_cmds: CmdSpec[]
+    after_ready_cmds: CmdSpec[]
+    always_pull: bool
+    platform: string
+    substitutors: fn[]
+    dockerfile_context: string
+    dockerfile: string
+    build_tag: string
+    build_args: string[]
+    keep_image: bool
+    print_build_log: bool
+    built_image: string
+    no_start: bool
+    is_reaper: bool
+    bad: string            // a setter's complaint, reported by run
+    // module settings (set_setting / req_setting): a module's own options,
+    // carried from the caller's block to the module's run; never sent to
+    // the engine
+    setting_keys: string[]
+    setting_values: string[]
+    // host_access_port: the host ports the container is meant to reach on
+    // HOST_INTERNAL (Go's HostAccessPorts)
+    host_access_ports: int[]
+    // reuse_by_name (Go's Reuse)
+    reuse: bool
+}
+
+// The builder's config factory: an empty request.
+request_new() -> ptr {
+    r = heap.new(Request)
+    return r as ptr
+}
+
+// The builder's release on an early exit from the block, and for a request
+// never run.
+request_free(p: ptr) {
+    if p == null { return }
+    heap.free(p as *Request)
+}
+
+fn rq(p: @into ptr) -> *Request { return p as *Request }
+
+fn copy_strings(xs: string[]) -> string[] {
+    string[] out = []
+    for x in xs { out.push(x) }
+    return out
+}
+
+// ---- setters: each takes the request first (_ctx inside a block) ----
+
+expose(_ctx: ptr, port: string) { r = rq(_ctx); r.exposed.push(port) }
+env(_ctx: ptr, key: string, value: string) {
+    r = rq(_ctx)
+    // a later value for a key replaces the earlier one, as a Go map does
+    prefix = "${key}="
+    string[] kept = []
+    for e in r.env {
+        if string.starts_with(e, prefix) == 0 { kept.push(e) }
+    }
+    kept.push("${key}=${value}")
+    r.env = kept
+}
+// Remove key from the request's environment (Go's delete(req.Env, key)).
+// Nothing happens when it is not set.
+unset_env(_ctx: ptr, key: string) {
+    r = rq(_ctx)
+    prefix = "${key}="
+    string[] kept = []
+    for e in r.env {
+        if string.starts_with(e, prefix) == 0 { kept.push(e) }
+    }
+    r.env = kept
+}
+cmd(_ctx: ptr, args: string[]) {
+    r = rq(_ctx)
+    r.cmd = copy_strings(args)
+    r.has_cmd = true
+}
+cmd_arg(_ctx: ptr, arg: string) {
+    r = rq(_ctx)
+    r.cmd.push(arg)
+    r.has_cmd = true
+}
+entrypoint(_ctx: ptr, args: string[]) {
+    r = rq(_ctx)
+    r.entrypoint = copy_strings(args)
+    r.has_entrypoint = true
+}
+entrypoint_arg(_ctx: ptr, arg: string) {
+    r = rq(_ctx)
+    r.entrypoint.push(arg)
+    r.has_entrypoint = true
+}
+label(_ctx: ptr, key: string, value: string) {
+    r = rq(_ctx)
+    if string.starts_with(key, docker.LABEL_BASE) == 1 && !r.is_reaper {
+        r.bad = "label ${key}: the ${docker.LABEL_BASE} prefix is reserved"
+        return
+    }
+    r.labels.push("${key}=${value}")
+}
+name(_ctx: ptr, n: string) { r = rq(_ctx); r.name = n }
+hostname(_ctx: ptr, h: string) { r = rq(_ctx); r.hostname = h }
+workdir(_ctx: ptr, d: string) { r = rq(_ctx); r.workdir = d }
+user(_ctx: ptr, u: string) { r = rq(_ctx); r.user = u }
+privileged(_ctx: ptr) { r = rq(_ctx); r.privileged = true }
+extra_host(_ctx: ptr, h: string) { r = rq(_ctx); r.extra_hosts.push(h) }
+cap_add(_ctx: ptr, c: string) { r = rq(_ctx); r.cap_add.push(c) }
+cap_drop(_ctx: ptr, c: string) { r = rq(_ctx); r.cap_drop.push(c) }
+shm_size(_ctx: ptr, bytes: long) { r = rq(_ctx); r.shm_size = bytes }
+auto_remove(_ctx: ptr) { r = rq(_ctx); r.auto_remove = true }
+network_mode(_ctx: ptr, m: string) { r = rq(_ctx); r.network_mode = m }
+bind(_ctx: ptr, host_path: string, target: string) { r = rq(_ctx); r.binds.push("${host_path}:${target}") }
+bind_ro(_ctx: ptr, host_path: string, target: string) { r = rq(_ctx); r.binds.push("${host_path}:${target}:ro") }
+volume(_ctx: ptr, vol: string, target: string) {
+    r = rq(_ctx)
+    r.volume_names.push(vol)
+    r.volume_targets.push(target)
+}
+tmpfs(_ctx: ptr, target: string, options: string) {
+    r = rq(_ctx)
+    r.tmpfs_targets.push(target)
+    r.tmpfs_options.push(options)
+}
+with_network(_ctx: ptr, network: string) {
+    r = rq(_ctx)
+    for n in r.networks { if n == network { return } }
+    r.networks.push(network)
+}
+network_alias(_ctx: ptr, network: string, alias: string) {
+    r = rq(_ctx)
+    with_network(_ctx, network)
+    r.alias_networks.push(network)
+    r.alias_names.push(alias)
+}
+// A host file copied to container_path before start (missing parents are
+// made), or a host directory extracted under its own base name into the
+// parent of container_path, as Go's WithFiles does: "testdata/data" to
+// "/data" lands at /data, to "/srv/" at /srv/data (the parent must exist).
+file(_ctx: ptr, host_path: string, container_path: string, mode: int) {
+    r = rq(_ctx)
+    r.files.push(FileSpec { host_path: host_path, content: "", is_content: false, target: container_path, mode: mode })
+}
+// Bytes copied to container_path before start.
+file_content(_ctx: ptr, content: string, container_path: string, mode: int) {
+    r = rq(_ctx)
+    r.files.push(FileSpec { host_path: "", content: content, is_content: true, target: container_path, mode: mode })
+}
+wait_for(_ctx: ptr, s: *wait.Strategy) { r = rq(_ctx); r.strategy = s }
+additional_wait(_ctx: ptr, s: *wait.Strategy) {
+    r = rq(_ctx)
+    if r.strategy == null { r.strategy = s } else { r.strategy = wait.and_then(r.strategy, s) }
+}
+wait_deadline(_ctx: ptr, d: Duration) { r = rq(_ctx); r.wait_deadline_ms = d / 1ms }
+// f: |kind: int, line: string| { ... }, kind 1 stdout, 2 stderr.
+log_consumer(_ctx: ptr, f: @keep fn) { r = rq(_ctx); r.log_consumers.push(f) }
+// f: |cfg: ptr| { json.set(cfg, ...) } on the container Config document.
+config_modifier(_ctx: ptr, f: @keep fn) { r = rq(_ctx); r.config_mods.push(f) }
+// f: |hc: ptr| { ... } on the HostConfig document.
+host_config_modifier(_ctx: ptr, f: @keep fn) { r = rq(_ctx); r.host_config_mods.push(f) }
+// f: |endpoints: ptr| { ... } on NetworkingConfig.EndpointsConfig.
+endpoint_settings_modifier(_ctx: ptr, f: @keep fn) { r = rq(_ctx); r.endpoint_mods.push(f) }
+
+fn add_hook(_ctx: ptr, stage: int, f: @keep fn) { r = rq(_ctx); r.hooks.push(Hook { stage: stage, f: f }) }
+on_pre_build(_ctx: ptr, f: @keep fn) { add_hook(_ctx, STAGE_PRE_BUILD, f) }
+on_post_build(_ctx: ptr, f: @keep fn) { add_hook(_ctx, STAGE_POST_BUILD, f) }
+on_pre_create(_ctx: ptr, f: @keep fn) { add_hook(_ctx, STAGE_PRE_CREATE, f) }
+on_post_create(_ctx: ptr, f: @keep fn) { add_hook(_ctx, STAGE_POST_CREATE, f) }
+on_pre_start(_ctx: ptr, f: @keep fn) { add_hook(_ctx, STAGE_PRE_START, f) }
+on_post_start(_ctx: ptr, f: @keep fn) { add_hook(_ctx, STAGE_POST_START, f) }
+on_post_ready(_ctx: ptr, f: @keep fn) { add_hook(_ctx, STAGE_POST_READY, f) }
+on_pre_stop(_ctx: ptr, f: @keep fn) { add_hook(_ctx, STAGE_PRE_STOP, f) }
+on_post_stop(_ctx: ptr, f: @keep fn) { add_hook(_ctx, STAGE_POST_STOP, f) }
+on_pre_terminate(_ctx: ptr, f: @keep fn) { add_hook(_ctx, STAGE_PRE_TERMINATE, f) }
+on_post_terminate(_ctx: ptr, f: @keep fn) { add_hook(_ctx, STAGE_POST_TERMINATE, f) }
+
+startup_command(_ctx: ptr, args: string[]) { r = rq(_ctx); r.startup_cmds.push(CmdSpec { args: copy_strings(args) }) }
+after_ready_command(_ctx: ptr, args: string[]) { r = rq(_ctx); r.after_ready_cmds.push(CmdSpec { args: copy_strings(args) }) }
+always_pull(_ctx: ptr) { r = rq(_ctx); r.always_pull = true }
+platform(_ctx: ptr, p: string) { r = rq(_ctx); r.platform = p }
+// f: |image: string| -> string (Go's ImageSubstitutor.Substitute)
+image_substitutor(_ctx: ptr, f: @keep fn) { r = rq(_ctx); r.substitutors.push(f) }
+from_dockerfile(_ctx: ptr, context_dir: string, dockerfile: string) {
+    r = rq(_ctx)
+    r.dockerfile_context = context_dir
+    r.dockerfile = dockerfile
+}
+build_arg(_ctx: ptr, key: string, value: string) { r = rq(_ctx); r.build_args.push("${key}=${value}") }
+build_tag(_ctx: ptr, tag: string) { r = rq(_ctx); r.build_tag = tag }
+keep_built_image(_ctx: ptr) { r = rq(_ctx); r.keep_image = true }
+print_build_log(_ctx: ptr) { r = rq(_ctx); r.print_build_log = true }
+no_start(_ctx: ptr) { r = rq(_ctx); r.no_start = true }
+
+// Let the container reach a service listening on port on the test's host as
+// HOST_INTERNAL:port (Go's WithHostPortAccess / HostAccessPorts). Go runs an
+// SSH-tunnel sidecar for it; here the engine maps the name itself, through
+// the extra host HOST_INTERNAL:host-gateway, which Docker (20.10 on) and
+// Podman both resolve to the host they run for. On Docker Desktop, OrbStack,
+// Colima and a Podman machine that reaches the host's loopback, so the
+// service may listen on 127.0.0.1; on Linux Docker or rootless Podman it is
+// the bridge's or the host's address (not its loopback), so the service must
+// listen there too: bind 0.0.0.0, which works on every engine. (Go's SSH
+// tunnel dials localhost from the test process, so Go does not need this.)
+// See DESIGN.md section 12.
+host_access_port(_ctx: ptr, port: int) {
+    r = rq(_ctx)
+    if port <= 0 || port > 65535 {
+        r.bad = "host_access_port: ${port} is not a port"
+        return
+    }
+    for p in r.host_access_ports { if p == port { return } }
+    if r.host_access_ports.len == 0 { r.extra_hosts.push("${HOST_INTERNAL}:${HOST_GATEWAY}") }
+    r.host_access_ports.push(port)
+}
+
+// Reuse the container called container_name if it exists (starting it if it
+// is stopped), else create it under that name (Go's WithReuseByName). Within
+// a session that is all; across sessions (a second test run) the container
+// must outlive the first session's reaper, so with
+// testcontainers.reuse.enable=true in ~/.testcontainers.properties (or
+// TESTCONTAINERS_REUSE_ENABLE=true) a container created for reuse is not
+// labelled for the reaper. DESIGN.md section 13.
+reuse_by_name(_ctx: ptr, container_name: string) {
+    r = rq(_ctx)
+    r.name = container_name
+    r.reuse = true
+}
+
+// The image to run when run_request / parallel is given "" (Go's WithImage).
+with_image(_ctx: ptr, image: string) { r = rq(_ctx); r.image = image }
+
+// A module setting: a value a module's option leaves on the request for the
+// module's run to read back with req_setting, the way Go's module options
+// fill a settings struct of their own. Never sent to the engine. A later
+// value for a key replaces the earlier one. By convention the key starts
+// with the module's name: "rabbitmq.ssl_conf".
+set_setting(_ctx: ptr, key: string, value: string) {
+    r = rq(_ctx)
+    i = 0
+    while i < r.setting_keys.len {
+        if r.setting_keys[i] == key {
+            r.setting_values[i] = value
+            return
+        }
+        i = i + 1
+    }
+    r.setting_keys.push(key)
+    r.setting_values.push(value)
+}
+
+// ---- reading a request (for modules that adjust defaults in run) ----
+
+req_image(p: ptr) -> string { return rq(p).image }
+req_env(p: ptr, key: string) -> string {
+    prefix = "${key}="
+    for e in rq(p).env {
+        if string.starts_with(e, prefix) == 1 { return string.substring(e, string.length(prefix), string.length(e)) }
+    }
+    return ""
+}
+// Whether key is in the environment at all (set to "" counts), as Go's
+// `_, ok := req.Env[key]`.
+req_has_env(p: ptr, key: string) -> bool {
+    prefix = "${key}="
+    for e in rq(p).env {
+        if string.starts_with(e, prefix) == 1 { return true }
+    }
+    return false
+}
+// The names in the environment, in the order they were first set (Go's
+// `for k := range req.Env`, which has no order).
+req_env_keys(p: ptr) -> string[] {
+    string[] out = []
+    for e in rq(p).env {
+        eq = string.index_of(e, "=")
+        if eq > 0 { out.push(string.substring(e, 0, eq)) }
+    }
+    return out
+}
+// The environment as "KEY=value" entries, a copy.
+req_env_list(p: ptr) -> string[] { return copy_strings(rq(p).env) }
+// A module setting (set_setting); "" when it is not set.
+req_setting(p: ptr, key: string) -> string {
+    r = rq(p)
+    i = 0
+    while i < r.setting_keys.len {
+        if r.setting_keys[i] == key { return r.setting_values[i] }
+        i = i + 1
+    }
+    return ""
+}
+req_has_setting(p: ptr, key: string) -> bool {
+    for k in rq(p).setting_keys { if k == key { return true } }
+    return false
+}
+req_cmd(p: ptr) -> string[] { return copy_strings(rq(p).cmd) }
+req_has_cmd_arg(p: ptr, arg: string) -> bool {
+    for a in rq(p).cmd { if a == arg { return true } }
+    return false
+}
+// The entrypoint words set so far (Go's req.Entrypoint), a copy.
+req_entrypoint(p: ptr) -> string[] { return copy_strings(rq(p).entrypoint) }
+req_exposed(p: ptr) -> string[] { return copy_strings(rq(p).exposed) }
+// The networks the request joins, in order (Go's req.Networks).
+req_networks(p: ptr) -> string[] { return copy_strings(rq(p).networks) }
+// The aliases set on one network, in order (Go's req.NetworkAliases[net]).
+req_network_aliases(p: ptr, network: string) -> string[] {
+    r = rq(p)
+    string[] out = []
+    i = 0
+    while i < r.alias_networks.len {
+        if r.alias_networks[i] == network { out.push(r.alias_names[i]) }
+        i = i + 1
+    }
+    return out
+}
+req_strategy(p: ptr) -> *wait.Strategy { return rq(p).strategy }
+// The networks the request is attached to, in order (Go's `req.Networks`).
+// The first alias given on the request's first network, or "" when the
+// request has no network or no alias there (Go's
+// `req.NetworkAliases[req.Networks[0]][0]`), for modules that advertise
+// themselves by their network alias (kafka, redpanda).
+req_first_network_alias(p: ptr) -> string {
+    r = rq(p)
+    if r.networks.len == 0 { return "" }
+    nw = r.networks[0]
+    i = 0
+    while i < r.alias_networks.len {
+        if r.alias_networks[i] == nw { return r.alias_names[i] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn copy_fns(xs: fn[]) -> fn[] {
+    fn[] out = []
+    for f in xs { out.push(f) }
+    return out
+}
+
+fn copy_cmds(xs: CmdSpec[]) -> CmdSpec[] {
+    CmdSpec[] out = []
+    for c in xs { out.push(CmdSpec { args: copy_strings(c.args) }) }
+    return out
+}
+
+// A copy of a request that has not run: every setting, list and module
+// setting, so a module can start several containers from one caller's
+// block, as Go re-applies the caller's options to each (modules/etcd's
+// cluster nodes). The closures (hooks, consumers, modifiers, matchers) and
+// the wait strategy are shared, not cloned, as Go's options share them.
+// The copy is the caller's to run (run_request takes it) or request_free.
+request_copy(p: ptr) -> ptr {
+    src = rq(p)
+    if src == null { return request_new() }
+    r = rq(request_new())
+    r.image = src.image
+    r.name = src.name
+    r.env = copy_strings(src.env)
+    r.cmd = copy_strings(src.cmd)
+    r.has_cmd = src.has_cmd
+    r.entrypoint = copy_strings(src.entrypoint)
+    r.has_entrypoint = src.has_entrypoint
+    r.exposed = copy_strings(src.exposed)
+    r.labels = copy_strings(src.labels)
+    r.hostname = src.hostname
+    r.workdir = src.workdir
+    r.user = src.user
+    r.privileged = src.privileged
+    r.auto_remove = src.auto_remove
+    r.network_mode = src.network_mode
+    r.extra_hosts = copy_strings(src.extra_hosts)
+    r.cap_add = copy_strings(src.cap_add)
+    r.cap_drop = copy_strings(src.cap_drop)
+    r.shm_size = src.shm_size
+    r.binds = copy_strings(src.binds)
+    r.volume_names = copy_strings(src.volume_names)
+    r.volume_targets = copy_strings(src.volume_targets)
+    r.tmpfs_targets = copy_strings(src.tmpfs_targets)
+    r.tmpfs_options = copy_strings(src.tmpfs_options)
+    r.networks = copy_strings(src.networks)
+    r.alias_networks = copy_strings(src.alias_networks)
+    r.alias_names = copy_strings(src.alias_names)
+    FileSpec[] files = []
+    for f in src.files {
+        files.push(FileSpec { host_path: f.host_path, content: f.content, is_content: f.is_content, target: f.target, mode: f.mode })
+    }
+    r.files = files
+    r.strategy = src.strategy
+    r.wait_deadline_ms = src.wait_deadline_ms
+    r.log_consumers = copy_fns(src.log_consumers)
+    Hook[] hooks = []
+    for h in src.hooks { hooks.push(Hook { stage: h.stage, f: h.f }) }
+    r.hooks = hooks
+    r.config_mods = copy_fns(src.config_mods)
+    r.host_config_mods = copy_fns(src.host_config_mods)
+    r.endpoint_mods = copy_fns(src.endpoint_mods)
+    r.startup_cmds = copy_cmds(src.startup_cmds)
+    r.after_ready_cmds = copy_cmds(src.after_ready_cmds)
+    r.always_pull = src.always_pull
+    r.platform = src.platform
+    r.substitutors = copy_fns(src.substitutors)
+    r.dockerfile_context = src.dockerfile_context
+    r.dockerfile = src.dockerfile
+    r.build_tag = src.build_tag
+    r.build_args = copy_strings(src.build_args)
+    r.keep_image = src.keep_image
+    r.print_build_log = src.print_build_log
+    r.no_start = src.no_start
+    r.is_reaper = src.is_reaper
+    r.bad = src.bad
+    r.setting_keys = copy_strings(src.setting_keys)
+    r.setting_values = copy_strings(src.setting_values)
+    int[] hap = []
+    for hp in src.host_access_ports { hap.push(hp) }
+    r.host_access_ports = hap
+    r.reuse = src.reuse
+    return r as ptr
+}
+
+stage_name(stage: int) -> string {
+    if stage == STAGE_PRE_BUILD { return "pre-build" }
+    if stage == STAGE_POST_BUILD { return "post-build" }
+    if stage == STAGE_PRE_CREATE { return "pre-create" }
+    if stage == STAGE_POST_CREATE { return "post-create" }
+    if stage == STAGE_PRE_START { return "pre-start" }
+    if stage == STAGE_POST_START { return "post-start" }
+    if stage == STAGE_POST_READY { return "post-ready" }
+    if stage == STAGE_PRE_STOP { return "pre-stop" }
+    if stage == STAGE_POST_STOP { return "post-stop" }
+    if stage == STAGE_PRE_TERMINATE { return "pre-terminate" }
+    return "post-terminate"
+}
+
+fn run_hooks(r: *Request, stage: int, c: *docker.Container) -> string {
+    if r == null { return "" }
+    for h in r.hooks {
+        if h.stage == stage {
+            string e = call(h.f, c)
+            if string.length(e) > 0 { return "${stage_name(stage)} hook: ${e}" }
+        }
+    }
+    return ""
+}
+
+// ===================================================================
+// The reaper (reaper.go)
+// ===================================================================
+
+var reaper_sock: ptr = null
+var reaper_container: ptr = null
+var reaper_off_for_test: bool = false
+
+fn reaper_on() -> bool {
+    if reaper_off_for_test { return false }
+    return !docker.config().ryuk_disabled
+}
+
+// Whether this process holds a connection to a running reaper.
+reaper_running() -> bool { return reaper_sock != null }
+
+// Tests of the no-reaper path call this before their first container.
+reaper_disable_for_test() { reaper_off_for_test = true }
+
+// Start (or join) the session's reaper without running a container, for
+// resources something other than run creates with the session's labels (a
+// compose project's containers, networks and volumes, made by the compose
+// CLI: modules/compose). "" when it is running, or the reaper is off.
+reaper_start() -> string {
+    cl, err = docker.client()
+    if err != "" { return err }
+    return ensure_reaper(cl)
+}
+
+fn reaper_filter() -> string {
+    sid = docker.session_id()
+    return "label=${docker.LABEL_BASE}=true&label=${docker.LABEL_LANG}=aether&label=${docker.LABEL_VERSION}=${docker.VERSION}&label=${docker.LABEL_SESSION_ID}=${sid}&label=${docker.LABEL_REAP}=true\n"
+}
+
+// Dial the reaper and send the session's filter; keep the connection.
+fn reaper_connect(host: string, port: int) -> string {
+    tries = 0
+    last = ""
+    while tries < 50 {
+        sock, err = tcp.connect(host, port)
+        if err == "" {
+            _, werr = tcp.write(sock, reaper_filter())
+            if werr == "" {
+                ack, rerr = tcp.read(sock, 4)
+                if rerr == "" && ack == "ACK\n" {
+                    reaper_sock = sock
+                    return ""
+                }
+                last = "handshake: got '${ack}' ${rerr}"
+            } else {
+                last = "write filter: ${werr}"
+            }
+            tcp.tcp_close(sock)
+        } else {
+            last = err
+        }
+        sleep(100)
+        tries = tries + 1
+    }
+    return "connect to the reaper at ${host}:${port}: ${last}"
+}
+
+fn reaper_request(cl: *docker.Client) -> *Request {
+    r = rq(request_new())
+    r.is_reaper = true
+    port = os.os_getenv("RYUK_PORT")
+    p = "8080/tcp"
+    if port != null && string.length(port) > 0 { p = "${port}/tcp" }
+    r.exposed.push(p)
+    r.name = "reaper_${docker.session_id()}"
+    r.labels.push("${docker.LABEL_REAPER}=true")
+    r.labels.push("${docker.LABEL_RYUK}=true")
+    sockpath = docker.engine_socket_for_mounts(cl)
+    r.binds.push("${sockpath}:/var/run/docker.sock")
+    cfg = docker.config()
+    r.privileged = cfg.ryuk_privileged || docker.is_podman(cl)
+    r.auto_remove = true
+    if string.length(cfg.ryuk_connection_timeout) > 0 { env(r as ptr, "RYUK_CONNECTION_TIMEOUT", cfg.ryuk_connection_timeout) }
+    if string.length(cfg.ryuk_reconnection_timeout) > 0 { env(r as ptr, "RYUK_RECONNECTION_TIMEOUT", cfg.ryuk_reconnection_timeout) }
+    if cfg.ryuk_verbose { env(r as ptr, "RYUK_VERBOSE", "true") }
+    r.strategy = wait.for_all([wait.for_log("Started"), wait.for_listening_port(p) { skip_internal_check() }])
+    return r
+}
+
+// Start Ryuk for this session (or find the one another process of the same
+// session started), and connect to it. Once per process.
+fn ensure_reaper(cl: *docker.Client) -> string {
+    if reaper_sock != null { return "" }
+    if !reaper_on() { return "" }
+    string[] want = []
+    want.push("${docker.LABEL_SESSION_ID}=${docker.session_id()}")
+    want.push("${docker.LABEL_RYUK}=true")
+    ids, lerr = docker.list_containers(cl, want)
+    if lerr == "" && ids.len > 0 {
+        c = docker.container_new(cl, ids[0], RYUK_IMAGE)
+        st, serr = docker.state_of(c)
+        if serr == "" && st.running {
+            mp, merr = docker.mapped_port(c, "8080/tcp")
+            if merr == "" {
+                h, _ = docker.host(c)
+                cerr = reaper_connect(h, mp)
+                if cerr == "" {
+                    reaper_container = c as ptr
+                    return ""
+                }
+            }
+        }
+    }
+    r = reaper_request(cl)
+    c, err = start_request(cl, r, RYUK_IMAGE)
+    if err != "" {
+        if c != null { _ = docker.remove(c, true, true) }
+        return "reaper: ${err}"
+    }
+    reaper_container = c as ptr
+    port = r.exposed[0]
+    mp, merr = docker.mapped_port(c, port)
+    if merr != "" { return "reaper: ${merr}" }
+    h, _ = docker.host(c)
+    return reaper_connect(h, mp)
+}
+
+// ===================================================================
+// Running a container (docker.go CreateContainer, generic.go Run)
+// ===================================================================
+
+fn json_strings(xs: string[]) -> ptr {
+    a = json.arr()
+    for x in xs { json.push(a, json.str(x)) }
+    return a
+}
+
+fn kv_object(o: ptr, kvs: string[]) {
+    for kv in kvs {
+        eq = string.index_of(kv, "=")
+        if eq > 0 { json.set(o, string.substring(kv, 0, eq), json.str(string.substring(kv, eq + 1, string.length(kv)))) }
+    }
+}
+
+fn host_port_of(spec: string) -> string {
+    // "8080:80/tcp" -> "8080"; "1.2.3.4:8080:80" -> "8080"; "80" -> ""
+    s = spec
+    slash = string.index_of(s, "/")
+    if slash >= 0 { s = string.substring(s, 0, slash) }
+    parts = string.split(s, ":")
+    n = string.string_array_size(parts)
+    out = ""
+    if n >= 2 { out = string.string_array_get(parts, n - 2) }
+    string.string_array_free(parts)
+    return out
+}
+
+fn resolve_image(r: *Request, image: string) -> string {
+    img = docker.hub_prefixed(image)
+    for f in r.substitutors {
+        string next = call(f, img)
+        if string.length(next) > 0 { img = next }
+    }
+    return img
+}
+
+fn build_config(cl: *docker.Client, r: *Request, image: string) -> ptr {
+    cfg = json.obj()
+    json.set(cfg, "Image", json.str(image))
+    if r.env.len > 0 { json.set(cfg, "Env", json_strings(r.env)) }
+    if r.has_cmd { json.set(cfg, "Cmd", json_strings(r.cmd)) }
+    if r.has_entrypoint { json.set(cfg, "Entrypoint", json_strings(r.entrypoint)) }
+    if string.length(r.hostname) > 0 { json.set(cfg, "Hostname", json.str(r.hostname)) }
+    if string.length(r.workdir) > 0 { json.set(cfg, "WorkingDir", json.str(r.workdir)) }
+    if string.length(r.user) > 0 { json.set(cfg, "User", json.str(r.user)) }
+    labels = json.obj()
+    docker.add_default_labels(labels)
+    if r.is_reaper {
+        // the reaper is not reaped by itself (Go deletes LabelReap)
+        json.set(labels, docker.LABEL_REAP, json.str("false"))
+    }
+    if r.reuse && docker.config().reuse_enable {
+        // a container kept for later sessions: its session's reaper must
+        // not remove it
+        json.set(labels, docker.LABEL_REAP, json.str("false"))
+    }
+    kv_object(labels, r.labels)
+    json.set(cfg, "Labels", labels)
+    hc = json.obj()
+    if r.exposed.len > 0 {
+        ep = json.obj()
+        pb = json.obj()
+        for spec in r.exposed {
+            p = docker.normalize_port(spec)
+            json.set(ep, p, json.obj())
+            b = json.obj()
+            json.set(b, "HostIp", json.str(""))
+            json.set(b, "HostPort", json.str(host_port_of(spec)))
+            arr = json.arr()
+            json.push(arr, b)
+            json.set(pb, p, arr)
+        }
+        json.set(cfg, "ExposedPorts", ep)
+        json.set(hc, "PortBindings", pb)
+    }
+    if r.binds.len > 0 { json.set(hc, "Binds", json_strings(r.binds)) }
+    if r.volume_names.len > 0 {
+        mounts = json.arr()
+        i = 0
+        while i < r.volume_names.len {
+            m = json.obj()
+            json.set(m, "Type", json.str("volume"))
+            json.set(m, "Source", json.str(r.volume_names[i]))
+            json.set(m, "Target", json.str(r.volume_targets[i]))
+            vo = json.obj()
+            vl = json.obj()
+            docker.add_default_labels(vl)
+            json.set(vo, "Labels", vl)
+            json.set(m, "VolumeOptions", vo)
+            json.push(mounts, m)
+            i = i + 1
+        }
+        json.set(hc, "Mounts", mounts)
+    }
+    if r.tmpfs_targets.len > 0 {
+        t = json.obj()
+        i = 0
+        while i < r.tmpfs_targets.len {
+            json.set(t, r.tmpfs_targets[i], json.str(r.tmpfs_options[i]))
+            i = i + 1
+        }
+        json.set(hc, "Tmpfs", t)
+    }
+    if r.privileged { json.set(hc, "Privileged", json.boolean(1)) }
+    if r.auto_remove { json.set(hc, "AutoRemove", json.boolean(1)) }
+    if r.extra_hosts.len > 0 { json.set(hc, "ExtraHosts", json_strings(r.extra_hosts)) }
+    if r.cap_add.len > 0 { json.set(hc, "CapAdd", json_strings(r.cap_add)) }
+    if r.cap_drop.len > 0 { json.set(hc, "CapDrop", json_strings(r.cap_drop)) }
+    if r.shm_size > 0 { json.set(hc, "ShmSize", json.from_int(r.shm_size)) }
+    mode = r.network_mode
+    if string.length(mode) == 0 && r.networks.len > 0 { mode = r.networks[0] }
+    if string.length(mode) > 0 { json.set(hc, "NetworkMode", json.str(mode)) }
+    for f in r.host_config_mods { call(f, hc) }
+    json.set(cfg, "HostConfig", hc)
+    endpoints = json.obj()
+    if r.networks.len > 0 {
+        first = r.networks[0]
+        es = json.obj()
+        string[] al = []
+        i = 0
+        while i < r.alias_networks.len {
+            if r.alias_networks[i] == first { al.push(r.alias_names[i]) }
+            i = i + 1
+        }
+        if al.len > 0 { json.set(es, "Aliases", json_strings(al)) }
+        json.set(endpoints, first, es)
+    }
+    for f in r.endpoint_mods { call(f, endpoints) }
+    nc = json.obj()
+    json.set(nc, "EndpointsConfig", endpoints)
+    json.set(cfg, "NetworkingConfig", nc)
+    for f in r.config_mods { call(f, cfg) }
+    _ = cl
+    return cfg
+}
+
+fn copy_files(c: *docker.Container, r: *Request) -> string {
+    for f in r.files {
+        err = ""
+        if f.is_content {
+            err = docker.copy_to_container(c, f.content, f.target, f.mode)
+        } else {
+            err = docker.copy_file_to_container(c, f.host_path, f.target, f.mode)
+        }
+        if err != "" { return "copy ${f.target}: ${err}" }
+    }
+    return ""
+}
+
+fn run_commands(c: *docker.Container, cmds: CmdSpec[], what: string) -> string {
+    for cs in cmds {
+        code, out, err = docker.exec(c, cs.args)
+        if err != "" { return "${what}: ${err}" }
+        _ = code
+        _ = out
+    }
+    return ""
+}
+
+// Create a container from a filled request: build or pull the image,
+// create, connect extra networks, copy files. No start.
+fn create_request(cl: *docker.Client, r: *Request, image: string) -> (*docker.Container, string) {
+    if string.length(r.bad) > 0 { return null, r.bad }
+    img = image
+    if string.length(img) == 0 { img = r.image }
+    if string.length(r.dockerfile_context) > 0 {
+        pre = docker.container_new(cl, "", "")
+        perr = run_hooks(r, STAGE_PRE_BUILD, pre)
+        if perr != "" { return null, perr }
+        tag = r.build_tag
+        if string.length(tag) == 0 {
+            u, _ = uuid.v4()
+            tag = "testcontainers-ae/${string.replace_all(u, "-", "")}:latest"
+        }
+        string[] blabels = []
+        built, out, berr = docker.build_image(cl, r.dockerfile_context, r.dockerfile, tag, r.build_args, blabels)
+        if r.print_build_log { print(out) }
+        if berr != "" { return null, berr }
+        img = built
+        if !r.keep_image { r.built_image = built }
+        post = docker.container_new(cl, "", img)
+        perr2 = run_hooks(r, STAGE_POST_BUILD, post)
+        if perr2 != "" { return null, perr2 }
+    } else {
+        if string.length(img) == 0 { return null, "no image (and no Dockerfile) in the request" }
+        img = resolve_image(r, img)
+        if r.always_pull || !docker.image_exists(cl, img) {
+            perr = docker.pull_image(cl, img, r.platform)
+            if perr != "" { return null, perr }
+        }
+    }
+    r.image = img
+    for vol in r.volume_names {
+        verr = docker.create_volume(cl, vol)
+        if verr != "" { return null, verr }
+    }
+    pre = docker.container_new(cl, "", img)
+    pherr = run_hooks(r, STAGE_PRE_CREATE, pre)
+    if pherr != "" { return null, pherr }
+    cfg = build_config(cl, r, img)
+    cid, cerr = docker.create_container(cl, r.name, cfg, r.platform)
+    if cerr != "" { return null, cerr }
+    c = docker.container_new(cl, cid, img)
+    c.name = r.name
+    c.req = r as ptr
+    for p in r.exposed { c.exposed.push(docker.normalize_port(p)) }
+    // further networks, with their aliases (the API takes one at create)
+    i = 1
+    while i < r.networks.len {
+        net = r.networks[i]
+        string[] al = []
+        j = 0
+        while j < r.alias_networks.len {
+            if r.alias_networks[j] == net { al.push(r.alias_names[j]) }
+            j = j + 1
+        }
+        nerr = docker.connect_network(cl, net, cid, al)
+        if nerr != "" { return c, nerr }
+        i = i + 1
+    }
+    herr = run_hooks(r, STAGE_POST_CREATE, c)
+    if herr != "" { return c, herr }
+    ferr = copy_files(c, r)
+    if ferr != "" { return c, ferr }
+    return c, ""
+}
+
+// Start a created container: pre-start hooks, start, post-start hooks (the
+// caller's, then startup commands, log consumers and the wait, as Go orders
+// its default hooks after the caller's), post-ready hooks.
+fn start_container(c: *docker.Container) -> string {
+    r = rq(c.req)
+    perr = run_hooks(r, STAGE_PRE_START, c)
+    if perr != "" { return perr }
+    serr = docker.start(c)
+    if serr != "" { return serr }
+    return started(c)
+}
+
+// What follows a start: the post-start hooks, startup commands, log
+// consumers, the wait, the post-ready hooks and after-ready commands. Also
+// all a reused container that is already running gets (Go's startedHook).
+fn started(c: *docker.Container) -> string {
+    r = rq(c.req)
+    if r == null { return "" }
+    herr = run_hooks(r, STAGE_POST_START, c)
+    if herr != "" { return herr }
+    cerr = run_commands(c, r.startup_cmds, "startup command")
+    if cerr != "" { return cerr }
+    for f in r.log_consumers { _ = logs_follow(c, f) }
+    if r.strategy != null {
+        s = r.strategy
+        if r.wait_deadline_ms > 0 {
+            s = wait.for_all([r.strategy])
+            s.deadline_ms = r.wait_deadline_ms
+        }
+        werr = wait.until_ready(s, c)
+        if werr != "" { return werr }
+    }
+    rerr = run_hooks(r, STAGE_POST_READY, c)
+    if rerr != "" { return rerr }
+    return run_commands(c, r.after_ready_cmds, "after-ready command")
+}
+
+fn start_request(cl: *docker.Client, r: *Request, image: string) -> (*docker.Container, string) {
+    c, err = create_request(cl, r, image)
+    if err != "" { return c, err }
+    if r.no_start { return c, "" }
+    serr = start_container(c)
+    return c, serr
+}
+
+// Run a filled request (from request_new and the setters), taking it over:
+// the container keeps it for its hooks. image may be "" when the request
+// builds from a Dockerfile.
+run_request(p: ptr, image: string) -> (*docker.Container, string) {
+    r = rq(p)
+    if r == null { r = rq(request_new()) }
+    if string.length(r.bad) > 0 { return null, r.bad }
+    cl, err = docker.client()
+    if err != "" { return null, err }
+    if !r.is_reaper {
+        rerr = ensure_reaper(cl)
+        if rerr != "" { return null, rerr }
+    }
+    if r.reuse { return reuse_or_create(cl, r, image) }
+    return start_request(cl, r, image)
+}
+
+// One reuse at a time in the process, as Go's reuseContainerMx, so two
+// parallel runs of one name do not both create it.
+var reuse_lock: ptr = null
+
+fn lock_reuse() {
+    if reuse_lock == null { reuse_lock = sync.atomic_new(0) }
+    while sync.atomic_cas(reuse_lock, 0, 1) == 0 { sleep(5) }
+}
+
+fn unlock_reuse() { sync.atomic_store(reuse_lock, 0) }
+
+// Go's ReuseOrCreateContainer: the container of that name if there is one,
+// started if it is not running; else a new one under the name. Another
+// process creating it at the same moment (a 409 from create) is waited for.
+fn reuse_or_create(cl: *docker.Client, r: *Request, image: string) -> (*docker.Container, string) {
+    if string.length(r.name) == 0 { return null, "with reuse a container name must not be empty" }
+    lock_reuse()
+    c, ferr = docker.find_container_by_name(cl, r.name)
+    if ferr != "" {
+        unlock_reuse()
+        return null, ferr
+    }
+    if c == null {
+        nc, cerr = create_request(cl, r, image)
+        if cerr == "" {
+            if r.no_start {
+                unlock_reuse()
+                return nc, ""
+            }
+            serr = start_container(nc)
+            unlock_reuse()
+            return nc, serr
+        }
+        if !docker.is_conflict(cerr) {
+            unlock_reuse()
+            return nc, cerr
+        }
+        tries = 0
+        while c == null && tries < 100 {
+            sleep(100)
+            c, ferr = docker.find_container_by_name(cl, r.name)
+            tries = tries + 1
+        }
+        if c == null {
+            unlock_reuse()
+            return null, "reuse ${r.name}: created elsewhere but not found: ${cerr}"
+        }
+    }
+    c.req = r as ptr
+    for p in r.exposed { c.exposed.push(docker.normalize_port(p)) }
+    st, serr = docker.state_of(c)
+    if serr != "" {
+        unlock_reuse()
+        return c, serr
+    }
+    err = ""
+    if st.paused {
+        err = "reuse ${r.name}: cannot start a paused container"
+    } else if st.running {
+        err = started(c)
+    } else if !r.no_start {
+        err = start_container(c)
+    }
+    unlock_reuse()
+    return c, err
+}
+
+// Run a container (Go's Run): the block fills the request first. Returns
+// the container with the error when a step after create fails, so the
+// caller can terminate it.
+builder run(image: string) with request_new -> (*docker.Container, string) {
+    return run_request(_builder, image)
+}
+
+// A request to run later, with its image (Go's GenericContainerRequest), for
+// parallel: `tc.container_request("redis:7-alpine") { expose("6379/tcp") }`.
+builder container_request(image: string) with request_new -> ptr {
+    p = _builder
+    if p == null { p = request_new() }
+    rq(p).image = image
+    return p
+}
+
+struct ParallelSlot {
+    req: ptr
+    c: ptr
+    err: string
+}
+
+fn parallel_worker(slots: ptr, next: ptr, done: ptr, n: int) {
+    i = sync.atomic_add(next, 1) - 1
+    while i < n {
+        sp, _ = list.get(slots, i as int)
+        slot = sp as *ParallelSlot
+        c, err = run_request(slot.req, "")
+        slot.c = c as ptr
+        slot.err = err
+        i = sync.atomic_add(next, 1) - 1
+    }
+    _ = sync.atomic_add(done, 1)
+}
+
+// Run the requests (from container_request) concurrently on up to workers
+// threads, 0 for PARALLEL_WORKERS (Go's ParallelContainers). Returns the
+// containers and the errors, both index-aligned with reqs (a container is
+// null when none was made, and may be there beside its error, to
+// terminate), and "" or every failure in one message (Go's
+// ParallelContainersError). Takes the requests over, as run_request does.
+parallel(reqs: ptr[], workers: int) -> (ptr[], string[], string) {
+    n = reqs.len
+    let cs: ptr[] = []
+    string[] errs = []
+    if n == 0 { return cs, errs, "" }
+    w = workers
+    if w <= 0 { w = PARALLEL_WORKERS }
+    if w > n { w = n }
+    // what the workers share is made here, before they start: the client,
+    // the reaper, the reuse lock
+    cl, cerr = docker.client()
+    pre = cerr
+    if pre == "" { pre = ensure_reaper(cl) }
+    if reuse_lock == null { reuse_lock = sync.atomic_new(0) }
+    slots = list.new()
+    for r in reqs {
+        slot = heap.new(ParallelSlot)
+        slot.req = r
+        slot.c = null
+        slot.err = pre
+        list.add(slots, slot as ptr)
+    }
+    if pre == "" {
+        next = sync.atomic_new(0)
+        done = sync.atomic_new(0)
+        started = 0
+        k = 0
+        while k < w {
+            if worker.run_detached(|| { parallel_worker(slots, next, done, n) }) { started = started + 1 }
+            k = k + 1
+        }
+        if started == 0 { parallel_worker(slots, next, done, n) }
+        want = started
+        if started == 0 { want = 1 }
+        while sync.atomic_load(done) < want { sleep(10) }
+    }
+    all = ""
+    i = 0
+    while i < n {
+        sp, _ = list.get(slots, i)
+        slot = sp as *ParallelSlot
+        cs.push(slot.c)
+        errs.push(slot.err)
+        if string.length(slot.err) > 0 {
+            img = ""
+            if slot.req != null { img = rq(slot.req).image }
+            if string.length(all) > 0 { all = "${all}; " }
+            all = "${all}request ${i} (${img}): ${slot.err}"
+        }
+        if pre != "" { request_free(slot.req) }
+        heap.free(slot)
+        i = i + 1
+    }
+    list.free(slots)
+    return cs, errs, all
+}
+
+// Create without starting (Go's WithNoStart); start later with start(c).
+builder create(image: string) with request_new -> (*docker.Container, string) {
+    r = rq(_builder)
+    if r == null { r = rq(request_new()) }
+    r.no_start = true
+    return run_request(r as ptr, image)
+}
+
+// ===================================================================
+// Container operations (Go's Container interface)
+// ===================================================================
+
+id(c: *docker.Container) -> string { return c.id }
+name_of(c: *docker.Container) -> string { return c.name }
+image_of(c: *docker.Container) -> string { return c.image }
+session_id() -> string { return docker.session_id() }
+engine_available() -> bool { return docker.engine_available() }
+
+host(c: *docker.Container) -> (string, string) { return docker.host(c) }
+mapped_port(c: *docker.Container, port: string) -> (int, string) { return docker.mapped_port(c, port) }
+endpoint(c: *docker.Container, port: string, proto: string) -> (string, string) { return docker.endpoint(c, port, proto) }
+inspect(c: *docker.Container) -> (ptr, string) { return docker.inspect(c) }
+state_of(c: *docker.Container) -> (docker.State, string) { return docker.state_of(c) }
+is_running(c: *docker.Container) -> bool { return docker.is_running(c) }
+logs(c: *docker.Container) -> (string, string) { return docker.logs(c) }
+logs_split(c: *docker.Container) -> (string, string, string) { return docker.logs_split(c) }
+exec(c: *docker.Container, cmd: string[]) -> (int, string, string) { return docker.exec(c, cmd) }
+exec_with(c: *docker.Container, cmd: string[], user: string, workdir: string, env: string[]) -> (*docker.ExecResult, string) {
+    return docker.exec_with(c, cmd, user, workdir, env)
+}
+copy_to_container(c: *docker.Container, content: string, path: string, mode: int) -> string { return docker.copy_to_container(c, content, path, mode) }
+copy_file_to_container(c: *docker.Container, host_path: string, path: string, mode: int) -> string { return docker.copy_file_to_container(c, host_path, path, mode) }
+copy_dir_to_container(c: *docker.Container, host_dir: string, container_path: string, mode: int) -> string { return docker.copy_dir_to_container(c, host_dir, container_path, mode) }
+copy_file_from_container(c: *docker.Container, path: string) -> (string, string) { return docker.copy_file_from_container(c, path) }
+container_ip(c: *docker.Container) -> (string, string) { return docker.container_ip(c) }
+container_ips(c: *docker.Container) -> (string[], string) { return docker.container_ips(c) }
+networks(c: *docker.Container) -> (string[], string) { return docker.networks(c) }
+network_aliases(c: *docker.Container, network: string) -> (string[], string) { return docker.network_aliases(c, network) }
+
+// Start a created (no_start) or stopped container, with its hooks and wait.
+start(c: *docker.Container) -> string {
+    if c == null { return "start: no container" }
+    return start_container(c)
+}
+
+// Stop with a timeout (Go's Stop): pre-stop hooks, stop, post-stop hooks.
+stop(c: *docker.Container, timeout: Duration) -> string {
+    if c == null { return "" }
+    r = rq(c.req)
+    perr = run_hooks(r, STAGE_PRE_STOP, c)
+    if perr != "" { return perr }
+    secs = (timeout / 1ms) / 1000
+    serr = docker.stop(c, secs as int)
+    if serr != "" { return serr }
+    return run_hooks(r, STAGE_POST_STOP, c)
+}
+
+fn wait_followers(c: *docker.Container) {
+    f = c.follower
+    if f == null { return }
+    fl = f as *Follower
+    n = 0
+    while sync.atomic_load(fl.running) > 0 && n < 200 {
+        sleep(10)
+        n = n + 1
+    }
+}
+
+// Terminate (Go's Terminate): pre-terminate hooks, kill and remove the
+// container with its anonymous volumes (`docker rm -fv`, without waiting
+// out a stop timeout: terminate_graceful stops first), wait for its log consumers to see the
+// end, remove an image built for it, post-terminate hooks. Null-safe, and a
+// container already gone is not an error.
+terminate(c: *docker.Container) -> string {
+    if c == null { return "" }
+    if c.terminated { return "" }
+    r = rq(c.req)
+    perr = run_hooks(r, STAGE_PRE_TERMINATE, c)
+    if perr != "" { return perr }
+    // Kill first: Podman's forced remove stops with the 10s timeout before
+    // it kills (Docker's kills at once), so a PID 1 that ignores SIGTERM
+    // (sleep) would cost every terminate ten seconds.
+    _ = docker.kill(c, "KILL")
+    rerr = docker.remove(c, true, true)
+    if rerr != "" { return rerr }
+    wait_followers(c)
+    if r != null && string.length(r.built_image) > 0 {
+        _ = docker.remove_image(c.client, r.built_image, true)
+    }
+    return run_hooks(r, STAGE_POST_TERMINATE, c)
+}
+
+// Stop gracefully (with the stop hooks) and then terminate.
+terminate_graceful(c: *docker.Container, timeout: Duration) -> string {
+    if c == null { return "" }
+    serr = stop(c, timeout)
+    if serr != "" && !docker.is_not_found(serr) { return serr }
+    return terminate(c)
+}
+
+// ===================================================================
+// Log consumers (logconsumer.go, docker.go startLogProduction)
+// ===================================================================
+
+struct Follower {
+    running: ptr     // a std.sync atomic: the follower threads still reading
+    consumers: fn[]
+}
+
+fn follow_loop(c: *docker.Container, f: fn, fl: *Follower) {
+    s, err = docker.logs_stream(c, 0)
+    if err == "" {
+        d = docker.demux_new()
+        going = true
+        while going {
+            chunk = docker.stream_read(s, 65536)
+            if string.length(chunk) == 0 {
+                going = false
+            } else if c.tty {
+                call(f, 1, chunk)
+            } else {
+                docker.demux_feed(d, chunk)
+                while docker.demux_pop(d) {
+                    call(f, d.kind, d.payload)
+                }
+            }
+        }
+        docker.stream_close(s)
+    }
+    _ = sync.atomic_sub(fl.running, 1)
+}
+
+// Follow the container's log on a pool thread (std.worker), handing each
+// frame to f: |kind: int, line: string| (kind 1 stdout, 2 stderr), until the
+// container stops. Go's FollowOutput + StartLogProducer.
+logs_follow(c: *docker.Container, f: @keep fn) -> string {
+    if c.follower == null {
+        fl0 = heap.new(Follower)
+        fl0.running = sync.atomic_new(0)
+        c.follower = fl0 as ptr
+    }
+    fl = c.follower as *Follower
+    _ = sync.atomic_add(fl.running, 1)
+    ok = worker.run_detached(|| { follow_loop(c, f, fl) })
+    if !ok {
+        _ = sync.atomic_sub(fl.running, 1)
+        return "could not start a log follower thread"
+    }
+    return ""
+}

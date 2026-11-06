@@ -1,0 +1,174 @@
+// Ported from testcontainers-go modules/mosquitto/mosquitto_test.go
+//
+// A real Mosquitto: MQTT 3.1.1 CONNECT -> CONNACK, then SUBSCRIBE -> SUBACK
+// and a PUBLISH that comes back to the subscriber, all as bytes over std.tcp
+// at the mapped port.
+
+import std.spec
+import std.string
+import std.tcp
+import std.bytes
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.mosquitto
+
+const IMAGE = "eclipse-mosquitto:2"
+
+fn put(buf: ptr, v: int) { bytes.set(buf, bytes.length(buf), v) }
+fn put_str(buf: ptr, s: string) {
+    // two-byte length prefix, as MQTT strings have
+    n = string.length(s)
+    put(buf, n / 256)
+    put(buf, n % 256)
+    bytes.copy_from_string(buf, bytes.length(buf), s, n)
+}
+
+// Wrap a body in a fixed header (type/flags byte, remaining length < 128).
+fn packet(first: int, body: ptr) -> ptr {
+    out = bytes.new(64)
+    put(out, first)
+    put(out, bytes.length(body))
+    bytes.copy_from_bytes(out, bytes.length(out), body, 0, bytes.length(body))
+    bytes.free(body)
+    return out
+}
+
+fn send_packet(sock: ptr, p: ptr) -> string {
+    _, err = tcp.write_all(sock, bytes.view(p))
+    bytes.free(p)
+    return err
+}
+
+// Read exactly n bytes: as hex text ("2002 0000" -> "20020000"), and an error.
+fn read_hex(sock: ptr, n: int) -> (string, string) {
+    buf = bytes.new(n + 16)
+    got = 0
+    tries = 0
+    out = ""
+    while got < n && tries < 100 {
+        cv = bytes.capacity_view(buf)
+        m, rerr = tcp.read_into(sock, cv[got..n])
+        if rerr != "" && rerr != "timeout" { bytes.free(buf); return "", rerr }
+        got = got + m
+        tries = tries + 1
+    }
+    if got < n { bytes.free(buf); return "", "short read: ${got} of ${n} bytes" }
+    v = bytes.capacity_view(buf)
+    i = 0
+    while i < n {
+        d = v[i] & 255
+        hexd = "0123456789abcdef"
+        out = "${out}${string.substring(hexd, d / 16, d / 16 + 1)}${string.substring(hexd, d % 16, d % 16 + 1)}"
+        i = i + 1
+    }
+    bytes.free(buf)
+    return out, ""
+}
+
+fn connect(c: *docker.Container) -> (ptr, string) {
+    h, _ = tc.host(c)
+    port, perr = tc.mapped_port(c, mosquitto.PORT)
+    if perr != "" { return null, perr }
+    return tcp.connect(h, port)
+}
+
+// CONNECT (clean session, 60s keepalive) and read CONNACK: its 4 bytes as hex.
+fn mqtt_connect(sock: ptr, client_id: string) -> (string, string) {
+    body = bytes.new(32)
+    put_str(body, "MQTT")
+    put(body, 4)      // protocol level 3.1.1
+    put(body, 2)      // clean session
+    put(body, 0)
+    put(body, 60)
+    put_str(body, client_id)
+    err = send_packet(sock, packet(16, body))
+    if err != "" { return "", err }
+    return read_hex(sock, 4)
+}
+
+fn assert_broker_works(c: *docker.Container) {
+    url, uerr = mosquitto.broker_url(c)
+    spec.assert_ok(uerr, "broker url")
+    spec.assert_true(string.starts_with(url, "mqtt://localhost:") == 1, "an mqtt:// URL: ${url}")
+    sock, cerr = connect(c)
+    spec.assert_ok(cerr, "connect")
+    if cerr != "" { return }
+    ack, aerr = mqtt_connect(sock, "tcae-client")
+    spec.assert_ok(aerr, "CONNACK")
+    spec.assert_str_eq(ack, "20020000", "CONNACK, session not present, connection accepted")
+
+    // SUBSCRIBE to tcae/topic at QoS 0 -> SUBACK 90 03 <id> 00
+    sb = bytes.new(32)
+    put(sb, 0)
+    put(sb, 7)        // packet id 7
+    put_str(sb, "tcae/topic")
+    put(sb, 0)
+    spec.assert_ok(send_packet(sock, packet(130, sb)), "send SUBSCRIBE")
+    suback, serr = read_hex(sock, 5)
+    spec.assert_ok(serr, "SUBACK")
+    spec.assert_str_eq(suback, "9003000700", "SUBACK for packet 7, granted QoS 0")
+
+    // PUBLISH to the same topic: the broker delivers it back to the subscriber.
+    pb = bytes.new(32)
+    put_str(pb, "tcae/topic")
+    bytes.copy_from_string(pb, bytes.length(pb), "hello", 5)
+    spec.assert_ok(send_packet(sock, packet(48, pb)), "send PUBLISH")
+    // 30 11 | 000a "tcae/topic" | "hello"  => 2 + 2 + 10 + 5 = 19 bytes
+    msg, merr = read_hex(sock, 19)
+    spec.assert_ok(merr, "PUBLISH delivered")
+    // "tcae/topic" = 74 63 61 65 2f 74 6f 70 69 63 ; "hello" = 68 65 6c 6c 6f
+    spec.assert_str_eq(msg, "3011000a746361652f746f70696368656c6c6f", "the published message comes back")
+    tcp.tcp_close(sock)
+}
+
+fn conf_of(c: *docker.Container) -> string {
+    conf, _ = tc.copy_file_from_container(c, mosquitto.CONFIG_PATH)
+    return conf
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/mosquitto") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("accepts MQTT clients with the default config (TestMosquitto)") callback {
+            c, err = mosquitto.run(IMAGE)
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "mosquitto starts")
+            if err == "" {
+                spec.assert_str_eq(conf_of(c), mosquitto.DEFAULT_CONFIG, "the default config is in the container")
+                assert_broker_works(c)
+            }
+        }
+
+        spec.it("starts from a config file (TestMosquittoWithConfigFile)") callback {
+            c, err = mosquitto.run(IMAGE) {
+                config_file("modules/mosquitto/testdata/mosquitto.conf")
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "mosquitto starts")
+            if err == "" {
+                spec.assert_contains(conf_of(c), "max_inflight_messages 20", "the caller's file replaced the default")
+                assert_broker_works(c)
+            }
+        }
+
+        spec.it("mixes core options into the module's block") callback {
+            c, err = mosquitto.run(IMAGE) {
+                tc.env("TCAE_MARK", "from-the-block")
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "mosquitto starts")
+            if err == "" {
+                code, out, eerr = tc.exec(c, ["sh", "-c", "echo $TCAE_MARK"])
+                spec.assert_ok(eerr, "exec")
+                spec.assert_eq(code, 0, "exit code")
+                spec.assert_str_eq(string.trim(out), "from-the-block", "the core env setter reached the request")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

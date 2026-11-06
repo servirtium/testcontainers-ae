@@ -1,0 +1,43 @@
+// Ported from testcontainers-go modules/dockermcpgateway (dockermcpgateway_test.go):
+// the gateway starts with no servers (TestDockerMCPGateway), the tools given
+// are kept per server and de-duplicated (_withServerAndTools; checked without
+// starting the servers, whose launch needs Docker Hub's MCP catalog), and a
+// secret reaches the container's secrets file (_withSecret).
+
+import std.spec
+import std.string
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.dockermcpgateway
+
+const IMAGE = "docker/mcp-gateway:latest"
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/dockermcpgateway") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("starts with a secret, and keeps its tools (TestDockerMCPGateway, _withSecret)") callback {
+            g, err = dockermcpgateway.run(IMAGE) {
+                secret("github.personal_access_token", "test_token")
+                secret("another.secret", "another_value")
+                secret("another.secret", "replaced")
+            }
+            if g != null { testing.cleanup_container(dockermcpgateway.container_of(g)) }
+            spec.assert_ok(err, "the gateway starts")
+            if err == "" {
+                ep, eerr = dockermcpgateway.gateway_endpoint(g)
+                spec.assert_ok(eerr, "endpoint")
+                spec.assert_true(string.starts_with(ep, "http://localhost:") == 1, "http endpoint: ${ep}")
+                content, cerr = tc.copy_file_from_container(dockermcpgateway.container_of(g), dockermcpgateway.SECRETS_PATH)
+                spec.assert_ok(cerr, "read the secrets file")
+                spec.assert_str_eq(content, "github.personal_access_token=test_token\nanother.secret=replaced\n", "secrets file")
+                spec.assert_eq(dockermcpgateway.servers(g).len, 0, "no tools")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

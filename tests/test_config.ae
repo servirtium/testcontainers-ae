@@ -1,0 +1,273 @@
+// Ported from testcontainers-go internal/config/config_test.go, internal/core/docker_host_test.go (the parts without an engine), image_substitutors_test.go, docker_auth_test.go, wait/host_port_test.go (buildInternalCheckCommand), internal/core/labels_test.go
+//
+// What needs no engine: configuration, image names, ports, the stream
+// format, labels, registry auth, wait descriptions.
+
+import std.spec
+import std.string
+import std.os
+import std.fs
+import std.json
+import std.bytes
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.wait
+
+fn frame(kind: int, payload: string) -> string {
+    n = string.length(payload)
+    h = make([]byte, 8)
+    h[0] = kind as byte
+    h[4] = ((n >> 24) & 255) as byte
+    h[5] = ((n >> 16) & 255) as byte
+    h[6] = ((n >> 8) & 255) as byte
+    h[7] = (n & 255) as byte
+    hs = bytes.string_from_slice(h)
+    return string.concat(hs, payload)
+}
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "configuration") {
+        spec.it("reads ~/.testcontainers.properties, and the environment wins") callback {
+            dir, derr = fs.make_temp_dir("", "tcae-home")
+            spec.assert_ok(derr, "temp dir")
+            old_home = os.os_getenv("HOME")
+            werr = fs.write("${dir}/.testcontainers.properties", "# comment\ndocker.host=unix:///tmp/nope.sock\nryuk.disabled=true\nryuk.container.privileged = true\nhub.image.name.prefix: mirror.example.com\nryuk.reconnection.timeout=30s\n")
+            spec.assert_ok(werr, "write properties")
+            os.setenv("HOME", dir)
+            os.unsetenv("TESTCONTAINERS_RYUK_DISABLED")
+            os.unsetenv("TESTCONTAINERS_HUB_IMAGE_NAME_PREFIX")
+            docker.config_reset()
+            c = docker.config()
+            spec.assert_str_eq(c.host, "unix:///tmp/nope.sock", "docker.host")
+            spec.assert_true(c.ryuk_disabled, "ryuk.disabled")
+            spec.assert_true(c.ryuk_privileged, "ryuk.container.privileged with spaces round =")
+            spec.assert_str_eq(c.hub_image_name_prefix, "mirror.example.com", "key: value form")
+            spec.assert_str_eq(c.ryuk_reconnection_timeout, "30s", "ryuk.reconnection.timeout")
+            spec.assert_str_eq(c.ryuk_connection_timeout, "1m", "the default connection timeout")
+            os.setenv("TESTCONTAINERS_RYUK_DISABLED", "false")
+            os.setenv("TESTCONTAINERS_HUB_IMAGE_NAME_PREFIX", "registry.local:5000/hub")
+            docker.config_reset()
+            c2 = docker.config()
+            spec.assert_false(c2.ryuk_disabled, "TESTCONTAINERS_RYUK_DISABLED=false overrides the file")
+            spec.assert_str_eq(c2.hub_image_name_prefix, "registry.local:5000/hub", "the env prefix wins")
+            os.setenv("HOME", old_home)
+            os.unsetenv("TESTCONTAINERS_RYUK_DISABLED")
+            os.unsetenv("TESTCONTAINERS_HUB_IMAGE_NAME_PREFIX")
+            docker.config_reset()
+            fs.remove_tree(dir)
+        }
+
+        spec.it("takes the session id from TESTCONTAINERS_SESSION_ID") callback {
+            os.setenv("TESTCONTAINERS_SESSION_ID", "my-session_1")
+            docker.config_reset()
+            spec.assert_str_eq(docker.session_id(), "my-session_1", "the session id")
+            os.unsetenv("TESTCONTAINERS_SESSION_ID")
+            docker.config_reset()
+            sid = docker.session_id()
+            spec.assert_eq(string.length(sid), 32, "a random session id is 32 hex digits")
+            spec.assert_str_eq(docker.session_id(), sid, "and stays the same for the process")
+        }
+
+        spec.it("labels every resource with the session") callback {
+            lj = docker.default_labels_json()
+            doc, perr = json.parse(lj)
+            spec.assert_ok(perr, "labels are JSON")
+            v, _ = json.object_get(doc, "org.testcontainers.lang")
+            lang, _ = json.get_string(v)
+            spec.assert_str_eq(lang, "aether", "lang label")
+            s, _ = json.object_get(doc, "org.testcontainers.sessionId")
+            sid, _ = json.get_string(s)
+            spec.assert_str_eq(sid, docker.session_id(), "session label")
+            spec.assert_true(json.json_object_has(doc, "org.testcontainers") == 1, "base label")
+            json.free(doc)
+        }
+    }
+
+    spec.describe(fw, "image names") {
+        spec.it("parses registry, repository and tag") callback {
+            reg, name, tag = docker.parse_image("redis:7-alpine")
+            spec.assert_str_eq(reg, "docker.io", "hub registry")
+            spec.assert_str_eq(name, "redis", "repository")
+            spec.assert_str_eq(tag, "7-alpine", "tag")
+            reg2, name2, tag2 = docker.parse_image("localhost:5000/team/app")
+            spec.assert_str_eq(reg2, "localhost:5000", "a registry with a port")
+            spec.assert_str_eq(name2, "localhost:5000/team/app", "repository as written")
+            spec.assert_str_eq(tag2, "latest", "no tag is latest")
+            _, name3, tag3 = docker.parse_image("quay.io/org/img@sha256:abc")
+            spec.assert_str_eq(name3, "quay.io/org/img", "digest split off")
+            spec.assert_str_eq(tag3, "@sha256:abc", "digest kept")
+            spec.assert_str_eq(docker.image_registry("testcontainers/ryuk:0.14.0"), "docker.io", "an org on the hub")
+        }
+
+        spec.it("prefixes hub images only (TestPrependHubRegistry)") callback {
+            os.setenv("TESTCONTAINERS_HUB_IMAGE_NAME_PREFIX", "my.registry.com")
+            docker.config_reset()
+            spec.assert_str_eq(docker.hub_prefixed("redis:7"), "my.registry.com/redis:7", "official image")
+            spec.assert_str_eq(docker.hub_prefixed("testcontainers/ryuk:0.14.0"), "my.registry.com/testcontainers/ryuk:0.14.0", "hub org image")
+            spec.assert_str_eq(docker.hub_prefixed("quay.io/prometheus/node"), "quay.io/prometheus/node", "another registry is left alone")
+            spec.assert_str_eq(docker.hub_prefixed("localhost/app:1"), "localhost/app:1", "localhost is a registry")
+            os.unsetenv("TESTCONTAINERS_HUB_IMAGE_NAME_PREFIX")
+            docker.config_reset()
+            spec.assert_str_eq(docker.hub_prefixed("redis:7"), "redis:7", "no prefix configured")
+        }
+
+        spec.it("reads registry credentials from DOCKER_CONFIG") callback {
+            dir, _ = fs.make_temp_dir("", "tcae-dockercfg")
+            // "user:secret" in base64
+            fs.write("${dir}/config.json", "{\"auths\":{\"registry.example.com\":{\"auth\":\"dXNlcjpzZWNyZXQ=\"}}}")
+            os.setenv("DOCKER_CONFIG", dir)
+            a = docker.registry_auth("registry.example.com")
+            spec.assert_true(string.length(a) > 0, "an X-Registry-Auth value")
+            spec.assert_str_eq(docker.registry_auth("other.example.com"), "", "none for another registry")
+            os.unsetenv("DOCKER_CONFIG")
+            fs.remove_tree(dir)
+        }
+    }
+
+    spec.describe(fw, "ports") {
+        spec.it("normalizes port specs") callback {
+            spec.assert_str_eq(docker.normalize_port("6379"), "6379/tcp", "tcp by default")
+            spec.assert_str_eq(docker.normalize_port("53/udp"), "53/udp", "udp kept")
+            spec.assert_str_eq(docker.normalize_port("8080:80/tcp"), "80/tcp", "the container side of a pinned port")
+            spec.assert_str_eq(docker.normalize_port("127.0.0.1:8080:80"), "80/tcp", "with a host IP")
+        }
+
+        spec.it("builds Go's internal port check command") callback {
+            cmd = wait.internal_check_command(6379)
+            spec.assert_contains(cmd, ":18EB", "6379 in hex, as /proc/net/tcp shows it")
+            spec.assert_contains(cmd, "nc -vz -w 1 localhost 6379", "the nc fallback")
+            spec.assert_contains(cmd, "/dev/tcp/localhost/6379", "the bash fallback")
+        }
+    }
+
+    spec.describe(fw, "the multiplexed stream format") {
+        spec.it("splits stdout and stderr frames, keeping order and NUL bytes") callback {
+            raw = string.concat(string.concat(frame(1, "out1\n"), frame(2, "err1\n")), frame(1, "a\x00b"))
+            out, errs, all = docker.demux_split(raw)
+            spec.assert_str_eq(out, "out1\na\x00b", "stdout")
+            spec.assert_eq(string.length(out), 8, "the NUL byte survives")
+            spec.assert_str_eq(errs, "err1\n", "stderr")
+            spec.assert_str_eq(all, "out1\nerr1\na\x00b", "both, in order")
+        }
+
+        spec.it("waits for a whole frame across chunks") callback {
+            f = frame(2, "hello")
+            d = docker.demux_new()
+            docker.demux_feed(d, string.string_substring_n(f, string.length(f), 0, 6))
+            spec.assert_false(docker.demux_pop(d), "half a header is not a frame")
+            docker.demux_feed(d, string.string_substring_n(f, string.length(f), 6, string.length(f)))
+            spec.assert_true(docker.demux_pop(d), "the rest completes it")
+            spec.assert_eq(d.kind, 2, "stderr")
+            spec.assert_str_eq(d.payload, "hello", "payload")
+        }
+    }
+
+    spec.describe(fw, "errors and descriptions") {
+        spec.it("classifies engine errors by status") callback {
+            e = docker.engine_error("inspect x", 404, "no such container")
+            spec.assert_true(docker.is_not_found(e), "404 is not found")
+            spec.assert_false(docker.is_conflict(e), "404 is not a conflict")
+            spec.assert_true(docker.is_conflict(docker.api_check("create", 409, "{\"message\":\"name in use\"}")), "409 is a conflict")
+            spec.assert_str_eq(docker.api_check("x", 204, ""), "", "2xx is no error")
+            spec.assert_contains(docker.api_check("create", 500, "{\"message\":\"boom\"}"), "boom", "the engine's message")
+        }
+
+        spec.it("describes strategies as Go's String() does") callback {
+            spec.assert_str_eq(wait.describe(wait.for_log("ready")), "log message \"ready\"", "log")
+            spec.assert_str_eq(wait.describe(wait.for_log("r.*y") { as_regexp(); with_occurrence(2) }), "log pattern \"r.*y\" (occurrence: 2)", "regexp with occurrence")
+            spec.assert_str_eq(wait.describe(wait.for_listening_port("80")), "port 80/tcp to be listening", "port")
+            spec.assert_str_eq(wait.describe(wait.for_mapped_port("80/tcp")), "port 80/tcp to be mapped", "mapped port")
+            spec.assert_str_eq(wait.describe(wait.for_exposed_port() { skip_internal_check() }), "first exposed port to be accessible externally", "exposed port, external only")
+            all = wait.for_all([wait.for_log("a"), wait.for_exit()])
+            spec.assert_str_eq(wait.describe(all), "all of: [log message \"a\", container to exit]", "all")
+        }
+
+        spec.it("applies modifiers in a block, called directly, and keeps defaults") callback {
+            s = wait.for_http("health") { with_port("8080"); with_status(204); with_startup_timeout(5s); with_poll_interval(250ms) }
+            spec.assert_str_eq(s.path, "/health", "a leading slash is added")
+            spec.assert_str_eq(s.port, "8080/tcp", "the port is normalized")
+            spec.assert_eq(s.status, 204, "status")
+            spec.assert_eq_long(wait.timeout_ms(s), 5000, "startup timeout")
+            spec.assert_eq_long(wait.poll_ms(s), 250, "poll interval")
+            d = wait.for_log("x")
+            spec.assert_eq_long(wait.timeout_ms(d), 60000, "Go's default startup timeout")
+            spec.assert_eq_long(wait.poll_ms(d), 100, "Go's default poll interval")
+            e = wait.with_occurrence(wait.for_log("y"), 0)
+            spec.assert_eq(e.occurrence, 1, "an occurrence below 1 is 1")
+            both = wait.and_then(wait.for_log("a"), wait.for_log("b"))
+            spec.assert_eq(both.kind, wait.KIND_ALL, "and_then makes a for_all")
+        }
+
+        spec.it("rejects a reserved label in the request") callback {
+            r = tc.request_new()
+            tc.label(r, "org.testcontainers.sessionId", "theirs")
+            c, err = tc.run_request(r, "alpine:3")
+            spec.assert_null(c, "nothing created")
+            spec.assert_err_contains(err, "reserved", "a reserved label is refused")
+        }
+    }
+
+    spec.describe(fw, "a request, read and copied (for modules)") {
+        spec.it("unsets and lists the environment") callback {
+            r = tc.request_new()
+            tc.env(r, "A", "1")
+            tc.env(r, "B", "")
+            tc.env(r, "C", "x=y")
+            tc.unset_env(r, "A")
+            tc.unset_env(r, "NOT_SET")
+            spec.assert_false(tc.req_has_env(r, "A"), "A is gone")
+            spec.assert_true(tc.req_has_env(r, "B"), "B is set, to the empty string")
+            keys = tc.req_env_keys(r)
+            spec.assert_eq(keys.len, 2, "two names")
+            spec.assert_str_eq(keys[0], "B", "in the order they were set")
+            spec.assert_str_eq(keys[1], "C", "a value with = keeps its name whole")
+            all = tc.req_env_list(r)
+            spec.assert_str_eq(all[1], "C=x=y", "the entries")
+            tc.request_free(r)
+        }
+
+        spec.it("keeps module settings apart from the environment") callback {
+            r = tc.request_new()
+            tc.set_setting(r, "mod.a", "1")
+            tc.set_setting(r, "mod.b", "multi\nline=")
+            tc.set_setting(r, "mod.a", "2")
+            spec.assert_str_eq(tc.req_setting(r, "mod.a"), "2", "a later value replaces")
+            spec.assert_str_eq(tc.req_setting(r, "mod.b"), "multi\nline=", "any text")
+            spec.assert_str_eq(tc.req_setting(r, "mod.c"), "", "an unset one is empty")
+            spec.assert_true(tc.req_has_setting(r, "mod.b"), "has")
+            spec.assert_false(tc.req_has_setting(r, "mod.c"), "has not")
+            spec.assert_eq(tc.req_env_keys(r).len, 0, "and none of it is environment")
+            tc.request_free(r)
+        }
+
+        spec.it("copies a request, independent of the original") callback {
+            r = tc.request_new()
+            tc.env(r, "A", "1")
+            tc.label(r, "team", "aether")
+            tc.cmd(r, ["a", "b"])
+            tc.expose(r, "80/tcp")
+            tc.file_content(r, "x", "/x", 420)
+            tc.set_setting(r, "mod.k", "v")
+            tc.on_post_start(r, |c: *docker.Container| { return "" })
+            tc.wait_for(r, wait.for_log("ready"))
+            cp = tc.request_copy(r)
+            tc.env(r, "A", "changed")
+            tc.cmd_arg(r, "c")
+            tc.set_setting(r, "mod.k", "changed")
+            tc.env(cp, "ONLY_COPY", "1")
+            spec.assert_str_eq(tc.req_env(cp, "A"), "1", "the copy kept its env")
+            spec.assert_false(tc.req_has_env(r, "ONLY_COPY"), "and the original did not get the copy's")
+            spec.assert_eq(tc.req_cmd(cp).len, 2, "the copy's cmd")
+            spec.assert_eq(tc.req_cmd(r).len, 3, "the original's cmd")
+            spec.assert_str_eq(tc.req_setting(cp, "mod.k"), "v", "the copy's setting")
+            spec.assert_str_eq(tc.req_exposed(cp)[0], "80/tcp", "ports")
+            spec.assert_true(tc.req_strategy(cp) == tc.req_strategy(r), "the strategy is shared")
+            tc.request_free(r)
+            tc.request_free(cp)
+        }
+    }
+
+    return spec.run_summary(fw)
+}

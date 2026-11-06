@@ -1,0 +1,65 @@
+// Ported from testcontainers-go modules/trino/trino_test.go
+//
+// A real Trino: GET /v1/info at connection_string answers with
+// "starting": false, and a statement POSTed to /v1/statement is accepted.
+
+import std.spec
+import std.string
+import std.http.client
+import std.tcp
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.trino
+
+const IMAGE = "trinodb/trino:435"
+
+// One HTTP request: (status, body, error).
+fn http_do(method: string, url: string, body: string) -> (int, string, string) {
+    req = client.request(method, url)
+    client.set_timeout(req, 15s)
+    if string.length(body) > 0 { client.set_body(req, string.bytes(body), "application/json") }
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    st = client.response_status(r)
+    b = client.response_body(r)
+    client.response_free(r)
+    return st, b, ""
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/trino") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("serves its info and runs a statement (TestTrino)") callback {
+            c, err = trino.run(IMAGE)
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "trino starts")
+            if err != "" { return }
+            url, uerr = trino.connection_string(c)
+            spec.assert_ok(uerr, "connection string")
+            spec.assert_true(string.starts_with(url, "http://") == 1, "an http:// URL: ${url}")
+            st, body, herr = http_do("GET", "${url}/v1/info", "")
+            spec.assert_ok(herr, "GET /v1/info")
+            spec.assert_eq(st, 200, "info status")
+            spec.assert_contains(body, "\"starting\":false", "the server finished starting")
+            req = client.request("POST", "${url}/v1/statement")
+            client.set_timeout(req, 30s)
+            client.set_header(req, "X-Trino-User", "tcae")
+            client.set_body(req, string.bytes("SELECT 1"), "text/plain")
+            r, serr = client.send_request(req)
+            client.request_free(req)
+            spec.assert_ok(serr, "POST /v1/statement")
+            if serr == "" {
+                spec.assert_eq(client.response_status(r), 200, "the statement is accepted")
+                spec.assert_contains(client.response_body(r), "nextUri", "with a result URI")
+                client.response_free(r)
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

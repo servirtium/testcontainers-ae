@@ -1,0 +1,61 @@
+// Ported from testcontainers-go modules/inbucket/inbucket.go
+//
+// modules.inbucket: an Inbucket container (SMTP 2500, web UI / REST 9000, POP3 1100).
+//
+//     import modules.inbucket
+//
+//     c, err = inbucket.run("inbucket/inbucket:sha-2d409bb")
+//     defer tc.terminate(c)
+//     smtp, _ = inbucket.smtp_connection(c)   // "localhost:32771"
+//     web, _  = inbucket.web_interface(c)     // "http://localhost:32772"
+//
+// Everything in the Go module is ported except the deprecated RunContainer.
+// SmtpConnection and WebInterface keep their Go names (snake_cased).
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, smtp_connection, web_interface,
+    SMTP_PORT, WEB_PORT, POP3_PORT, DEFAULT_IMAGE, inbucket_request_new, inbucket_request_free
+)
+
+const SMTP_PORT = "2500/tcp"
+const WEB_PORT = "9000/tcp"
+const POP3_PORT = "1100/tcp"
+const DEFAULT_IMAGE = "inbucket/inbucket:sha-2d409bb"
+
+// Go's moduleOpts: the three ports, each listening.
+inbucket_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, SMTP_PORT)
+    tc.expose(r, WEB_PORT)
+    tc.expose(r, POP3_PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(SMTP_PORT),
+        wait.for_listening_port(WEB_PORT),
+        wait.for_listening_port(POP3_PORT)
+    ]))
+    return r
+}
+
+inbucket_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with inbucket_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = inbucket_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run inbucket: ${err}" }
+    return c, ""
+}
+
+// "host:port" of the SMTP server (Go's SmtpConnection).
+smtp_connection(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, SMTP_PORT, "")
+}
+
+// "http://host:port" of the web interface and REST API (Go's WebInterface).
+web_interface(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, WEB_PORT, "http")
+}

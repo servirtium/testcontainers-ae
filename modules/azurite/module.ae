@@ -1,0 +1,162 @@
+// Ported from testcontainers-go modules/azurite/azurite.go, options.go and
+// services.go (thin re-exports of modules/azure/azurite/*.go, which hold the
+// code).
+//
+// modules.azurite: Microsoft's Azure Storage emulator (blob, queue, table).
+//
+//     import modules.azurite
+//
+//     c, err = azurite.run("mcr.microsoft.com/azure-storage/azurite:3.28.0") {
+//         enabled_services(["blob"])
+//         in_memory_persistence(64.0)
+//     }
+//     defer tc.terminate(c)
+//     blob, _ = azurite.blob_service_url(c)   // "http://localhost:32771"
+//
+// Services are the strings "blob", "queue" and "table" (Go's Service values
+// BlobService, QueueService, TableService, also exported as constants).
+// The module's entrypoint, command, ports and waits depend on the enabled
+// services, so run assembles them after the caller's block has chosen them.
+//
+// Not ported: Go's RunContainer (deprecated).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, service_url, blob_service_url, queue_service_url, table_service_url,
+    enabled_services, in_memory_persistence,
+    BLOB_PORT, QUEUE_PORT, TABLE_PORT, ACCOUNT_NAME, ACCOUNT_KEY,
+    BLOB_SERVICE, QUEUE_SERVICE, TABLE_SERVICE, DEFAULT_IMAGE,
+    azurite_request_new, azurite_request_free
+)
+
+const BLOB_PORT = "10000/tcp"
+const QUEUE_PORT = "10001/tcp"
+const TABLE_PORT = "10002/tcp"
+
+const ACCOUNT_NAME = "devstoreaccount1"
+const ACCOUNT_KEY = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+
+const BLOB_SERVICE = "blob"
+const QUEUE_SERVICE = "queue"
+const TABLE_SERVICE = "table"
+
+const DEFAULT_IMAGE = "mcr.microsoft.com/azure-storage/azurite:3.28.0"
+
+const SVC_KEY = "azurite.services"
+const MEM_KEY = "azurite.inmemory"
+
+// Nothing yet: the services decide the ports, entrypoint and waits, in run.
+azurite_request_new() -> ptr {
+    return tc.request_new()
+}
+
+azurite_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithEnabledServices; no argument means all three.
+enabled_services(_ctx: ptr, services: string[]) {
+    line = ""
+    for s in services {
+        if string.length(line) > 0 { line = "${line}," }
+        line = "${line}${s}"
+    }
+    tc.set_setting(_ctx, SVC_KEY, line)
+}
+
+// Go's WithInMemoryPersistence: --inMemoryPersistence, with
+// --extentMemoryLimit <megabytes> when megabytes > 0.
+in_memory_persistence(_ctx: ptr, megabytes: float) {
+    tc.set_setting(_ctx, MEM_KEY, "${megabytes}")
+}
+
+fn service_port(srv: string) -> (string, string) {
+    if srv == BLOB_SERVICE { return BLOB_PORT, "" }
+    if srv == QUEUE_SERVICE { return QUEUE_PORT, "" }
+    if srv == TABLE_SERVICE { return TABLE_PORT, "" }
+    return "", "unknown service: ${srv}"
+}
+
+fn split_on(s: string, sep: string) -> string[] {
+    string[] out = []
+    rest = s
+    i = string.index_of(rest, sep)
+    while i >= 0 {
+        out.push(string.substring(rest, 0, i))
+        rest = string.substring(rest, i + string.length(sep), string.length(rest))
+        i = string.index_of(rest, sep)
+    }
+    out.push(rest)
+    return out
+}
+
+builder run(image: string) with azurite_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = azurite_request_new() }
+
+    raw = "${BLOB_SERVICE},${QUEUE_SERVICE},${TABLE_SERVICE}"
+    if tc.req_has_setting(r, SVC_KEY) && string.length(tc.req_setting(r, SVC_KEY)) > 0 {
+        raw = tc.req_setting(r, SVC_KEY)
+    }
+    services = split_on(raw, ",")
+    seen = ","
+    for srv in services {
+        if string.contains(seen, ",${srv},") == 1 {
+            tc.request_free(r)
+            return null, "azurite option: duplicate service: ${srv}"
+        }
+        seen = "${seen}${srv},"
+    }
+
+    // entrypoint "azurite", or "azurite-<svc>" for one non-table service
+    ep = "azurite"
+    if services.len == 1 && services[0] != TABLE_SERVICE { ep = "azurite-${services[0]}" }
+    // the caller's entrypoint args (Go's WithEntrypointArgs after the module's
+    // WithEntrypoint) follow the service entrypoint
+    extra_ep = tc.req_entrypoint(r)
+    tc.entrypoint(r, [ep])
+    for a in extra_ep { tc.entrypoint_arg(r, a) }
+
+    strategy = wait.for_nop()
+    for srv in services {
+        port, perr = service_port(srv)
+        if perr != "" {
+            tc.request_free(r)
+            return null, perr
+        }
+        pnum = string.substring(port, 0, string.index_of(port, "/"))
+        tc.cmd_arg(r, "--${srv}Host")
+        tc.cmd_arg(r, "0.0.0.0")
+        tc.cmd_arg(r, "--${srv}Port")
+        tc.cmd_arg(r, pnum)
+        tc.expose(r, port)
+        strategy = wait.and_then(strategy, wait.for_listening_port(port))
+    }
+    tc.wait_for(r, strategy)
+
+    if tc.req_has_setting(r, MEM_KEY) {
+        tc.cmd_arg(r, "--inMemoryPersistence")
+        mb, _ = string.to_float(tc.req_setting(r, MEM_KEY))
+        if mb > 0.0 {
+            tc.cmd_arg(r, "--extentMemoryLimit")
+            tc.cmd_arg(r, "${mb}")
+        }
+    }
+
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run azurite: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" of a service (Go's ServiceURL).
+service_url(c: *docker.Container, srv: string) -> (string, string) {
+    port, err = service_port(srv)
+    if err != "" { return "", err }
+    return tc.endpoint(c, port, "http")
+}
+
+blob_service_url(c: *docker.Container) -> (string, string) { return service_url(c, BLOB_SERVICE) }
+queue_service_url(c: *docker.Container) -> (string, string) { return service_url(c, QUEUE_SERVICE) }
+table_service_url(c: *docker.Container) -> (string, string) { return service_url(c, TABLE_SERVICE) }

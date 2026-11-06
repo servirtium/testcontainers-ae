@@ -1,0 +1,169 @@
+// Ported from testcontainers-go modules/scylladb/scylladb.go
+//
+// modules.scylladb: a ScyllaDB container (CQL 9042, optionally the
+// shard-aware port 19042 and Alternator, the DynamoDB-compatible API, 8000).
+//
+//     import modules.scylladb
+//
+//     c, err = scylladb.run("scylladb/scylla:6.2") {
+//         shard_awareness()
+//         alternator()
+//         custom_commands(["--smp=2", "--memory=1G"])
+//     }
+//     defer tc.terminate(c)
+//     host, _ = scylladb.non_shard_aware_connection_host(c)   // "localhost:32771"
+//
+// Differences from Go:
+//
+//  - config takes the YAML as a string (Go takes an io.Reader); config_file
+//    copies a host file. Both write /etc/scylla/scylla.yaml.
+//  - shard_awareness and alternator ADD a wait for their port (Go's replaces
+//    the whole wait strategy with just that port, which drops the CQL
+//    bootstrap check).
+//  - custom_commands with an invalid flag is an error from run, as the
+//    option's error is in Go; new flags are appended in the order given.
+//
+// Not ported: the gocql / Alternator client code of Go's tests and examples.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, config, config_file, shard_awareness, alternator, custom_commands,
+    shard_aware_connection_host, non_shard_aware_connection_host,
+    alternator_connection_host, PORT, SHARD_AWARE_PORT, ALTERNATOR_PORT,
+    DEFAULT_IMAGE, scylladb_request_new, scylladb_request_free
+)
+
+const PORT = "9042/tcp"
+const SHARD_AWARE_PORT = "19042/tcp"
+const ALTERNATOR_PORT = "8000/tcp"
+const DEFAULT_IMAGE = "scylladb/scylla:6.2"
+const SET_ERROR = "scylladb.error"
+
+fn bootstrapped(body: string) -> bool { return string.contains(body, "COMPLETED") == 1 }
+
+scylladb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.cmd(r, ["--developer-mode=1", "--overprovisioned=1", "--smp=1", "--memory=512M"])
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(PORT),
+        wait.for_exec(["cqlsh", "-e", "SELECT bootstrapped FROM system.local"]) {
+            with_response_matcher(|body: string| -> bootstrapped(body))
+        }
+    ]))
+    return r
+}
+
+scylladb_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithConfig: the scylla.yaml content.
+config(_ctx: ptr, yaml: string) {
+    tc.file_content(_ctx, yaml, "/etc/scylla/scylla.yaml", 420)
+}
+
+// The same from a host file.
+config_file(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, "/etc/scylla/scylla.yaml", 420)
+}
+
+// Go's WithShardAwareness: expose 19042 and wait for it.
+shard_awareness(_ctx: ptr) {
+    tc.expose(_ctx, SHARD_AWARE_PORT)
+    tc.additional_wait(_ctx, wait.for_listening_port(SHARD_AWARE_PORT))
+}
+
+// Go's setCommandFlags: a flag already in the command line gets the new value
+// in place, the others are appended. A flag is "--name" or "--name=value".
+fn set_command_flags(_ctx: ptr, names: string[], values: string[]) {
+    string[] out = []
+    bool[] used = []
+    for n in names { used.push(false) }
+    for cmd in tc.req_cmd(_ctx) {
+        eq = string.index_of(cmd, "=")
+        before = cmd
+        if eq >= 0 { before = string.substring(cmd, 0, eq) }
+        hit = -1
+        i = 0
+        for n in names {
+            if n == before { hit = i }
+            i = i + 1
+        }
+        if hit >= 0 {
+            used[hit] = true
+            if eq >= 0 { out.push("${before}=${values[hit]}") } else { out.push(before) }
+        } else {
+            out.push(cmd)
+        }
+    }
+    i = 0
+    for n in names {
+        if !used[i] {
+            if string.length(values[i]) == 0 { out.push(n) } else { out.push("${n}=${values[i]}") }
+        }
+        i = i + 1
+    }
+    tc.cmd(_ctx, out)
+}
+
+// Go's WithAlternator: expose 8000, wait for it, and set
+// --alternator-port=8000 --alternator-write-isolation=always.
+alternator(_ctx: ptr) {
+    tc.expose(_ctx, ALTERNATOR_PORT)
+    tc.additional_wait(_ctx, wait.for_listening_port(ALTERNATOR_PORT))
+    set_command_flags(_ctx, ["--alternator-port", "--alternator-write-isolation"], ["8000", "always"])
+}
+
+// Go's WithCustomCommands: flags like "--smp=2" or "--flag", overriding the
+// defaults of the same name. A flag that does not start with - is an error
+// from run.
+custom_commands(_ctx: ptr, flags: string[]) {
+    string[] names = []
+    string[] values = []
+    for f in flags {
+        if string.starts_with(f, "-") != 1 {
+            if !tc.req_has_setting(_ctx, SET_ERROR) { tc.set_setting(_ctx, SET_ERROR, "invalid flag: ${f}") }
+            return
+        }
+        eq = string.index_of(f, "=")
+        if eq >= 0 {
+            names.push(string.substring(f, 0, eq))
+            values.push(string.substring(f, eq + 1, string.length(f)))
+        } else {
+            names.push(f)
+            values.push("")
+        }
+    }
+    set_command_flags(_ctx, names, values)
+}
+
+builder run(image: string) with scylladb_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = scylladb_request_new() }
+    if tc.req_has_setting(r, SET_ERROR) {
+        msg = tc.req_setting(r, SET_ERROR)
+        tc.request_free(r)
+        return null, "run scylladb: ${msg}"
+    }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run scylladb: ${err}" }
+    return c, ""
+}
+
+// "host:port" of the shard-aware port (needs shard_awareness()).
+shard_aware_connection_host(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, SHARD_AWARE_PORT, "")
+}
+
+// "host:port" of the CQL port.
+non_shard_aware_connection_host(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "")
+}
+
+// "host:port" of Alternator (needs alternator()).
+alternator_connection_host(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, ALTERNATOR_PORT, "")
+}

@@ -1,0 +1,51 @@
+// Ported from testcontainers-go modules/mockserver/mockserver.go
+//
+// modules.mockserver: a MockServer container.
+//
+//     import modules.mockserver
+//
+//     c, err = mockserver.run("mockserver/mockserver:5.15.0")
+//     defer tc.terminate(c)
+//     url, _ = mockserver.url(c)    // "http://localhost:32771"
+//
+// Then PUT expectations to <url>/mockserver/expectation and call the mocked
+// paths on <url>. Go's examples drive MockServer through its Go client
+// (mock-server-client-go); that client is not ported, the REST API is plain
+// JSON over HTTP. Everything else in the Go module is ported except the
+// deprecated RunContainer.
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(run, url, PORT, DEFAULT_IMAGE, mockserver_request_new, mockserver_request_free)
+
+const PORT = "1080/tcp"
+const DEFAULT_IMAGE = "mockserver/mockserver:5.15.0"
+
+// Go's moduleOpts: the log line, then the port reachable from outside only
+// (as Go: SkipInternalCheck, the image has no shell tools to probe with).
+mockserver_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_log("started on port: 1080"),
+        wait.for_listening_port(PORT) { skip_internal_check() }
+    ]))
+    return r
+}
+
+mockserver_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with mockserver_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = mockserver_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run mockserver: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" of the MockServer (Go's URL).
+url(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "http")
+}

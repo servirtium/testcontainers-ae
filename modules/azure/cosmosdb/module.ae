@@ -1,0 +1,78 @@
+// Ported from testcontainers-go modules/azure/cosmosdb/cosmosdb.go
+//
+// modules.azure.cosmosdb: the Azure Cosmos DB (vnext) emulator.
+//
+//     import modules.azure.cosmosdb
+//
+//     c, err = cosmosdb.run("mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview")
+//     defer tc.terminate(c)
+//     cs, _ = cosmosdb.connection_string(c)
+//     // "AccountEndpoint=http://localhost:32771;AccountKey=C2y6yDjf...;"
+//
+// Defaults as in Go: port 8081, `--enable-explorer false`, waiting for the
+// "Started" log line and the listening port. host_port is added: the
+// "host:port" form that Go's examples/cosmosdb ContainerPolicy pins every
+// request to (the emulator advertises its own address otherwise).
+//
+// Status: compile-checked only (alpha; no engine was used to port it).
+//
+// Not ported: the azcosmos SDK code of Go's examples/cosmosdb (policy.go,
+// cosmosdb_test.go): there is no Azure SDK in Aether.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, connection_string, connection_string_for, host_port,
+    PORT, ACCOUNT_KEY, DEFAULT_IMAGE, cosmosdb_request_new, cosmosdb_request_free
+)
+
+const PORT = "8081/tcp"
+const DEFAULT_IMAGE = "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview"
+
+// The well-known, publicly documented account key of the emulator.
+// https://learn.microsoft.com/en-us/azure/cosmos-db/how-to-develop-emulator
+const ACCOUNT_KEY = "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw=="
+
+cosmosdb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.cmd_arg(r, "--enable-explorer")
+    tc.cmd_arg(r, "false")
+    tc.wait_for(r, wait.for_all([
+        wait.for_log("Started"),
+        wait.for_listening_port(PORT)
+    ]))
+    return r
+}
+
+cosmosdb_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with cosmosdb_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = cosmosdb_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run cosmosdb: ${err}" }
+    return c, ""
+}
+
+// "AccountEndpoint=<endpoint>;AccountKey=<key>;" for an endpoint such as
+// "http://localhost:32771".
+connection_string_for(endpoint: string) -> string {
+    return "AccountEndpoint=${endpoint};AccountKey=${ACCOUNT_KEY};"
+}
+
+// The connection string of the emulator (Go's ConnectionString): the account
+// endpoint (http://host:port) and the default account key.
+connection_string(c: *docker.Container) -> (string, string) {
+    ep, err = tc.endpoint(c, PORT, "http")
+    if err != "" { return "", "port endpoint: ${err}" }
+    return connection_string_for(ep), ""
+}
+
+// "host:port" of the emulator, without a scheme.
+host_port(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "")
+}

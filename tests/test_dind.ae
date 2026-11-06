@@ -1,0 +1,52 @@
+// Ported from testcontainers-go modules/dind (dind_test.go, examples_test.go)
+//
+// STATUS: compile-checked only. Docker-in-Docker needs a privileged container,
+// so the live case runs only with TCAE_DIND=1: it starts docker:28.0.1-dind
+// and GETs the inner daemon's /_ping over its mapped TCP port (Go's example
+// asks the inner daemon for its API version; /version carries it too).
+// Go's Test_LoadImages is not ported (LoadImage is not).
+
+import std.spec
+import std.string
+import std.os
+import std.http.client
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.dind
+
+main() {
+    fw = spec.init()
+    if string.length(os.os_getenv("TCAE_DIND")) == 0 {
+        spec.describe(fw, "modules/dind (set TCAE_DIND=1: needs a privileged container)") {
+            spec.it("skipped") callback { spec.assert_true(true, "skipped: privileged container") }
+        }
+        return spec.run_summary(fw)
+    }
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/dind") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("runs an inner daemon that answers /_ping (ExampleRun)") callback {
+            c, err = dind.run(dind.DEFAULT_IMAGE)
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "dind starts")
+            if err == "" {
+                h, herr = dind.host(c)
+                spec.assert_ok(herr, "host")
+                req = client.request("GET", "${h}/_ping")
+                client.set_timeout(req, 30s)
+                r, rerr = client.send_request(req)
+                client.request_free(req)
+                spec.assert_ok(rerr, "GET /_ping")
+                if rerr == "" {
+                    spec.assert_eq(client.response_status(r), 200, "inner daemon is up")
+                    spec.assert_str_eq(client.response_body(r), "OK", "ping body")
+                    client.response_free(r)
+                }
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

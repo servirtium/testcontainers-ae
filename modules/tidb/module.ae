@@ -1,0 +1,77 @@
+// Ported from testcontainers-go modules/tidb/tidb.go
+//
+// modules.tidb: a TiDB container (the MySQL-protocol port 4000 and the status
+// REST port 10080). Like Go's Container it carries the credentials (always
+// root, no password, database "test"; the Go module has no option to change
+// them).
+//
+//     import modules.tidb
+//
+//     t, err = tidb.run("pingcap/tidb:v8.4.0")
+//     defer tc.terminate(t.container)
+//     dsn, _ = tidb.connection_string(t, "tls=skip-verify")
+//     // "root:@tcp(localhost:32771)/test?tls=skip-verify"
+//
+// Not ported: MustConnectionString (no Must* in this port) and the Go
+// examples that open a database/sql connection (no SQL client in Aether's std).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    TiDBContainer, run, connection_string, PORT, REST_PORT, DEFAULT_IMAGE,
+    tidb_request_new, tidb_request_free
+)
+
+const PORT = "4000/tcp"
+const REST_PORT = "10080/tcp"
+const DEFAULT_IMAGE = "pingcap/tidb:v8.4.0"
+const DEFAULT_USER = "root"
+const DEFAULT_PASSWORD = ""
+const DEFAULT_DATABASE = "test"
+
+struct TiDBContainer {
+    container: *docker.Container
+    username: string
+    password: string
+    database: string
+}
+
+tidb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.expose(r, REST_PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(PORT),
+        wait.for_http("/status") { with_port(REST_PORT) }
+    ]))
+    return r
+}
+
+tidb_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with tidb_request_new -> (*TiDBContainer, string) {
+    r = _builder
+    if r == null { r = tidb_request_new() }
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run tidb: ${err}" }
+    t = heap.new(TiDBContainer)
+    t.container = c
+    t.username = DEFAULT_USER
+    t.password = DEFAULT_PASSWORD
+    t.database = DEFAULT_DATABASE
+    if err != "" { return t, "run tidb: ${err}" }
+    return t, ""
+}
+
+// "user:password@tcp(host:port)/db?args" (Go's ConnectionString, the
+// go-sql-driver DSN form; args are joined with &, "" means none).
+connection_string(t: *TiDBContainer, args: string) -> (string, string) {
+    ep, err = tc.endpoint(t.container, PORT, "")
+    if err != "" { return "", err }
+    extra = ""
+    if string.length(args) > 0 { extra = "?${args}" }
+    return "${t.username}:${t.password}@tcp(${ep})/${t.database}${extra}", ""
+}

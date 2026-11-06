@@ -1,0 +1,271 @@
+// Ported from testcontainers-go wait/log_test.go, wait/host_port_test.go, wait/http_test.go, wait/health_test.go, wait/exec_test.go, wait/exit_test.go, wait/file_test.go, wait/all_test.go, wait/any_test.go
+//
+// Every strategy against real containers, each shown to wait (the
+// condition comes true some time after start) and to fail on time.
+
+import std.spec
+import std.string
+import std.os
+import std.json
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.wait
+import testcontainers.testing
+
+const ALPINE = "alpine:3"
+
+fn since(t0: long) -> long { return os.now_monotonic_ms() - t0 }
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "wait.for_log") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("waits for the nth occurrence") callback {
+            t0 = os.now_monotonic_ms()
+            c, err = tc.run(ALPINE) {
+                cmd(["sh", "-c", "for i in 1 2 3; do echo tick; sleep 0.5; done; sleep 300"])
+                wait_for(wait.for_log("tick") { with_occurrence(3) })
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "the third tick came")
+            spec.assert_true(since(t0) >= 1000, "it waited for the later ticks")
+            out, _ = tc.logs(c)
+            spec.assert_true(string.length(out) >= 15, "three ticks in the log")
+        }
+
+        spec.it("matches a regular expression, on stderr too") callback {
+            c, err = tc.run(ALPINE) {
+                cmd(["sh", "-c", "sleep 0.5; echo 'listening on port=5432' >&2; sleep 300"])
+                wait_for(wait.for_log("port=[0-9]+$") { as_regexp() })
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "the pattern matched")
+        }
+
+        spec.it("times out with what it saw") callback {
+            t0 = os.now_monotonic_ms()
+            c, err = tc.run(ALPINE) {
+                cmd(["sleep", "300"])
+                wait_for(wait.for_log("never") { with_startup_timeout(2s); with_poll_interval(200ms) })
+            }
+            testing.cleanup_container(c)
+            spec.assert_err_contains(err, "timed out after 2000ms", "a timeout")
+            spec.assert_err_contains(err, "matched 0 times", "and the last look")
+            el = since(t0)
+            spec.assert_true(el >= 2000 && el < 15000, "about the timeout: ${el}ms")
+        }
+    }
+
+    spec.describe(fw, "wait.for_listening_port") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("waits until the port listens inside and outside") callback {
+            t0 = os.now_monotonic_ms()
+            c, err = tc.run(ALPINE) {
+                expose("8080/tcp")
+                cmd(["sh", "-c", "sleep 2; nc -lk -p 8080 -e echo hi"])
+                wait_for(wait.for_listening_port("8080/tcp"))
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "the port came up")
+            spec.assert_true(since(t0) >= 2000, "not before the server listened")
+        }
+
+        spec.it("does not take the engine's port forwarder for a listener") callback {
+            // With a Podman machine (gvproxy) or Docker's userland proxy a
+            // connect to the host port can succeed with nothing listening in
+            // the container; the internal check is what tells them apart.
+            c, err = tc.run(ALPINE) {
+                expose("8080/tcp")
+                cmd(["sleep", "300"])
+                wait_for(wait.for_exposed_port() { with_startup_timeout(3s) })
+            }
+            testing.cleanup_container(c)
+            spec.assert_err_contains(err, "not listening inside the container", "the internal check failed it")
+        }
+
+        spec.it("only waits for the mapping with for_mapped_port") callback {
+            c, err = tc.run(ALPINE) {
+                expose("8080/tcp")
+                cmd(["sleep", "300"])
+                wait_for(wait.for_mapped_port("8080/tcp") { with_startup_timeout(5s) })
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "mapped is enough")
+        }
+    }
+
+    spec.describe(fw, "wait.for_http") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("checks status and body") callback {
+            c, err = tc.run("nginx:alpine") {
+                expose("80/tcp")
+                wait_for(wait.for_http("/") {
+                    with_status_matcher(|status: int| -> status == 200)
+                    with_response_matcher(|body: string| -> string.contains(body, "Welcome to nginx") == 1)
+                })
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "nginx served its page")
+        }
+
+        spec.it("waits for another status, on a named port, with headers") callback {
+            c, err = tc.run("nginx:alpine") {
+                expose("80/tcp")
+                expose("8081/tcp")
+                wait_for(wait.for_http("/missing") { with_port("80/tcp"); with_status(404); with_header("X-Test", "1"); with_basic_auth("u", "p") })
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "a 404 was what we asked for")
+        }
+
+        spec.it("fails when the body never matches") callback {
+            c, err = tc.run("nginx:alpine") {
+                expose("80/tcp")
+                wait_for(wait.for_http("/") {
+                    with_response_matcher(|body: string| -> string.contains(body, "not in the page") == 1)
+                    with_startup_timeout(3s)
+                })
+            }
+            testing.cleanup_container(c)
+            spec.assert_err_contains(err, "did not match", "the matcher said no")
+        }
+    }
+
+    spec.describe(fw, "wait.for_health_check, for_exec, for_exit, for_file") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("waits for a HEALTHCHECK to pass") callback {
+            c, err = tc.run(ALPINE) {
+                cmd(["sh", "-c", "sleep 2; touch /tmp/healthy; sleep 300"])
+                config_modifier(|cfg: ptr| {
+                    hc = json.obj()
+                    t = json.arr()
+                    json.push(t, json.str("CMD-SHELL"))
+                    json.push(t, json.str("test -f /tmp/healthy"))
+                    json.set(hc, "Test", t)
+                    json.set(hc, "Interval", json.from_int(500000000))
+                    json.set(hc, "Retries", json.from_int(30))
+                    json.set(cfg, "Healthcheck", hc)
+                })
+                wait_for(wait.for_health_check() { with_startup_timeout(30s) })
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "healthy")
+            st, _ = tc.state_of(c)
+            spec.assert_str_eq(st.health, "healthy", "the state says so")
+        }
+
+        spec.it("waits for a command to succeed, with its exit code and output") callback {
+            c, err = tc.run(ALPINE) {
+                cmd(["sh", "-c", "sleep 1; echo ready > /tmp/flag; sleep 300"])
+                wait_for(wait.for_exec(["cat", "/tmp/flag"]) {
+                    with_exit_code_matcher(|code: int| -> code == 0)
+                    with_response_matcher(|out: string| -> string.contains(out, "ready") == 1)
+                })
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "the command succeeded")
+            c2, err2 = tc.run(ALPINE) {
+                cmd(["sleep", "300"])
+                wait_for(wait.for_exec(["sh", "-c", "exit 5"]) { with_exit_code(5) })
+            }
+            testing.cleanup_container(c2)
+            spec.assert_ok(err2, "exit code 5 was asked for")
+        }
+
+        spec.it("waits for the container to exit") callback {
+            c, err = tc.run(ALPINE) {
+                cmd(["sh", "-c", "sleep 1"])
+                wait_for(wait.for_exit())
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "it exited")
+            st, _ = tc.state_of(c)
+            spec.assert_str_eq(st.status, "exited", "exited")
+        }
+
+        spec.it("waits for a file, and its content") callback {
+            c, err = tc.run(ALPINE) {
+                cmd(["sh", "-c", "sleep 1; echo partial > /tmp/f; sleep 1; echo done >> /tmp/f; sleep 300"])
+                wait_for(wait.for_file("/tmp/f") { with_file_matcher(|content: string| -> string.contains(content, "done") == 1) })
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "the file has its content")
+            data, _ = tc.copy_file_from_container(c, "/tmp/f")
+            spec.assert_str_eq(data, "partial\ndone\n", "all of it")
+        }
+    }
+
+    spec.describe(fw, "wait.for_all, for_any, for_func") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("waits for all, in order") callback {
+            c, err = tc.run(ALPINE) {
+                cmd(["sh", "-c", "echo one; sleep 1; echo two; sleep 300"])
+                wait_for(wait.for_all([wait.for_log("one"), wait.for_log("two")]) { with_deadline(20s) })
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "both")
+        }
+
+        spec.it("an overall deadline cuts the children short") callback {
+            t0 = os.now_monotonic_ms()
+            c, err = tc.run(ALPINE) {
+                cmd(["sleep", "300"])
+                wait_for(wait.for_all([wait.for_log("never")]) { with_deadline(2s) })
+            }
+            testing.cleanup_container(c)
+            spec.assert_err_contains(err, "timed out", "the deadline")
+            spec.assert_true(since(t0) < 20000, "well before the child's own 60s")
+        }
+
+        spec.it("takes the first of any") callback {
+            t0 = os.now_monotonic_ms()
+            c, err = tc.run(ALPINE) {
+                cmd(["sh", "-c", "echo second-one; sleep 300"])
+                wait_for(wait.for_any([wait.for_log("first-one"), wait.for_log("second-one")]) { with_startup_timeout(20s) })
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "the second was enough")
+            spec.assert_true(since(t0) < 15000, "without waiting out the first")
+        }
+
+        spec.it("polls a function of our own (Go's custom Strategy)") callback {
+            calls = 0
+            c, err = tc.run(ALPINE) {
+                cmd(["sleep", "300"])
+                // for_func's last parameter is the closure, so a modifier
+                // block cannot follow it: call the modifier instead.
+                wait_for(wait.with_poll_interval(wait.for_func(|c: *docker.Container| {
+                    calls = calls + 1
+                    if calls < 3 { return "not yet (${calls})" }
+                    return ""
+                }), 50ms))
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "ready on the third call")
+            spec.assert_eq(calls, 3, "called until ready")
+            c2, err2 = tc.run(ALPINE) {
+                cmd(["sleep", "300"])
+                wait_for(wait.with_startup_timeout(wait.for_func(|c: *docker.Container| { return "never" }), 1s))
+            }
+            testing.cleanup_container(c2)
+            spec.assert_err_contains(err2, "never", "its reason in the timeout")
+        }
+
+        spec.it("runs a strategy against a running container directly") callback {
+            c, err = tc.run(ALPINE) { cmd(["sh", "-c", "sleep 1; echo late; sleep 300"]) }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "run")
+            spec.assert_ok(wait.until_ready(wait.for_log("late"), c), "WaitUntilReady")
+            spec.assert_ok(wait.until_ready(wait.for_nop(), c), "nop")
+        }
+    }
+
+    return spec.run_summary(fw)
+}

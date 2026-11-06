@@ -1,0 +1,50 @@
+// Ported from testcontainers-go modules/vearch/vearch_test.go
+//
+// A real Vearch (TestVearch): GET on the REST endpoint answers 200.
+
+import std.spec
+import std.string
+import std.http.client
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.vearch
+
+const IMAGE = "vearch/vearch:3.5.1"
+
+// (status, body, error) of a GET.
+fn http_get(url: string) -> (int, string, string) {
+    req = client.request("GET", url)
+    client.set_timeout(req, 30s)
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    status = client.response_status(r)
+    out = client.response_body(r)
+    client.response_free(r)
+    return status, out, ""
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/vearch") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("serves the REST endpoint (TestVearch)") callback {
+            c, err = vearch.run(IMAGE)
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "vearch starts")
+            if err == "" {
+                url, uerr = vearch.rest_endpoint(c)
+                spec.assert_ok(uerr, "rest endpoint")
+                spec.assert_true(string.starts_with(url, "http://localhost:") == 1, "an http:// URL: ${url}")
+                st, _, herr = http_get(url)
+                spec.assert_ok(herr, "GET ${url}")
+                spec.assert_eq(st, 200, "REST endpoint answers 200")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

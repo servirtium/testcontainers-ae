@@ -1,0 +1,71 @@
+// Ported from testcontainers-go modules/opensearch/opensearch_test.go
+//
+// A real OpenSearch: address() answers the root banner (tagline), the
+// module's credentials are recorded, and a document is indexed and read back
+// over the REST API. Not ported: the opensearch-go client.
+
+import std.spec
+import std.string
+import std.http.client
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+ import std.json
+import modules.opensearch
+
+// (status, body, error); headers are "Name: value" strings.
+fn call_api(method: string, url: string, headers: string[], body: string, ctype: string) -> (int, string, string) {
+    req = client.request(method, url)
+    client.set_timeout(req, 30s)
+    for h in headers {
+        colon = string.index_of(h, ":")
+        client.set_header(req, string.substring(h, 0, colon), string.trim(string.substring(h, colon + 1, string.length(h))))
+    }
+    if string.length(body) > 0 { client.set_body(req, string.bytes(body), ctype) }
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    status = client.response_status(r)
+    out = client.response_body(r)
+    client.response_free(r)
+    return status, out, ""
+}
+
+const IMAGE = "opensearchproject/opensearch:2.11.1"
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/opensearch") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("serves the REST API (TestOpenSearch)") callback {
+            o, err = opensearch.run(IMAGE) {
+                username("tc-user")
+                password("tc-pass")
+            }
+            if o != null { testing.cleanup_container(o.container) }
+            spec.assert_ok(err, "opensearch starts")
+            if err == "" {
+                spec.assert_str_eq(o.user, "tc-user", "username option")
+                spec.assert_str_eq(o.password, "tc-pass", "password option")
+                addr, aerr = opensearch.address(o)
+                spec.assert_ok(aerr, "address")
+                spec.assert_true(string.starts_with(addr, "http://localhost:") == 1, "an http:// URL: ${addr}")
+                s, b, e = call_api("GET", "${addr}/", [], "", "")
+                spec.assert_ok(e, "GET /")
+                spec.assert_eq(s, 200, "root is 200")
+                spec.assert_contains(b, "The OpenSearch Project", "the tagline")
+                ps, _, pe = call_api("PUT", "${addr}/tc/_doc/1?refresh=true", ["Content-Type: application/json"], "{\"hello\":\"world\"}", "application/json")
+                spec.assert_ok(pe, "index a document")
+                spec.assert_true(ps == 200 || ps == 201, "indexed: ${ps}")
+                gs, gb, ge = call_api("GET", "${addr}/tc/_doc/1", [], "", "")
+                spec.assert_ok(ge, "get the document")
+                spec.assert_eq(gs, 200, "found")
+                spec.assert_contains(gb, "world", "the document reads back")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

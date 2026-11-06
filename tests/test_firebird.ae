@@ -1,0 +1,122 @@
+// Ported from testcontainers-go modules/firebird/firebird_test.go
+//
+// A real Firebird (TestFirebird, TestFirebirdWithOptions): the connection
+// string is the firebird:// URL with the server-side path Go asserts, with
+// the options' credentials in it, and the server answers the Firebird wire
+// protocol: an op_connect packet (p_cnct) at the mapped port gets back an
+// accept or reject opcode.
+
+import std.spec
+import std.string
+import std.tcp
+import std.bytes
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.firebird
+
+const IMAGE = "jacobalberty/firebird:v3.0"
+
+fn put32(buf: ptr, v: int) {
+    n = bytes.length(buf)
+    bytes.set(buf, n, (v / 16777216) & 255)
+    bytes.set(buf, n + 1, (v / 65536) & 255)
+    bytes.set(buf, n + 2, (v / 256) & 255)
+    bytes.set(buf, n + 3, v & 255)
+}
+
+// XDR string: length, bytes, zero padding to a multiple of 4
+fn put_xdr(buf: ptr, s: string) {
+    n = string.length(s)
+    put32(buf, n)
+    bytes.copy_from_string(buf, bytes.length(buf), s, n)
+    pad = (4 - n % 4) % 4
+    i = 0
+    while i < pad { bytes.set(buf, bytes.length(buf), 0); i = i + 1 }
+}
+
+// op_connect for op_attach, protocol 10 offered; returns the opcode of the
+// reply (op_accept 3, op_reject 4, op_response 9, op_cond_accept 98, ...).
+fn op_connect(host: string, port: int, db: string) -> (int, string) {
+    sock, cerr = tcp.connect(host, port)
+    if cerr != "" { return 0, cerr }
+    p = bytes.new(128)
+    put32(p, 1)       // op_connect
+    put32(p, 19)      // op_attach
+    put32(p, 2)       // CONNECT_VERSION2
+    put32(p, 1)       // arch_generic
+    put_xdr(p, db)
+    put32(p, 1)       // one protocol
+    put_xdr(p, "")    // user id block
+    put32(p, 10)      // protocol version 10
+    put32(p, 1)       // architecture generic
+    put32(p, 0)       // min type
+    put32(p, 3)       // max type
+    put32(p, 2)       // weight
+    _, werr = tcp.write_all(sock, bytes.view(p))
+    bytes.free(p)
+    if werr != "" { tcp.tcp_close(sock); return 0, werr }
+    buf = bytes.new(64)
+    got = 0
+    tries = 0
+    while got < 4 && tries < 100 {
+        n, rerr = tcp.read_into(sock, bytes.capacity_view(buf))
+        if rerr != "" && rerr != "timeout" { break }
+        if n > 0 { got = got + n; bytes.set_length(buf, got) }
+        tries = tries + 1
+    }
+    tcp.tcp_close(sock)
+    if got < 4 { bytes.free(buf); return 0, "short reply: ${got} bytes" }
+    v = bytes.view(buf)
+    op = (v[0] & 255) * 16777216 + (v[1] & 255) * 65536 + (v[2] & 255) * 256 + (v[3] & 255)
+    bytes.free(buf)
+    return op, ""
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/firebird") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("builds the connection string and speaks the wire protocol (TestFirebird)") callback {
+            f, err = firebird.run(IMAGE)
+            if f != null { testing.cleanup_container(f.container) }
+            spec.assert_ok(err, "firebird starts")
+            if err == "" {
+                cs, cerr = firebird.connection_string(f)
+                spec.assert_ok(cerr, "connection string")
+                spec.assert_true(string.starts_with(cs, "firebird://test:test@localhost:") == 1, "firebird:// URL: ${cs}")
+                spec.assert_contains(cs, "/firebird/data/test.fdb?charset=UTF8", "the server-side path")
+
+                h, _ = tc.host(f.container)
+                port, perr = tc.mapped_port(f.container, firebird.PORT)
+                spec.assert_ok(perr, "mapped port")
+                op, werr = op_connect(h, port, "/firebird/data/test.fdb")
+                spec.assert_ok(werr, "op_connect exchange")
+                spec.assert_true(op == 3 || op == 4 || op == 9 || op == 94 || op == 98, "a Firebird protocol reply opcode: ${op}")
+            }
+        }
+
+        spec.it("takes the option credentials (TestFirebirdWithOptions)") callback {
+            f, err = firebird.run(IMAGE) {
+                database("mydb.fdb")
+                username("myuser")
+                password("mypassword")
+                sysdba_password("mysyspassword")
+            }
+            if f != null { testing.cleanup_container(f.container) }
+            spec.assert_ok(err, "firebird starts")
+            if err == "" {
+                cs, _ = firebird.connection_string(f)
+                spec.assert_contains(cs, "myuser:mypassword@", "the credentials")
+                spec.assert_contains(cs, "/firebird/data/mydb.fdb", "the database")
+                code, out, _ = tc.exec(f.container, ["sh", "-c", "echo $FIREBIRD_DATABASE:$FIREBIRD_USER:$ISC_PASSWORD"])
+                spec.assert_eq(code, 0, "exec")
+                spec.assert_str_eq(string.trim(out), "mydb.fdb:myuser:mysyspassword", "the container's environment")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

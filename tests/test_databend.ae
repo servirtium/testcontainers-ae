@@ -1,0 +1,71 @@
+// Ported from testcontainers-go modules/databend/databend_test.go
+//
+// A real Databend: the connection string has the module's user, password and
+// database, and its host:port answers a SQL statement over the HTTP query API
+// ("select 1 + 41") with the credentials as basic auth; a wrong password is
+// refused. Not ported: the databend-go database/sql driver.
+
+import std.spec
+import std.string
+import std.http.client
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+ import modules.databend
+
+// (status, body, error); headers are "Name: value" strings.
+fn call_api(method: string, url: string, headers: string[], body: string, ctype: string) -> (int, string, string) {
+    req = client.request(method, url)
+    client.set_timeout(req, 30s)
+    for h in headers {
+        colon = string.index_of(h, ":")
+        client.set_header(req, string.substring(h, 0, colon), string.trim(string.substring(h, colon + 1, string.length(h))))
+    }
+    if string.length(body) > 0 { client.set_body(req, string.bytes(body), ctype) }
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    status = client.response_status(r)
+    out = client.response_body(r)
+    client.response_free(r)
+    return status, out, ""
+}
+
+const IMAGE = "datafuselabs/databend:v1.2.615"
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/databend") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("runs SQL at the connection string's address (TestDatabend)") callback {
+            d, err = databend.run(IMAGE) {
+                username("tcuser")
+                password("tcpass")
+            }
+            if d != null { testing.cleanup_container(d.container) }
+            spec.assert_ok(err, "databend starts")
+            if err == "" {
+                dsn, derr = databend.connection_string(d, ["sslmode=disable"])
+                spec.assert_ok(derr, "connection string")
+                spec.assert_true(string.starts_with(dsn, "databend://tcuser:tcpass@localhost:") == 1, "DSN: ${dsn}")
+                spec.assert_true(string.ends_with(dsn, "/default?sslmode=disable") == 1, "database and args: ${dsn}")
+                at = string.index_of(dsn, "@")
+                rest = string.substring(dsn, at + 1, string.length(dsn))
+                hostport = string.substring(rest, 0, string.index_of(rest, "/"))
+                q = "{\"sql\":\"select 1 + 41\"}"
+                // "tcuser:tcpass" in base64
+                s, b, e = call_api("POST", "http://${hostport}/v1/query", ["Authorization: Basic dGN1c2VyOnRjcGFzcw=="], q, "application/json")
+                spec.assert_ok(e, "POST /v1/query")
+                spec.assert_eq(s, 200, "query is 200")
+                spec.assert_contains(b, "[[\"42\"]]", "1 + 41 = 42")
+                bs, _, be = call_api("POST", "http://${hostport}/v1/query", ["Authorization: Basic dGN1c2VyOndyb25n"], q, "application/json")
+                spec.assert_ok(be, "wrong password call")
+                spec.assert_eq(bs, 401, "wrong password: refused")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

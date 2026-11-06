@@ -1,0 +1,70 @@
+// Ported from testcontainers-go modules/nginx/nginx.go
+//
+// modules.nginx: an nginx container.
+//
+//     import modules.nginx
+//
+//     c, err = nginx.run("nginx:1.25") {
+//         custom_config("testdata/default.conf")     // /etc/nginx/conf.d/default.conf
+//         tc.file_content("hello", "/usr/share/nginx/html/hello.txt", 420)
+//     }
+//     defer tc.terminate(c)
+//     url, _ = nginx.http_endpoint(c)                // "http://localhost:32771"
+//
+// Not ported: Go's Container wrapper type (it stores nothing; the module
+// returns the plain *docker.Container, as redis does).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, http_endpoint, https_endpoint, config_file, custom_config,
+    HTTP_PORT, HTTPS_PORT, CONF_PATH, DEFAULT_CONF_PATH,
+    nginx_request_new, nginx_request_free
+)
+
+const HTTP_PORT = "80/tcp"
+const HTTPS_PORT = "443/tcp"
+const CONF_PATH = "/etc/nginx/nginx.conf"
+const DEFAULT_CONF_PATH = "/etc/nginx/conf.d/default.conf"
+
+nginx_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, HTTPS_PORT)
+    tc.wait_for(r, wait.for_listening_port(HTTP_PORT))
+    return r
+}
+
+nginx_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithConfigFile: replace /etc/nginx/nginx.conf with a host file.
+config_file(_ctx: ptr, host_path: string) { tc.file(_ctx, host_path, CONF_PATH, 420) }
+
+// Go's WithCustomConfig: replace /etc/nginx/conf.d/default.conf (the server
+// block the stock nginx.conf includes) with a host file.
+custom_config(_ctx: ptr, host_path: string) { tc.file(_ctx, host_path, DEFAULT_CONF_PATH, 420) }
+
+builder run(image: string) with nginx_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = nginx_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run nginx: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" (Go's HTTPEndpoint).
+http_endpoint(c: *docker.Container) -> (string, string) {
+    ep, err = tc.endpoint(c, HTTP_PORT, "http")
+    if err != "" { return "", "http endpoint: ${err}" }
+    return ep, ""
+}
+
+// "https://host:port" (Go's HTTPSEndpoint).
+https_endpoint(c: *docker.Container) -> (string, string) {
+    ep, err = tc.endpoint(c, HTTPS_PORT, "https")
+    if err != "" { return "", "https endpoint: ${err}" }
+    return ep, ""
+}

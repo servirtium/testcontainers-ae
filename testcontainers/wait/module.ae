@@ -1,0 +1,879 @@
+// Ported from testcontainers-go wait/{wait.go,log.go,host_port.go,http.go,health.go,exec.go,exit.go,file.go,all.go,any.go,nop.go,walk.go,tls.go,sql.go}
+//
+// testcontainers.wait: wait strategies.
+//
+// A strategy is a *Strategy built by a for_* constructor and adjusted by
+// with_* modifiers, which take the strategy first and return it, so they
+// chain with UFCS:
+//
+//     wait.for_log("ready").with_occurrence(2).with_startup_timeout(30s)
+//
+// Each kind has one probe (one look at the logs, one dial, one request); a
+// single driver loop polls it until the deadline. for_all runs its children
+// one after another; for_any interleaves their probes on one loop. Before a
+// probe the container's state is checked, so an exited or OOM-killed
+// container fails the wait at once (Go's checkTarget). DESIGN.md section 3.
+
+import std.string
+import std.os
+import std.tcp
+import std.regex
+import std.http.client
+import std.encoding
+import std.fs
+import std.uuid
+import testcontainers.docker
+import sql
+
+exports(
+    Strategy, KIND_LOG, KIND_PORT, KIND_HTTP, KIND_HEALTH, KIND_EXEC, KIND_EXIT,
+    KIND_FILE, KIND_ALL, KIND_ANY, KIND_FUNC, KIND_NOP, KIND_TLS, KIND_SQL,
+    for_tls_cert, for_tls_root_cas, with_root_cas, with_cert, with_server_name,
+    with_tls, with_allow_insecure, with_tls_ca_file, with_tls_config_from,
+    tls_ca_file, tls_ca_pem, tls_cert_pem, tls_key_pem,
+    for_log, for_listening_port, for_exposed_port, for_mapped_port, for_http,
+    for_health_check, for_exec, for_exit, for_file, for_all, for_any, for_func,
+    for_nop, for_sql, with_query, DEFAULT_SQL_QUERY,
+    with_startup_timeout, with_poll_interval, with_deadline, with_occurrence,
+    as_regexp, skip_internal_check, skip_external_check, with_port, with_status,
+    with_status_matcher, with_response_matcher, with_method, with_body,
+    with_header, with_basic_auth, with_exit_code, with_exit_code_matcher,
+    with_file_matcher, and_then,
+    until_ready, describe, timeout_ms, poll_ms, internal_check_command
+)
+
+const KIND_LOG = 1
+const KIND_PORT = 2
+const KIND_HTTP = 3
+const KIND_HEALTH = 4
+const KIND_EXEC = 5
+const KIND_EXIT = 6
+const KIND_FILE = 7
+const KIND_ALL = 8
+const KIND_ANY = 9
+const KIND_FUNC = 10
+const KIND_NOP = 11
+const KIND_TLS = 12
+const KIND_SQL = 13
+
+const DEFAULT_SQL_QUERY = "SELECT 1"
+
+const DEFAULT_TIMEOUT_MS = 60000
+const DEFAULT_POLL_MS = 100
+
+struct Strategy {
+    kind: int
+    timeout_ms: long        // 0: unset (DEFAULT_TIMEOUT_MS, or the parent's)
+    poll_ms: long
+    deadline_ms: long       // for_all / for_any: the overall deadline, 0 none
+    // log
+    text: string
+    regexp: bool
+    occurrence: int
+    // port, http
+    port: string
+    skip_internal: bool
+    skip_external: bool
+    // http
+    path: string
+    method: string
+    body: string
+    headers: string[]       // "Name: value"
+    status: int             // the wanted status when no matcher; 200 by default
+    status_matcher: fn
+    has_status_matcher: bool
+    response_matcher: fn
+    has_response_matcher: bool
+    // exec
+    cmd: string[]
+    exit_code: int
+    exit_matcher: fn
+    has_exit_matcher: bool
+    // file
+    file: string
+    file_matcher: fn
+    has_file_matcher: bool
+    // all, any
+    children: ptr[]          // *Strategy each
+    // func
+    func: fn
+    // http over TLS (Go's WithTLS / WithAllowInsecure): verify against the
+    // system store, ca_file, or the CA a for_tls_* strategy read (tls_from)
+    tls: bool
+    insecure: bool
+    ca_file: string
+    tls_from: ptr            // *Strategy of KIND_TLS
+    // tls (Go's ForTLSCert / ForTLSRootCAs): container paths, then what
+    // was read from them once ready
+    root_files: string[]
+    cert_file: string
+    key_file: string
+    ca_pem: string
+    cert_pem: string
+    key_pem: string
+    ca_path: string          // the host file the CA bundle was written to
+    server_name: string      // the name the certificate is checked for
+    // sql (Go's ForSQL): the driver's registered name, the DSN closure
+    // |host: string, port: int| -> string, and the query
+    sql_driver: string
+    sql_url: fn
+    sql_query: string
+    // what the last probe saw, for the timeout error
+    last: string
+}
+
+fn base(kind: int) -> *Strategy {
+    s = heap.new(Strategy)
+    s.kind = kind
+    s.poll_ms = DEFAULT_POLL_MS
+    s.occurrence = 1
+    s.status = 200
+    s.method = "GET"
+    s.ca_file = ""
+    s.cert_file = ""
+    s.key_file = ""
+    s.ca_pem = ""
+    s.cert_pem = ""
+    s.key_pem = ""
+    s.ca_path = ""
+    s.server_name = ""
+    s.sql_driver = ""
+    s.sql_query = DEFAULT_SQL_QUERY
+    return s
+}
+
+// ---- constructors ----
+
+// Wait until the log (stdout and stderr) contains text (Go's ForLog).
+for_log(text: string) -> *Strategy {
+    s = base(KIND_LOG)
+    s.text = text
+    return s
+}
+
+// Wait until the container port listens, checked from inside the container
+// (/proc/net/tcp, nc or bash's /dev/tcp) and from the host through the
+// mapped port (Go's ForListeningPort).
+for_listening_port(port: string) -> *Strategy {
+    s = base(KIND_PORT)
+    s.port = docker.normalize_port(port)
+    return s
+}
+
+// for_listening_port on the lowest exposed port (Go's ForExposedPort).
+for_exposed_port() -> *Strategy { return base(KIND_PORT) }
+
+// Only that the port is mapped (Go's ForMappedPort).
+for_mapped_port(port: string) -> *Strategy {
+    s = for_listening_port(port)
+    s.skip_internal = true
+    s.skip_external = true
+    return s
+}
+
+// Wait until GET http://host:mapped<path> answers 200, or what with_status /
+// with_status_matcher / with_response_matcher ask (Go's ForHTTP). The port
+// is the lowest exposed one unless with_port names one. HTTPS with with_tls,
+// with_allow_insecure, with_tls_ca_file or with_tls_config_from.
+for_http(path: string) -> *Strategy {
+    s = base(KIND_HTTP)
+    s.path = path
+    if string.starts_with(path, "/") == 0 { s.path = "/${path}" }
+    return s
+}
+
+// Wait until the PEM certificate and key files exist in the container and
+// read them (Go's ForTLSCert); with_root_cas adds the CA files to read. Once
+// ready, tls_ca_file(s) is a host file of the CA bundle that for_http's
+// with_tls_config_from(s) verifies against, and tls_cert_pem / tls_key_pem
+// hold the pair. (std.http has no client certificates yet, so the pair is
+// for the caller; Go puts it in the tls.Config.)
+for_tls_cert(cert_file: string, key_file: string) -> *Strategy {
+    s = base(KIND_TLS)
+    s.cert_file = cert_file
+    s.key_file = key_file
+    return s
+}
+
+// Wait until the PEM CA files exist in the container and read them (Go's
+// ForTLSRootCAs).
+for_tls_root_cas(files: string[]) -> *Strategy {
+    s = base(KIND_TLS)
+    for f in files { s.root_files.push(f) }
+    return s
+}
+
+// Wait until the image's HEALTHCHECK reports healthy (Go's ForHealthCheck).
+for_health_check() -> *Strategy { return base(KIND_HEALTH) }
+
+// Wait until cmd, exec'd in the container, exits 0 (or with_exit_code /
+// with_exit_code_matcher), and its output matches with_response_matcher
+// (Go's ForExec).
+for_exec(cmd: string[]) -> *Strategy {
+    s = base(KIND_EXEC)
+    for a in cmd { s.cmd.push(a) }
+    return s
+}
+
+// Wait until the container has exited (Go's ForExit).
+for_exit() -> *Strategy { return base(KIND_EXIT) }
+
+// Wait until a file exists in the container, and matches with_file_matcher
+// (Go's ForFile).
+for_file(path: string) -> *Strategy {
+    s = base(KIND_FILE)
+    s.file = path
+    return s
+}
+
+// Every strategy, in order (Go's ForAll).
+for_all(strategies: ptr[]) -> *Strategy {
+    s = base(KIND_ALL)
+    for c in strategies { s.children.push(c) }
+    return s
+}
+
+// The first strategy to be ready (Go's ForAny).
+for_any(strategies: ptr[]) -> *Strategy {
+    s = base(KIND_ANY)
+    for c in strategies { s.children.push(c) }
+    return s
+}
+
+// A strategy of your own: f is |c: *docker.Container| { ...; return "" },
+// called once a poll; "" is ready, anything else is "not yet" and the
+// reason, reported if the deadline passes.
+for_func(f: @keep fn) -> *Strategy {
+    s = base(KIND_FUNC)
+    s.func = f
+    return s
+}
+
+// Ready at once (Go's ForNop with no function).
+for_nop() -> *Strategy { return base(KIND_NOP) }
+
+// Wait until a SQL query succeeds against the database on a port (Go's
+// ForSQL): url_fn is |host: string, port: int| -> string, the data source
+// name for the host and mapped port; driver is a name registered with
+// `sql` (sql.postgres's register() gives "postgres", "pgx", "pgx/v5"). Each
+// poll opens the database, runs the query ("SELECT 1", or with_query's) and
+// closes it. The closure is the last parameter, so modifiers are called
+// around it: wait.with_query(wait.for_sql(...), "SELECT 10"). Go keeps one
+// sql.DB across polls (its pool reconnects); here each poll is a fresh
+// connection, which is what that pool does after a failure.
+for_sql(port: string, driver: string, url_fn: @keep fn) -> *Strategy {
+    s = base(KIND_SQL)
+    s.port = port
+    if string.length(port) > 0 { s.port = docker.normalize_port(port) }
+    s.sql_driver = driver
+    s.sql_url = url_fn
+    return s
+}
+
+// ---- modifiers ----
+//
+// Each takes the strategy as _ctx and returns it, so it works three ways:
+// in a trailing block on the constructor (the strategy is the block's
+// context), `wait.for_log("x") { with_occurrence(2) }`; called with the
+// strategy first, `wait.with_occurrence(s, 2)`; and chained with UFCS,
+// `wait.for_log("x").with_occurrence(2)`, where Aether resolves UFCS for
+// the import (not yet for a dotted or aliased import such as
+// `import testcontainers.wait`: see README, "Known gaps").
+
+with_startup_timeout(_ctx: *Strategy, d: Duration) -> *Strategy { _ctx.timeout_ms = d / 1ms; return _ctx }
+with_poll_interval(_ctx: *Strategy, d: Duration) -> *Strategy { _ctx.poll_ms = d / 1ms; return _ctx }
+// for_all / for_any: a deadline over all the children (Go's WithDeadline).
+with_deadline(_ctx: *Strategy, d: Duration) -> *Strategy { _ctx.deadline_ms = d / 1ms; return _ctx }
+// for_sql: the query run until it succeeds (Go's WithQuery).
+with_query(_ctx: *Strategy, q: string) -> *Strategy { _ctx.sql_query = q; return _ctx }
+with_occurrence(_ctx: *Strategy, n: int) -> *Strategy {
+    if n <= 0 { _ctx.occurrence = 1 } else { _ctx.occurrence = n }
+    return _ctx
+}
+as_regexp(_ctx: *Strategy) -> *Strategy { _ctx.regexp = true; return _ctx }
+skip_internal_check(_ctx: *Strategy) -> *Strategy { _ctx.skip_internal = true; return _ctx }
+skip_external_check(_ctx: *Strategy) -> *Strategy { _ctx.skip_external = true; return _ctx }
+with_port(_ctx: *Strategy, port: string) -> *Strategy { _ctx.port = docker.normalize_port(port); return _ctx }
+with_status(_ctx: *Strategy, code: int) -> *Strategy { _ctx.status = code; return _ctx }
+// f: |status: int| -> bool
+with_status_matcher(_ctx: *Strategy, f: @keep fn) -> *Strategy {
+    _ctx.status_matcher = f
+    _ctx.has_status_matcher = true
+    return _ctx
+}
+// f: |body: string| -> bool, for for_http (the body) and for_exec (the output)
+with_response_matcher(_ctx: *Strategy, f: @keep fn) -> *Strategy {
+    _ctx.response_matcher = f
+    _ctx.has_response_matcher = true
+    return _ctx
+}
+with_method(_ctx: *Strategy, m: string) -> *Strategy { _ctx.method = m; return _ctx }
+with_body(_ctx: *Strategy, body: string) -> *Strategy { _ctx.body = body; return _ctx }
+with_header(_ctx: *Strategy, name: string, value: string) -> *Strategy {
+    _ctx.headers.push("${name}: ${value}")
+    return _ctx
+}
+with_basic_auth(_ctx: *Strategy, user: string, password: string) -> *Strategy {
+    _ctx.headers.push("Authorization: Basic ${basic(user, password)}")
+    return _ctx
+}
+with_exit_code(_ctx: *Strategy, code: int) -> *Strategy { _ctx.exit_code = code; return _ctx }
+// f: |code: int| -> bool
+with_exit_code_matcher(_ctx: *Strategy, f: @keep fn) -> *Strategy {
+    _ctx.exit_matcher = f
+    _ctx.has_exit_matcher = true
+    return _ctx
+}
+// f: |content: string| -> bool
+with_file_matcher(_ctx: *Strategy, f: @keep fn) -> *Strategy {
+    _ctx.file_matcher = f
+    _ctx.has_file_matcher = true
+    return _ctx
+}
+
+// for_tls_*: the CA files to read (Go's WithRootCAs), replacing earlier ones.
+with_root_cas(_ctx: *Strategy, files: string[]) -> *Strategy {
+    string[] kept = []
+    for f in files { kept.push(f) }
+    _ctx.root_files = kept
+    return _ctx
+}
+// for_tls_*: the certificate and key files (Go's WithCert).
+with_cert(_ctx: *Strategy, cert_file: string, key_file: string) -> *Strategy {
+    _ctx.cert_file = cert_file
+    _ctx.key_file = key_file
+    return _ctx
+}
+// for_tls_* (Go's WithServerName), and for_http directly: the name the
+// server's certificate is checked for, when it is not the host dialled
+// (cockroach's node certificate names 127.0.0.1 only, not localhost).
+// std.http.client verifies the host it dials and cannot be given another
+// name, so this works when the name and the host are both this machine's
+// loopback (the probe then dials the name); any other pair fails the wait
+// with that reason.
+with_server_name(_ctx: *Strategy, name: string) -> *Strategy { _ctx.server_name = name; return _ctx }
+// for_http over HTTPS, verified against the system trust store (Go's
+// WithTLS(true)).
+with_tls(_ctx: *Strategy) -> *Strategy { _ctx.tls = true; return _ctx }
+// for_http over HTTPS without verifying the certificate (Go's
+// WithTLS(true) + WithAllowInsecure(true): InsecureSkipVerify).
+with_allow_insecure(_ctx: *Strategy) -> *Strategy {
+    _ctx.tls = true
+    _ctx.insecure = true
+    return _ctx
+}
+// for_http over HTTPS, verified against the PEM CA bundle at a host path
+// (Go's WithTLS(true, &tls.Config{RootCAs: ...})). The host name checked is
+// the one dialled (tc.host, "localhost" for a local engine).
+with_tls_ca_file(_ctx: *Strategy, path: string) -> *Strategy {
+    _ctx.tls = true
+    _ctx.ca_file = path
+    return _ctx
+}
+// for_http over HTTPS, verified against the CA a for_tls_cert /
+// for_tls_root_cas strategy read from the container (Go's
+// WithTLS(true, tlsStrategy.TLSConfig())). Put the TLS strategy before
+// this one (for_all, or additional_wait), as in Go.
+with_tls_config_from(_ctx: *Strategy, t: *Strategy) -> *Strategy {
+    _ctx.tls = true
+    _ctx.tls_from = t as ptr
+    return _ctx
+}
+
+// After a for_tls_* strategy is ready: the host path of the CA bundle it
+// wrote ("" when it read no CA file), the CA PEM, the certificate PEM and
+// the key PEM (Go's TLSConfig()).
+tls_ca_file(s: *Strategy) -> string { return s.ca_path }
+tls_ca_pem(s: *Strategy) -> string { return s.ca_pem }
+tls_cert_pem(s: *Strategy) -> string { return s.cert_pem }
+tls_key_pem(s: *Strategy) -> string { return s.key_pem }
+
+// s followed by next: for_all([s, next]), or next appended when s is a for_all.
+and_then(s: *Strategy, next: *Strategy) -> *Strategy {
+    if s == null { return next }
+    if s.kind == KIND_ALL {
+        s.children.push(next)
+        return s
+    }
+    all = base(KIND_ALL)
+    all.children.push(s)
+    all.children.push(next)
+    return all
+}
+
+fn basic(user: string, password: string) -> string {
+    return encoding.base64_encode_padded(string.bytes("${user}:${password}"))
+}
+
+timeout_ms(s: *Strategy) -> long {
+    if s.timeout_ms > 0 { return s.timeout_ms }
+    return DEFAULT_TIMEOUT_MS
+}
+
+poll_ms(s: *Strategy) -> long {
+    if s.poll_ms > 0 { return s.poll_ms }
+    return DEFAULT_POLL_MS
+}
+
+// A human description (Go's String()).
+describe(s: *Strategy) -> string {
+    if s == null { return "nothing" }
+    k = s.kind
+    if k == KIND_LOG {
+        what = "log message"
+        if s.regexp { what = "log pattern" }
+        occ = ""
+        if s.occurrence > 1 { occ = " (occurrence: ${s.occurrence})" }
+        return "${what} \"${s.text}\"${occ}"
+    }
+    if k == KIND_PORT {
+        p = "first exposed port"
+        if string.length(s.port) > 0 { p = "port ${s.port}" }
+        if s.skip_internal && s.skip_external { return "${p} to be mapped" }
+        if s.skip_internal { return "${p} to be accessible externally" }
+        if s.skip_external { return "${p} to be listening internally" }
+        return "${p} to be listening"
+    }
+    if k == KIND_HTTP {
+        sch = "HTTP"
+        if s.tls { sch = "HTTPS" }
+        return "${sch} ${s.method} ${s.path} on ${port_or_first(s.port)}"
+    }
+    if k == KIND_HEALTH { return "health check to be healthy" }
+    if k == KIND_EXEC { return "exec ${join(s.cmd)}" }
+    if k == KIND_EXIT { return "container to exit" }
+    if k == KIND_FILE { return "file \"${s.file}\"" }
+    if k == KIND_ALL || k == KIND_ANY {
+        parts = ""
+        for c in s.children {
+            if string.length(parts) > 0 { parts = "${parts}, " }
+            parts = "${parts}${describe(c as *Strategy)}"
+        }
+        if k == KIND_ALL { return "all of: [${parts}]" }
+        return "any of: [${parts}]"
+    }
+    if k == KIND_FUNC { return "custom check" }
+    if k == KIND_SQL {
+        p = "default"
+        if string.length(s.port) > 0 {
+            slash = string.index_of(s.port, "/")
+            p = s.port
+            if slash >= 0 { p = string.substring(s.port, 0, slash) }
+        }
+        q = ""
+        if s.sql_query != DEFAULT_SQL_QUERY { q = " with query \"${s.sql_query}\"" }
+        return "SQL database on port ${p} using driver \"${s.sql_driver}\"${q}"
+    }
+    if k == KIND_TLS {
+        parts = ""
+        if s.root_files.len > 0 { parts = "root CAs [${join(s.root_files)}]" }
+        if string.length(s.cert_file) > 0 {
+            if string.length(parts) > 0 { parts = "${parts} and " }
+            parts = "${parts}cert \"${s.cert_file}\" and key \"${s.key_file}\""
+        }
+        if string.length(parts) == 0 { return "TLS certificates" }
+        return parts
+    }
+    return "nothing"
+}
+
+fn port_or_first(p: string) -> string {
+    if string.length(p) > 0 { return p }
+    return "the first exposed port"
+}
+
+fn join(xs: string[]) -> string {
+    out = ""
+    for x in xs {
+        if string.length(out) > 0 { out = "${out} " }
+        out = "${out}${x}"
+    }
+    return out
+}
+
+// ===================================================================
+// Probes: one look each. (ready, error, fatal): ready true is done;
+// fatal true ends the wait with error; else error is why not yet.
+// ===================================================================
+
+// Go's checkState.
+fn check_running(c: *docker.Container) -> (string, bool) {
+    st, err = docker.state_of(c)
+    if err != "" { return err, false }
+    if st.running { return "", false }
+    if st.oom_killed { return "container crashed with out-of-memory (OOMKilled)", true }
+    if st.status == "exited" { return "container exited with code ${st.exit_code}", true }
+    return "unexpected container status \"${st.status}\"", st.status == "dead"
+}
+
+fn count_text(hay: string, needle: string) -> int {
+    if string.length(needle) == 0 { return 0 }
+    n = 0
+    i = string.index_of(hay, needle)
+    while i >= 0 {
+        n = n + 1
+        i = string.index_of_from(hay, needle, i + string.length(needle))
+    }
+    return n
+}
+
+fn count_regexp(hay: string, pattern: string) -> (int, string) {
+    re, err = regex.compile(pattern)
+    if err != "" { return 0, "bad pattern `${pattern}`: ${err}" }
+    fa, ferr = regex.find_all(re, hay)
+    if ferr != "" {
+        regex.free(re)
+        return 0, ""
+    }
+    n = regex.find_all_count(fa)
+    regex.find_all_free(fa)
+    regex.free(re)
+    return n, ""
+}
+
+fn probe_log(s: *Strategy, c: *docker.Container) -> (bool, string, bool) {
+    text, err = docker.logs(c)
+    if err != "" {
+        cerr, fatal = check_running(c)
+        if fatal { return false, "${cerr}; logs: ${err}", true }
+        return false, err, false
+    }
+    n = 0
+    if s.regexp {
+        m, rerr = count_regexp(text, s.text)
+        if rerr != "" { return false, rerr, true }
+        n = m
+    } else {
+        n = count_text(text, s.text)
+    }
+    if n >= s.occurrence { return true, "", false }
+    cerr, fatal = check_running(c)
+    if fatal { return false, cerr, true }
+    return false, "\"${s.text}\" matched ${n} times, expected ${s.occurrence}", false
+}
+
+// The shell command Go's internalCheck runs: the port in /proc/net/tcp*,
+// else nc, else bash's /dev/tcp.
+internal_check_command(port: int) -> string {
+    hex = string.to_upper(string.pad_start(string.from_int_radix(port, 16), 4, 48))
+    return "(cat /proc/net/tcp* | awk '{print $2}' | grep -i :${hex} || nc -vz -w 1 localhost ${port} || /bin/sh -c '</dev/tcp/localhost/${port}') > /dev/null 2>&1"
+}
+
+fn probe_port(s: *Strategy, c: *docker.Container) -> (bool, string, bool) {
+    cerr, fatal = check_running(c)
+    if fatal { return false, cerr, true }
+    if string.length(cerr) > 0 { return false, cerr, false }
+    p = s.port
+    if string.length(p) == 0 { p = docker.lowest_exposed_port(c) }
+    if string.length(p) == 0 { return false, "no exposed port to wait for", false }
+    mp, merr = docker.mapped_port(c, p)
+    if merr != "" { return false, merr, false }
+    if !s.skip_external {
+        h, _ = docker.host(c)
+        if string.ends_with(p, "/tcp") == 1 {
+            sock, derr = tcp.connect(h, mp)
+            if derr != "" { return false, "dial ${h}:${mp}: ${derr}", false }
+            tcp.tcp_close(sock)
+        }
+    }
+    if s.skip_internal { return true, "", false }
+    num, _ = string.to_int(string.substring(p, 0, string.index_of(p, "/")))
+    code, out, eerr = docker.exec(c, ["/bin/sh", "-c", internal_check_command(num)])
+    if eerr != "" { return false, "internal check: ${eerr}", false }
+    // 126: the shell cannot be run, 127: there is none; only the external
+    // check counts then, as in Go.
+    if code == 0 || code == 126 || code == 127 { return true, "", false }
+    _ = out
+    return false, "port ${p} is not listening inside the container", false
+}
+
+fn probe_http(s: *Strategy, c: *docker.Container) -> (bool, string, bool) {
+    cerr, fatal = check_running(c)
+    if fatal { return false, cerr, true }
+    p = s.port
+    if string.length(p) == 0 { p = docker.lowest_exposed_port(c) }
+    if string.length(p) == 0 { return false, "no exposed port for the HTTP check", false }
+    mp, merr = docker.mapped_port(c, p)
+    if merr != "" { return false, merr, false }
+    h, _ = docker.host(c)
+    scheme = "http"
+    cafile = s.ca_file
+    sname = s.server_name
+    if s.tls {
+        scheme = "https"
+        if s.tls_from != null {
+            t = s.tls_from as *Strategy
+            if string.length(t.ca_path) > 0 { cafile = t.ca_path }
+            if string.length(sname) == 0 { sname = t.server_name }
+        }
+        if string.length(sname) > 0 && sname != h {
+            if is_loopback(sname) && is_loopback(h) {
+                h = sname
+                if string.contains(h, ":") == 1 { h = "[${h}]" }
+            } else {
+                return false, "TLS server name ${sname} differs from the host ${h}: std.http.client verifies the host it dials and cannot be given another name", true
+            }
+        }
+    }
+    req = client.request(s.method, "${scheme}://${h}:${mp}${s.path}")
+    client.set_timeout(req, 5s)
+    if s.tls {
+        if s.insecure {
+            _ = client.set_insecure(req, 1)
+        } else if string.length(cafile) > 0 {
+            _ = client.set_cafile(req, cafile)
+        }
+    }
+    for hd in s.headers {
+        colon = string.index_of(hd, ": ")
+        if colon > 0 { client.set_header(req, string.substring(hd, 0, colon), string.substring(hd, colon + 2, string.length(hd))) }
+    }
+    if string.length(s.body) > 0 { client.set_body(req, string.bytes(s.body), "") }
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return false, "${s.method} ${s.path}: ${err}", false }
+    status = client.response_status(r)
+    body = client.response_body(r)
+    client.response_free(r)
+    ok = status == s.status
+    if s.has_status_matcher {
+        bool m = call(s.status_matcher, status)
+        ok = m
+    }
+    if !ok { return false, "${s.method} ${s.path}: status ${status}", false }
+    if s.has_response_matcher {
+        bool m2 = call(s.response_matcher, body)
+        if !m2 { return false, "${s.method} ${s.path}: the response did not match", false }
+    }
+    return true, "", false
+}
+
+fn probe_health(s: *Strategy, c: *docker.Container) -> (bool, string, bool) {
+    st, err = docker.state_of(c)
+    if err != "" { return false, err, false }
+    if !st.running {
+        if st.oom_killed { return false, "container crashed with out-of-memory (OOMKilled)", true }
+        if st.status == "exited" { return false, "container exited with code ${st.exit_code}", true }
+    }
+    if st.health == "healthy" { return true, "", false }
+    if st.health == "" { return false, "the container has no health check", false }
+    return false, "health is ${st.health}", false
+}
+
+fn probe_exec(s: *Strategy, c: *docker.Container) -> (bool, string, bool) {
+    cerr, fatal = check_running(c)
+    if fatal { return false, cerr, true }
+    code, out, err = docker.exec(c, s.cmd)
+    if err != "" { return false, err, false }
+    ok = code == s.exit_code
+    if s.has_exit_matcher {
+        bool m = call(s.exit_matcher, code)
+        ok = m
+    }
+    if !ok { return false, "exec ${join(s.cmd)} exited ${code}", false }
+    if s.has_response_matcher {
+        bool m2 = call(s.response_matcher, out)
+        if !m2 { return false, "exec ${join(s.cmd)}: the output did not match", false }
+    }
+    return true, "", false
+}
+
+fn probe_exit(s: *Strategy, c: *docker.Container) -> (bool, string, bool) {
+    st, err = docker.state_of(c)
+    if err != "" {
+        if docker.is_not_found(err) { return true, "", false }
+        return false, err, false
+    }
+    if !st.running && (st.status == "exited" || st.status == "dead") { return true, "", false }
+    return false, "container is ${st.status}", false
+}
+
+fn probe_file(s: *Strategy, c: *docker.Container) -> (bool, string, bool) {
+    data, err = docker.copy_file_from_container(c, s.file)
+    if err != "" {
+        cerr, fatal = check_running(c)
+        if fatal { return false, cerr, true }
+        return false, err, false
+    }
+    if s.has_file_matcher {
+        bool m = call(s.file_matcher, data)
+        if !m { return false, "file ${s.file} did not match", false }
+    }
+    return true, "", false
+}
+
+fn is_loopback(h: string) -> bool {
+    return h == "localhost" || h == "127.0.0.1" || h == "::1"
+}
+
+fn pem_has(text: string, what: string) -> bool {
+    return string.contains(text, "-----BEGIN ") == 1 && string.contains(text, what) == 1
+}
+
+// Go's TLSStrategy: every file there and PEM; then the CA bundle is written
+// to a host file for with_tls_config_from.
+fn probe_tls(s: *Strategy, c: *docker.Container) -> (bool, string, bool) {
+    bundle = ""
+    for f in s.root_files {
+        data, err = docker.copy_file_from_container(c, f)
+        if err != "" {
+            cerr, fatal = check_running(c)
+            if fatal { return false, cerr, true }
+            return false, "read CA cert file \"${f}\": ${err}", false
+        }
+        if !pem_has(data, "CERTIFICATE-----") { return false, "invalid CA cert file \"${f}\"", false }
+        bundle = "${bundle}${data}"
+        if string.ends_with(bundle, "\n") == 0 { bundle = "${bundle}\n" }
+    }
+    cert = ""
+    key = ""
+    if string.length(s.cert_file) > 0 {
+        cd, cerr2 = docker.copy_file_from_container(c, s.cert_file)
+        if cerr2 != "" { return false, "read certificate cert \"${s.cert_file}\": ${cerr2}", false }
+        if !pem_has(cd, "CERTIFICATE-----") { return false, "certificate \"${s.cert_file}\" is not PEM", false }
+        kd, kerr = docker.copy_file_from_container(c, s.key_file)
+        if kerr != "" { return false, "read certificate key \"${s.key_file}\": ${kerr}", false }
+        if !pem_has(kd, "PRIVATE KEY-----") { return false, "key \"${s.key_file}\" is not a PEM private key", false }
+        cert = cd
+        key = kd
+    }
+    if string.length(bundle) > 0 {
+        u, _ = uuid.v4()
+        path = "${os.temp_dir()}/tcae-ca-${u}.pem"
+        werr = fs.write(path, bundle)
+        if werr != "" { return false, "write the CA bundle to ${path}: ${werr}", true }
+        s.ca_path = path
+    }
+    s.ca_pem = bundle
+    s.cert_pem = cert
+    s.key_pem = key
+    return true, "", false
+}
+
+// Go's waitForSQL.WaitUntilReady, one poll: the container still running,
+// the port mapped, then sql.open + exec of the query; any failure is "not
+// yet" (an unknown driver is fatal: it cannot get better).
+fn probe_sql(s: *Strategy, c: *docker.Container) -> (bool, string, bool) {
+    cerr, fatal = check_running(c)
+    if fatal { return false, cerr, true }
+    if string.length(cerr) > 0 { return false, cerr, false }
+    p = s.port
+    if string.length(p) == 0 { p = docker.lowest_exposed_port(c) }
+    mp, merr = docker.mapped_port(c, p)
+    if merr != "" { return false, merr, false }
+    h, herr = docker.host(c)
+    if herr != "" { return false, herr, false }
+    string dsn = call(s.sql_url, h, mp)
+    db, oerr = sql.open(s.sql_driver, dsn)
+    if oerr != "" { return false, "sql.Open: ${oerr}", true }
+    _, eerr = sql.exec(db, s.sql_query, [])
+    sql.close(db)
+    if eerr != "" { return false, eerr, false }
+    return true, "", false
+}
+
+fn probe_func(s: *Strategy, c: *docker.Container) -> (bool, string, bool) {
+    string r = call(s.func, c)
+    if string.length(r) == 0 { return true, "", false }
+    return false, r, false
+}
+
+fn probe(s: *Strategy, c: *docker.Container) -> (bool, string, bool) {
+    k = s.kind
+    if k == KIND_LOG { return probe_log(s, c) }
+    if k == KIND_PORT { return probe_port(s, c) }
+    if k == KIND_HTTP { return probe_http(s, c) }
+    if k == KIND_HEALTH { return probe_health(s, c) }
+    if k == KIND_EXEC { return probe_exec(s, c) }
+    if k == KIND_EXIT { return probe_exit(s, c) }
+    if k == KIND_FILE { return probe_file(s, c) }
+    if k == KIND_FUNC { return probe_func(s, c) }
+    if k == KIND_TLS { return probe_tls(s, c) }
+    if k == KIND_SQL { return probe_sql(s, c) }
+    if k == KIND_ANY { return probe_any_once(s, c) }
+    if k == KIND_ALL { return probe_all_once(s, c) }
+    return true, "", false
+}
+
+// for_any nested inside for_any: one round over the children.
+fn probe_any_once(s: *Strategy, c: *docker.Container) -> (bool, string, bool) {
+    errs = ""
+    nfatal = 0
+    for chp in s.children {
+        ch = chp as *Strategy
+        ready, err, fatal = probe(ch, c)
+        if ready { return true, "", false }
+        if fatal { nfatal = nfatal + 1 }
+        if string.length(errs) > 0 { errs = "${errs}; " }
+        errs = "${errs}${describe(ch)}: ${err}"
+    }
+    if nfatal == s.children.len && nfatal > 0 { return false, errs, true }
+    return false, errs, false
+}
+
+// for_all inside for_any: ready when every child is ready on one round.
+fn probe_all_once(s: *Strategy, c: *docker.Container) -> (bool, string, bool) {
+    for chp in s.children {
+        ch = chp as *Strategy
+        ready, err, fatal = probe(ch, c)
+        if !ready { return false, "${describe(ch)}: ${err}", fatal }
+    }
+    return true, "", false
+}
+
+fn now_ms() -> long { return os.now_monotonic_ms() }
+
+// Poll one strategy until it is ready, a probe says fatal, or the deadline.
+fn drive(s: *Strategy, c: *docker.Container, deadline: long) -> string {
+    last = ""
+    while true {
+        ready, err, fatal = probe(s, c)
+        if ready { return "" }
+        if fatal { return "wait for ${describe(s)}: ${err}" }
+        last = err
+        if now_ms() >= deadline { break }
+        rest = deadline - now_ms()
+        p = poll_ms(s)
+        if p > rest { p = rest }
+        if p > 0 { sleep(p as int) }
+    }
+    return "wait for ${describe(s)}: timed out after ${timeout_ms(s)}ms: ${last}"
+}
+
+fn run(s: *Strategy, c: *docker.Container, outer: long, inherited_ms: long) -> string {
+    if s == null { return "" }
+    start = now_ms()
+    t = s.timeout_ms
+    if t == 0 { t = inherited_ms }
+    if t == 0 { t = DEFAULT_TIMEOUT_MS }
+    deadline = start + t
+    if outer > 0 && outer < deadline { deadline = outer }
+    if s.kind == KIND_ALL {
+        if s.children.len == 0 { return "no wait strategy supplied" }
+        overall = outer
+        if s.deadline_ms > 0 {
+            d = start + s.deadline_ms
+            if overall == 0 || d < overall { overall = d }
+        }
+        for chp in s.children {
+            err = run(chp as *Strategy, c, overall, s.timeout_ms)
+            if err != "" { return err }
+        }
+        return ""
+    }
+    if s.kind == KIND_ANY {
+        if s.children.len == 0 { return "no wait strategy supplied" }
+        if s.deadline_ms > 0 {
+            d = start + s.deadline_ms
+            if d < deadline { deadline = d }
+        }
+        return drive(s, c, deadline)
+    }
+    return drive(s, c, deadline)
+}
+
+// Wait until the strategy is satisfied by the running container (Go's
+// WaitUntilReady). "" when ready, else why not.
+until_ready(s: *Strategy, c: *docker.Container) -> string {
+    return run(s, c, 0, 0)
+}

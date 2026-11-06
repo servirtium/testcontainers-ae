@@ -1,0 +1,100 @@
+// Ported from testcontainers-go modules/meilisearch/meilisearch_test.go
+//
+// A real Meilisearch: GET /health, an authenticated call with the master
+// key (and a refusal without it), and a dump import read back as a document.
+
+import std.spec
+import std.string
+import std.encoding
+import std.http.client
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.meilisearch
+
+const IMAGE = "getmeili/meilisearch:v1.10.3"
+
+// One HTTP request: (status, body, error). hdrs are "Name: value" lines.
+fn http_do(method: string, url: string, hdrs: string[], body: string) -> (int, string, string) {
+    req = client.request(method, url)
+    client.set_timeout(req, 15s)
+    for h in hdrs {
+        colon = string.index_of(h, ":")
+        client.set_header(req, string.substring(h, 0, colon), string.trim(string.substring(h, colon + 1, string.length(h))))
+    }
+    if string.length(body) > 0 { client.set_body(req, string.bytes(body), "application/json") }
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    st = client.response_status(r)
+    b = client.response_body(r)
+    client.response_free(r)
+    return st, b, ""
+}
+
+fn basic(user: string, pw: string) -> string {
+    return "Authorization: Basic ${encoding.base64_encode_padded(string.bytes("${user}:${pw}"))}"
+}
+fn bearer(key: string) -> string { return "Authorization: Bearer ${key}" }
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/meilisearch") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("is healthy and checks the master key (TestMeilisearch)") callback {
+            m, err = meilisearch.run(IMAGE)
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "meilisearch starts")
+            if err != "" { return }
+            addr, aerr = meilisearch.address(m)
+            spec.assert_ok(aerr, "address")
+            port, _ = tc.mapped_port(m.container, meilisearch.PORT)
+            spec.assert_str_eq(addr, "http://localhost:${port}", "address shape")
+            spec.assert_str_eq(meilisearch.master_key_of(m), meilisearch.DEFAULT_MASTER_KEY, "the default master key")
+            st, body, herr = http_do("GET", "${addr}/health", [], "")
+            spec.assert_ok(herr, "GET /health")
+            spec.assert_eq(st, 200, "health status")
+            spec.assert_contains(body, "available", "health body: ${body}")
+            // protected route: refused without the key, answered with it
+            ust, _ub, uerr = http_do("GET", "${addr}/indexes", [], "")
+            spec.assert_ok(uerr, "GET /indexes without a key")
+            spec.assert_eq(ust, 401, "no key is refused")
+            ast, abody, aerr2 = http_do("GET", "${addr}/indexes", [bearer(meilisearch.master_key_of(m))], "")
+            spec.assert_ok(aerr2, "GET /indexes with the master key")
+            spec.assert_eq(ast, 200, "the master key is accepted: ${abody}")
+            spec.assert_contains(abody, "\"results\"", "an index listing")
+        }
+
+        spec.it("imports a dump with a custom master key (TestMeilisearch_WithDataDump)") callback {
+            m, err = meilisearch.run(IMAGE) {
+                dump_import("modules/meilisearch/testdata/movies.dump")
+                master_key("my-master-key")
+            }
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "meilisearch starts")
+            if err != "" { return }
+            spec.assert_str_eq(meilisearch.master_key_of(m), "my-master-key", "the master key the block set")
+            addr, _ = meilisearch.address(m)
+            st, _b, herr = http_do("GET", addr, [], "")
+            spec.assert_ok(herr, "GET /")
+            spec.assert_eq(st, 200, "root status")
+            // the dump is imported asynchronously after startup: poll briefly
+            dst = 0
+            dbody = ""
+            tries = 0
+            while tries < 60 {
+                dst, dbody, _e = http_do("GET", "${addr}/indexes/movies/documents/1212", [bearer("my-master-key")], "")
+                if dst == 200 { break }
+                tries = tries + 1
+                sleep(500)
+            }
+            spec.assert_eq(dst, 200, "the imported document: ${dbody}")
+            spec.assert_contains(dbody, "\"movie_id\":1212", "movie 1212")
+            spec.assert_contains(dbody, "American Ninja", "its overview came from the dump")
+        }
+    }
+    return spec.run_summary(fw)
+}

@@ -1,0 +1,76 @@
+// Ported from testcontainers-go modules/vault/vault.go
+//
+// modules.vault: a HashiCorp Vault server in dev mode (the image's default
+// command), with the root token you choose.
+//
+//     import modules.vault
+//
+//     c, err = vault.run("hashicorp/vault:1.13.0") {
+//         token("root-token")
+//         init_command(["secrets enable transit", "write -f transit/keys/my-key"])
+//         init_command(["kv put secret/test1 foo1=bar1"])
+//     }
+//     defer tc.terminate(c)
+//     addr, _ = vault.http_host_address(c)       // "http://localhost:32771"
+//
+// init_command is Go's WithInitCommand: the `vault <args>` commands, joined
+// with &&, are run in the container by an extra wait strategy, so `run`
+// returns once they have succeeded. Each call adds one more such wait.
+//
+// Not ported: Go's RunContainer (deprecated) and the vault-client-go client
+// used in its examples (the test calls the HTTP API and the CLI instead).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, http_host_address, token, init_command,
+    PORT, DEFAULT_IMAGE,
+    vault_request_new, vault_request_free
+)
+
+const PORT = "8200/tcp"
+const DEFAULT_IMAGE = "hashicorp/vault:1.13.0"
+
+vault_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.cap_add(r, "CAP_IPC_LOCK")
+    tc.wait_for(r, wait.for_http("/v1/sys/health") { with_port("8200") })
+    tc.env(r, "VAULT_ADDR", "http://0.0.0.0:8200")
+    return r
+}
+
+vault_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithToken: the dev server's root token, also VAULT_TOKEN for the CLI.
+token(_ctx: ptr, root_token: string) {
+    tc.env(_ctx, "VAULT_DEV_ROOT_TOKEN_ID", root_token)
+    tc.env(_ctx, "VAULT_TOKEN", root_token)
+}
+
+// Go's WithInitCommand: each string is the arguments of a `vault` command
+// ("kv put secret/a b=c"); they run in order, as one `sh -c "vault x && vault y"`.
+init_command(_ctx: ptr, commands: string[]) {
+    line = ""
+    for cmd in commands {
+        if string.length(line) > 0 { line = "${line} && " }
+        line = "${line}vault ${cmd}"
+    }
+    tc.additional_wait(_ctx, wait.for_exec(["/bin/sh", "-c", line]))
+}
+
+builder run(image: string) with vault_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = vault_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run vault: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" (Go's HttpHostAddress).
+http_host_address(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "http")
+}

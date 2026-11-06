@@ -1,0 +1,59 @@
+// Ported from testcontainers-go modules/trino/trino.go
+//
+// modules.trino: a Trino coordinator (HTTP on 8080).
+//
+//     import modules.trino
+//
+//     c, err = trino.run("trinodb/trino:435")
+//     defer tc.terminate(c)
+//     url, _ = trino.connection_string(c)    // "http://localhost:32771"
+//
+// Ready when GET /v1/info answers with "starting": false (2 minute startup
+// timeout, as in Go). Nothing is left out.
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+import std.json
+
+exports(run, connection_string, PORT, DEFAULT_IMAGE, trino_request_new, trino_request_free)
+
+const PORT = "8080/tcp"
+const DEFAULT_IMAGE = "trinodb/trino:435"
+
+// Go's isTrinoReady: the JSON body has starting == false.
+fn is_ready(body: string) -> bool {
+    doc, perr = json.parse(body)
+    if perr != "" { return false }
+    v, _ = json.object_get(doc, "starting")
+    starting = false
+    if v != null { starting = json.json_get_bool(v) == 1 }
+    json.free(doc)
+    return !starting
+}
+
+trino_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_http("/v1/info") {
+        with_port(PORT)
+        with_response_matcher(|body: string| -> is_ready(body))
+        with_startup_timeout(120s)
+    })
+    return r
+}
+
+trino_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with trino_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = trino_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run trino: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" of the coordinator (Go's ConnectionString).
+connection_string(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "http")
+}

@@ -1,0 +1,193 @@
+// Ported from testcontainers-go modules/kafka/kafka.go, modules/kafka/options.go
+//
+// modules.kafka: an Apache Kafka broker in KRaft mode (Confluent's
+// confluent-local image, >= 7.4.0), with the advertised-listener dance Go
+// does: the container starts a shell that waits for a starter script, and
+// once the mapped port is known a post-start hook writes the script, with
+// the real host:port in KAFKA_ADVERTISED_LISTENERS, into the container; the
+// script then starts Kafka.
+//
+//     import modules.kafka
+//
+//     k, err = kafka.run("confluentinc/confluent-local:7.5.0") {
+//         cluster_id("kraftCluster")
+//     }
+//     defer tc.terminate(k.container)
+//     brokers, _ = kafka.brokers(k)        // ["localhost:32771"]
+//
+// `run` returns a *KafkaContainer (the container and the cluster id read back
+// from its environment). The quorum voters default to
+// 1@<first network alias, or localhost>:9094, decided after the caller's block.
+//
+// Not ported: WithTLS and brokers_tls / tls_config (they need a CA, a server
+// certificate and a PKCS12 keystore generated at run time, which Aether's
+// std cannot build yet; Go uses mdelapenya/tlscert and a Go TLS config), the
+// Kafka-client helpers of Go's tests (franz-go, sarama), the deprecated
+// RunContainer.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+import std.json
+
+exports(
+    KafkaContainer, run, brokers, cluster_id,
+    PUBLIC_PORT, DEFAULT_IMAGE, STARTER_SCRIPT,
+    kafka_request_new, kafka_request_free
+)
+
+const PUBLIC_PORT = "9093/tcp"
+const DEFAULT_IMAGE = "confluentinc/confluent-local:7.5.0"
+const STARTER_SCRIPT = "/usr/sbin/testcontainers_start.sh"
+
+struct KafkaContainer {
+    container: *docker.Container
+    cluster_id: string
+}
+
+// Go's starterScriptContent; @ENDPOINT@ and @HOSTNAME@ are its two %s.
+const STARTER_SCRIPT_CONTENT = <<SH
+#!/bin/bash
+source /etc/confluent/docker/bash-config
+export KAFKA_ADVERTISED_LISTENERS=@ENDPOINT@,BROKER://@HOSTNAME@:9092
+echo Starting Kafka KRaft mode
+sed -i '/KAFKA_ZOOKEEPER_CONNECT/d' /etc/confluent/docker/configure
+echo 'kafka-storage format --ignore-formatted -t "$(kafka-storage random-uuid)" -c /etc/kafka/kafka.properties' >> /etc/confluent/docker/configure
+echo '' > /etc/confluent/docker/ensure
+/etc/confluent/docker/configure
+/etc/confluent/docker/launch
+SH
+
+// The post-start hook: wait for the mapped port, write the starter script
+// with the advertised address, then wait for Kafka to be running.
+fn start_kafka(c: *docker.Container) -> string {
+    werr = wait.until_ready(wait.for_mapped_port(PUBLIC_PORT), c)
+    if werr != "" { return "copy starter script: wait for mapped port: ${werr}" }
+    endpoint, eerr = tc.endpoint(c, PUBLIC_PORT, "PLAINTEXT")
+    if eerr != "" { return "copy starter script: port endpoint: ${eerr}" }
+    doc, ierr = tc.inspect(c)
+    if ierr != "" { return "copy starter script: inspect: ${ierr}" }
+    cfg, _ = json.object_get(doc, "Config")
+    hv, _ = json.object_get(cfg, "Hostname")
+    hostname, _ = json.get_string(hv)
+    json.free(doc)
+    script = string.replace_all(STARTER_SCRIPT_CONTENT, "@ENDPOINT@", endpoint)
+    script = string.replace_all(script, "@HOSTNAME@", hostname)
+    cerr = tc.copy_to_container(c, script, STARTER_SCRIPT, 493)
+    if cerr != "" { return "copy starter script: copy to container: ${cerr}" }
+    rerr = wait.until_ready(wait.for_log(".*Transitioning from RECOVERY to RUNNING.*") { as_regexp(); with_startup_timeout(180s) }, c)
+    if rerr != "" { return rerr }
+    return ""
+}
+
+// Go's moduleOpts: the public port, the KRaft environment, the `sh`
+// entrypoint waiting for the starter script, and the hook above.
+kafka_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PUBLIC_PORT)
+    tc.env(r, "KAFKA_LISTENERS", "PLAINTEXT://0.0.0.0:9093,BROKER://0.0.0.0:9092,CONTROLLER://0.0.0.0:9094")
+    tc.env(r, "KAFKA_REST_BOOTSTRAP_SERVERS", "PLAINTEXT://0.0.0.0:9093,BROKER://0.0.0.0:9092,CONTROLLER://0.0.0.0:9094")
+    tc.env(r, "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP", "BROKER:PLAINTEXT,PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT")
+    tc.env(r, "KAFKA_INTER_BROKER_LISTENER_NAME", "BROKER")
+    tc.env(r, "KAFKA_BROKER_ID", "1")
+    tc.env(r, "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
+    tc.env(r, "KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS", "1")
+    tc.env(r, "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+    tc.env(r, "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+    tc.env(r, "KAFKA_LOG_FLUSH_INTERVAL_MESSAGES", "9223372036854775807")
+    tc.env(r, "KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
+    tc.env(r, "KAFKA_NODE_ID", "1")
+    tc.env(r, "KAFKA_PROCESS_ROLES", "broker,controller")
+    tc.env(r, "KAFKA_CONTROLLER_LISTENER_NAMES", "CONTROLLER")
+    tc.entrypoint(r, ["sh"])
+    tc.cmd(r, ["-c", "while [ ! -f ${STARTER_SCRIPT} ]; do sleep 0.1; done; bash ${STARTER_SCRIPT}"])
+    tc.on_post_start(r, |c: *docker.Container| { return start_kafka(c) })
+    return r
+}
+
+kafka_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithClusterID: CLUSTER_ID, used to format the KRaft storage.
+cluster_id(_ctx: ptr, id: string) { tc.env(_ctx, "CLUSTER_ID", id) }
+
+// Go's validateKRaftVersion: confluent-local tags before 7.4.0 have no KRaft.
+// Other images are not checked.
+fn validate_kraft_version(fq_name: string) -> string {
+    if string.length(fq_name) == 0 { return "image cannot be empty" }
+    idx = -1
+    i = 0
+    while i < string.length(fq_name) {
+        if string.char_at(fq_name, i) == 58 { idx = i }
+        i = i + 1
+    }
+    if idx == -1 || idx == string.length(fq_name) - 1 { return "" }
+    image = string.substring(fq_name, 0, idx)
+    version = string.substring(fq_name, idx + 1, string.length(fq_name))
+    if string.to_lower(image) != "confluentinc/confluent-local" { return "" }
+    if string.ends_with(version, ".amd64") == 1 || string.ends_with(version, ".arm64") == 1 {
+        return "invalid image tag \"${version}\": architecture suffixes like .arm64 or .amd64 are not valid semver; please use a multi-architecture image instead"
+    }
+    // major.minor.patch, compared with 7.4.0
+    v = version
+    if string.starts_with(v, "v") == 1 { v = string.substring(v, 1, string.length(v)) }
+    parts = string.split(v, ".")
+    major = 0
+    minor = 0
+    if string.array_size(parts) > 0 { major, _ = string.to_int(string.array_get(parts, 0)) }
+    if string.array_size(parts) > 1 { minor, _ = string.to_int(string.array_get(parts, 1)) }
+    if major < 7 || (major == 7 && minor < 4) {
+        return "version=${version}. KRaft mode is only available since version 7.4.0"
+    }
+    return ""
+}
+
+// Run a Kafka container (Go's kafka.Run). The returned *KafkaContainer is
+// non-null whenever a container was created, with the error.
+builder run(image: string) with kafka_request_new -> (*KafkaContainer, string) {
+    r = _builder
+    if r == null { r = kafka_request_new() }
+    verr = validate_kraft_version(image)
+    if verr != "" {
+        kafka_request_free(r)
+        return null, verr
+    }
+    // the quorum voters, after all the options: the first network alias, or localhost
+    if string.length(tc.req_env(r, "KAFKA_CONTROLLER_QUORUM_VOTERS")) == 0 {
+        host = tc.req_first_network_alias(r)
+        if string.length(host) == 0 { host = "localhost" }
+        tc.env(r, "KAFKA_CONTROLLER_QUORUM_VOTERS", "1@${host}:9094")
+    }
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run kafka: ${err}" }
+    k = heap.new(KafkaContainer)
+    k.container = c
+    k.cluster_id = ""
+    if err != "" { return k, "run kafka: ${err}" }
+    doc, ierr = tc.inspect(c)
+    if ierr != "" { return k, "inspect kafka: ${ierr}" }
+    cfg, _ = json.object_get(doc, "Config")
+    envv, _ = json.object_get(cfg, "Env")
+    n = json.json_array_size(envv)
+    i = 0
+    while i < n {
+        ev, _ = json.array_get(envv, i)
+        e, _ = json.get_string(ev)
+        if string.starts_with(e, "CLUSTER_ID=") == 1 {
+            k.cluster_id = string.substring(e, 11, string.length(e))
+            i = n
+        }
+        i = i + 1
+    }
+    json.free(doc)
+    return k, ""
+}
+
+// The broker address(es): one entry, "host:port" of the public port (Go's Brokers).
+brokers(k: *KafkaContainer) -> (string[], string) {
+    string[] out = []
+    ep, err = tc.endpoint(k.container, PUBLIC_PORT, "")
+    if err != "" { return out, err }
+    out.push(ep)
+    return out, ""
+}

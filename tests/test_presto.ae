@@ -1,0 +1,57 @@
+// Ported from testcontainers-go modules/presto/presto_test.go
+//
+// A real Presto: GET /v1/info at connection_string says it has started, and
+// /v1/cluster reports an active worker.
+
+import std.spec
+import std.string
+import std.http.client
+import std.tcp
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.presto
+
+const IMAGE = "prestodb/presto:0.286"
+
+// One HTTP request: (status, body, error).
+fn http_do(method: string, url: string, body: string) -> (int, string, string) {
+    req = client.request(method, url)
+    client.set_timeout(req, 15s)
+    if string.length(body) > 0 { client.set_body(req, string.bytes(body), "application/json") }
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    st = client.response_status(r)
+    b = client.response_body(r)
+    client.response_free(r)
+    return st, b, ""
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/presto") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("serves its info and cluster (TestPresto/ConnectionString)") callback {
+            c, err = presto.run(IMAGE)
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "presto starts")
+            if err != "" { return }
+            url, uerr = presto.connection_string(c)
+            spec.assert_ok(uerr, "connection string")
+            spec.assert_true(string.starts_with(url, "http://") == 1, "an http:// URL: ${url}")
+            st, body, herr = http_do("GET", "${url}/v1/info", "")
+            spec.assert_ok(herr, "GET /v1/info")
+            spec.assert_eq(st, 200, "info status")
+            spec.assert_contains(body, "\"starting\":false", "the server finished starting")
+            cs, cb, cerr = http_do("GET", "${url}/v1/cluster", "")
+            spec.assert_ok(cerr, "GET /v1/cluster")
+            spec.assert_eq(cs, 200, "cluster status")
+            spec.assert_contains(cb, "activeWorkers", "cluster stats")
+        }
+    }
+    return spec.run_summary(fw)
+}

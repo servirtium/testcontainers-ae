@@ -1,0 +1,77 @@
+// Ported from testcontainers-go modules/questdb/questdb.go
+//
+// modules.questdb: a QuestDB container (web console + REST on 9000, the
+// PostgreSQL wire protocol on 8812, InfluxDB line protocol on 9009).
+//
+//     import modules.questdb
+//
+//     c, err = questdb.run("questdb/questdb:7.4.2")
+//     defer tc.terminate(c)
+//     http, _ = questdb.http_endpoint(c)       // "http://localhost:32771"
+//     pg, _ = questdb.pg_endpoint(c)           // "postgres://admin:quest@localhost:32772/qdb"
+//     ilp, _ = questdb.influxdb_endpoint(c)    // "localhost:32773"
+//
+// The readiness probe accepts 200 (7.x, as Go) or 301 (9.x redirects / to the console page).
+//
+// Not ported: the pgx / influxdb client code of Go's examples.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, http_endpoint, pg_endpoint, influxdb_endpoint,
+    HTTP_PORT, ILP_PORT, PG_PORT, DEFAULT_IMAGE,
+    questdb_request_new, questdb_request_free
+)
+
+const HTTP_PORT = "9000/tcp"
+const ILP_PORT = "9009/tcp"
+const PG_PORT = "8812/tcp"
+const DEFAULT_IMAGE = "questdb/questdb:7.4.2"
+const ADMIN_USER = "admin"
+const ADMIN_PASSWORD = "quest"
+const DATABASE = "qdb"
+
+questdb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, ILP_PORT)
+    tc.expose(r, PG_PORT)
+    tc.wait_for(r, wait.for_http("/") { with_port(HTTP_PORT); with_status_matcher(|status: int| -> status == 200 || status == 301) })
+    return r
+}
+
+questdb_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with questdb_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = questdb_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run questdb: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" of the web console / REST API.
+http_endpoint(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, HTTP_PORT, "http")
+}
+
+// "postgres://admin:quest@host:port/qdb" (QuestDB's default credentials).
+pg_endpoint(c: *docker.Container) -> (string, string) {
+    host, herr = tc.host(c)
+    if herr != "" { return "", "pg endpoint host: ${herr}" }
+    port, perr = tc.mapped_port(c, PG_PORT)
+    if perr != "" { return "", "pg endpoint port: ${perr}" }
+    return "postgres://${ADMIN_USER}:${ADMIN_PASSWORD}@${host}:${port}/${DATABASE}", ""
+}
+
+// "host:port" of the InfluxDB line protocol listener.
+influxdb_endpoint(c: *docker.Container) -> (string, string) {
+    host, herr = tc.host(c)
+    if herr != "" { return "", "influxdb endpoint host: ${herr}" }
+    port, perr = tc.mapped_port(c, ILP_PORT)
+    if perr != "" { return "", "influxdb endpoint port: ${perr}" }
+    return "${host}:${port}", ""
+}

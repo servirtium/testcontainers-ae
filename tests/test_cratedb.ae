@@ -1,0 +1,76 @@
+// Ported from testcontainers-go modules/cratedb/cratedb_test.go
+//
+// A real CrateDB: the HTTP endpoint answers / and runs SQL over /_sql, and
+// pg_connection_string() names the mapped PostgreSQL-wire port with the
+// extra arguments joined by &.
+
+import std.spec
+import std.string
+import std.encoding
+import std.http.client
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.cratedb
+
+const IMAGE = "crate:5.7"
+
+// One HTTP request: (status, body, error). hdrs are "Name: value" lines.
+fn http_do(method: string, url: string, hdrs: string[], body: string) -> (int, string, string) {
+    req = client.request(method, url)
+    client.set_timeout(req, 30s)
+    for h in hdrs {
+        colon = string.index_of(h, ":")
+        client.set_header(req, string.substring(h, 0, colon), string.trim(string.substring(h, colon + 1, string.length(h))))
+    }
+    if string.length(body) > 0 { client.set_body(req, string.bytes(body), "application/json") }
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    st = client.response_status(r)
+    b = client.response_body(r)
+    client.response_free(r)
+    return st, b, ""
+}
+
+fn basic(user: string, pw: string) -> string {
+    return "Authorization: Basic ${encoding.base64_encode_padded(string.bytes("${user}:${pw}"))}"
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/cratedb") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("runs SQL over HTTP (TestCrateDB)") callback {
+            c, err = cratedb.run(IMAGE) { heap_size("256m") }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "cratedb starts")
+            if err == "" {
+                url, uerr = cratedb.http_endpoint(c)
+                spec.assert_ok(uerr, "http endpoint")
+                spec.assert_true(string.starts_with(url, "http://localhost:") == 1, "an http URL: ${url}")
+                rs, _rb, rerr = http_do("GET", "${url}/", [], "")
+                spec.assert_ok(rerr, "GET /")
+                spec.assert_eq(rs, 200, "root")
+                qs, qb, qerr = http_do("POST", "${url}/_sql", [], "{\"stmt\":\"SELECT 1 + 1 AS two\"}")
+                spec.assert_ok(qerr, "POST /_sql")
+                spec.assert_eq(qs, 200, "sql")
+                spec.assert_contains(qb, "\"rows\":[[2]]", "the query result: ${qb}")
+                code, out, eerr = tc.exec(c, ["sh", "-c", "echo $CRATE_HEAP_SIZE"])
+                spec.assert_ok(eerr, "exec")
+                spec.assert_eq(code, 0, "exec exits 0")
+                spec.assert_str_eq(string.trim(out), "256m", "heap_size reached the container")
+                dsn, derr = cratedb.pg_connection_string(c, ["sslmode=disable", "application_name=tcae"])
+                spec.assert_ok(derr, "pg connection string")
+                spec.assert_true(string.starts_with(dsn, "postgres://crate@localhost:") == 1, "the pg URL: ${dsn}")
+                spec.assert_true(string.ends_with(dsn, "/doc?sslmode=disable&application_name=tcae") == 1, "args joined with &")
+                plain, _ = cratedb.pg_connection_string(c, [])
+                spec.assert_true(string.ends_with(plain, "/doc") == 1, "no args, no ?")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

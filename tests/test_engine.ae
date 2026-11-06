@@ -1,0 +1,116 @@
+// Ported from testcontainers-go internal/core/docker_host_test.go, internal/core/docker_rootless_test.go, docker_client_test.go, provider_test.go
+//
+// Finding the engine and talking to it: DOCKER_HOST, the version
+// negotiation, Podman detection, the socket a container sees, errors for
+// hosts that are not there or not supported.
+
+import std.spec
+import std.string
+import std.os
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "hosts that do not work") {
+        spec.it("reports a socket that is not there") callback {
+            _, err = docker.new_client("unix:///tmp/tcae-no-such.sock")
+            spec.assert_err_contains(err, "tcae-no-such.sock", "the error names the socket")
+        }
+        spec.it("refuses TLS, and an unknown scheme") callback {
+            os.setenv("DOCKER_TLS_VERIFY", "1")
+            docker.config_reset()
+            _, err = docker.new_client("tcp://127.0.0.1:2376")
+            spec.assert_err_contains(err, "TLS", "TLS is out of scope and says so")
+            os.unsetenv("DOCKER_TLS_VERIFY")
+            docker.config_reset()
+            _, err2 = docker.new_client("npipe:////./pipe/docker_engine")
+            spec.assert_err_contains(err2, "unsupported scheme", "npipe")
+        }
+        spec.it("tries the next candidate when DOCKER_HOST is dead") callback {
+            old = os.os_getenv("DOCKER_HOST")
+            os.setenv("DOCKER_HOST", "unix:///tmp/tcae-dead.sock")
+            docker.config_reset()
+            cl, err = docker.client()
+            if err == "" {
+                spec.assert_false(string.contains(cl.host, "tcae-dead") == 1, "a live engine further down the list: ${cl.host}")
+            } else {
+                spec.assert_err_contains(err, "tcae-dead.sock", "or an error naming what was tried")
+            }
+            if old == null || string.length(old) == 0 { os.unsetenv("DOCKER_HOST") } else { os.setenv("DOCKER_HOST", old) }
+            docker.config_reset()
+        }
+    }
+
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "the engine") {
+        spec.it("is found, pinged, and its API version negotiated") callback {
+            cl, err = docker.client()
+            spec.assert_ok(err, "a client")
+            spec.assert_true(string.length(cl.api) >= 4, "an API version: ${cl.api}")
+            spec.assert_true(string.version_compare(cl.api, "1.44") <= 0, "no newer than ours")
+            spec.assert_true(string.length(cl.server_version) > 0, "the server's version")
+            st, body, aerr = docker.api(cl, "GET", "/_ping", "")
+            spec.assert_ok(aerr, "ping")
+            spec.assert_eq(st, 200, "status")
+            spec.assert_str_eq(body, "OK", "body")
+        }
+
+        spec.it("an explicit DOCKER_HOST is used as given") callback {
+            cl, _ = docker.client()
+            if string.length(cl.unix_path) == 0 { return }
+            again, err = docker.new_client("unix://${cl.unix_path}")
+            spec.assert_ok(err, "a client for the same socket")
+            spec.assert_str_eq(again.server_version, cl.server_version, "the same engine")
+            bare, berr = docker.new_client(cl.unix_path)
+            spec.assert_ok(berr, "a bare path is a socket too")
+            spec.assert_str_eq(bare.host, "unix://${cl.unix_path}", "normalized")
+        }
+
+        spec.it("knows Podman, and the socket its containers see") callback {
+            cl, _ = docker.client()
+            sock = docker.engine_socket_for_mounts(cl)
+            spec.assert_true(string.starts_with(sock, "/") == 1, "an absolute path: ${sock}")
+            if docker.is_podman(cl) {
+                spec.assert_str_eq(docker.default_bridge_network(cl), "podman", "Podman's default network")
+                spec.assert_contains(sock, "podman.sock", "Podman's own socket")
+            } else {
+                spec.assert_str_eq(docker.default_bridge_network(cl), "bridge", "Docker's default network")
+            }
+            os.setenv("TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE", "/custom/docker.sock")
+            docker.config_reset()
+            cl2, _ = docker.client()
+            spec.assert_str_eq(docker.engine_socket_for_mounts(cl2), "/custom/docker.sock", "the override wins")
+            os.unsetenv("TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE")
+            docker.config_reset()
+        }
+
+        spec.it("puts published ports on localhost, unless overridden") callback {
+            cl, _ = docker.client()
+            if string.length(cl.unix_path) > 0 {
+                spec.assert_str_eq(docker.daemon_host(cl), "localhost", "a socket engine")
+            }
+            os.setenv("TESTCONTAINERS_HOST_OVERRIDE", "10.0.0.7")
+            docker.config_reset()
+            cl2, _ = docker.client()
+            spec.assert_str_eq(docker.daemon_host(cl2), "10.0.0.7", "TESTCONTAINERS_HOST_OVERRIDE")
+            os.unsetenv("TESTCONTAINERS_HOST_OVERRIDE")
+            docker.config_reset()
+        }
+
+        spec.it("maps engine errors to statuses") callback {
+            cl, _ = docker.client()
+            ghost = docker.container_new(cl, "tcae-no-such-container", "")
+            _, err = docker.inspect(ghost)
+            spec.assert_true(docker.is_not_found(err), "404: ${err}")
+            spec.assert_ok(docker.remove(ghost, true, true), "removing what is not there is fine")
+            _, _, berr = docker.api(cl, "GET", "/containers/json", "")
+            spec.assert_ok(berr, "a list call")
+        }
+    }
+
+    return spec.run_summary(fw)
+}

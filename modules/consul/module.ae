@@ -1,0 +1,68 @@
+// Ported from testcontainers-go modules/consul/consul.go
+//
+// modules.consul: a HashiCorp Consul agent (the image starts it in dev mode).
+//
+//     import modules.consul
+//
+//     c, err = consul.run("hashicorp/consul:1.15") {
+//         config_string("{\"node_name\": \"mine\"}")    // CONSUL_LOCAL_CONFIG
+//         config_file("testdata/config.json")          // /consul/config/node.json
+//     }
+//     defer tc.terminate(c)
+//     host, _ = consul.api_endpoint(c)                 // "localhost:32771" (no scheme)
+//
+// Not ported: Go's RunContainer (deprecated) and the Consul client library
+// usage in its examples (no Aether client; the test uses the HTTP API).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, api_endpoint, config_string, config_file,
+    HTTP_API_PORT, DNS_TCP_PORT, DNS_UDP_PORT, DEFAULT_BASE_IMAGE, CONFIG_FILE_PATH,
+    consul_request_new, consul_request_free
+)
+
+const HTTP_API_PORT = "8500/tcp"
+const DNS_TCP_PORT = "8600/tcp"
+const DNS_UDP_PORT = "8600/udp"
+const DEFAULT_BASE_IMAGE = "hashicorp/consul:1.15"
+const CONFIG_FILE_PATH = "/consul/config/node.json"
+
+// Defaults: the API and DNS ports, and Go's two waits (the agent's log line
+// and the API port listening), both of which must pass.
+consul_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, HTTP_API_PORT)
+    tc.expose(r, DNS_TCP_PORT)
+    tc.expose(r, DNS_UDP_PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_log("Consul agent running!"),
+        wait.for_listening_port(HTTP_API_PORT)
+    ]))
+    return r
+}
+
+consul_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithConfigString: JSON passed as CONSUL_LOCAL_CONFIG.
+config_string(_ctx: ptr, config: string) { tc.env(_ctx, "CONSUL_LOCAL_CONFIG", config) }
+
+// Go's WithConfigFile: a JSON config file copied to /consul/config/node.json
+// (mode 0755, as Go has it).
+config_file(_ctx: ptr, host_path: string) { tc.file(_ctx, host_path, CONFIG_FILE_PATH, 493) }
+
+builder run(image: string) with consul_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = consul_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run consul: ${err}" }
+    return c, ""
+}
+
+// "host:port" of the HTTP API, no scheme (Go's ApiEndpoint).
+api_endpoint(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, HTTP_API_PORT, "")
+}

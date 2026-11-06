@@ -1,0 +1,51 @@
+// Ported from testcontainers-go modules/dockermodelrunner
+// (dockermodelrunner_test.go, docker_desktop_test.go).
+//
+// STATUS: compile-checked only; BLOCKED: needs Docker Desktop. The module
+// forwards to model-runner.docker.internal, a name only Docker Desktop's
+// Model Runner provides, so the test skips on every other engine (as Go's
+// skips unless /info reports "Docker Desktop"). On Desktop it starts the
+// forwarder without a model (nothing is pulled) and lists the models.
+
+import std.spec
+import std.string
+import std.json
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.dockermodelrunner
+
+fn is_docker_desktop() -> bool {
+    cl, cerr = docker.client()
+    if cerr != "" { return false }
+    doc, err = docker.api_json(cl, "GET", "/info", "", "info")
+    if err != "" { return false }
+    v, _ = json.object_get(doc, "OperatingSystem")
+    s, _ = json.get_string(v)
+    json.free(doc)
+    return s == "Docker Desktop"
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+    if spec.skip_all_if(fw, if is_docker_desktop() { 0 } else { 1 }, "blocked: needs Docker Desktop (model-runner.docker.internal)") == 1 {
+        return spec.run_summary(fw)
+    }
+
+    spec.describe(fw, "modules/dockermodelrunner") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("reaches the Model Runner through socat") callback {
+            m, err = dockermodelrunner.run()
+            if m != null { testing.cleanup_container(dockermodelrunner.container_of(m)) }
+            spec.assert_ok(err, "model runner forwarder starts")
+            if err == "" {
+                body, lerr = dockermodelrunner.list_models(m)
+                spec.assert_ok(lerr, "GET /models")
+                spec.assert_true(string.length(body) > 0, "a models document")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

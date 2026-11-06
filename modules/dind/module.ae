@@ -1,0 +1,55 @@
+// Ported from testcontainers-go modules/dind/dind.go
+//
+// modules.dind: a Docker-in-Docker container, `dockerd` listening on plain
+// tcp port 2375. STATUS: compile-checked only (needs a privileged container
+// with the host cgroup namespace; not run on the rootless Podman machine it
+// was ported on).
+//
+//     import modules.dind
+//
+//     c, err = dind.run("docker:28.0.1-dind")
+//     defer tc.terminate(c)
+//     host, _ = dind.host(c)          // "http://localhost:32771": the inner daemon
+//
+// Not ported: Go's LoadImage (docker save of a local image through the
+// engine, copy of the tar, `docker image load`); the core has no
+// image-save call. The inner daemon can be given an image with tc.exec
+// ("docker", "pull", ...) instead.
+
+import std.json
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(run, host, PORT, DEFAULT_IMAGE, dind_request_new, dind_request_free)
+
+const PORT = "2375/tcp"
+const DEFAULT_IMAGE = "docker:28.0.1-dind"
+
+dind_request_new() -> ptr {
+    r = tc.request_new()
+    tc.cmd(r, ["dockerd", "-H", "tcp://0.0.0.0:2375", "--tls=false"])
+    tc.env(r, "DOCKER_HOST", "tcp://localhost:2375")
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_listening_port(PORT))
+    tc.privileged(r)
+    tc.host_config_modifier(r, |hc: ptr| { json.set(hc, "CgroupnsMode", json.str("host")) })
+    tc.tmpfs(r, "/run", "")
+    tc.tmpfs(r, "/var/run", "")
+    return r
+}
+
+dind_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with dind_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = dind_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run dind: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" of the inner Docker daemon (Go's Host).
+host(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "http")
+}

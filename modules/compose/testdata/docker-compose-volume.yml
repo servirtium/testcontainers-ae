@@ -1,0 +1,16 @@
+services:
+  {{ .ServiceType }}-nginx:
+    image: nginx:stable-alpine
+    volumes:
+      - type: volume
+        source: mydata
+        target: /data
+        volume:
+          nocopy: true
+    environment:
+      bar: ${bar}
+    ports:
+     - "{{ .Port_0 }}:80"
+
+volumes:
+  mydata:

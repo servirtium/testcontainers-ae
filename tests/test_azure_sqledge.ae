@@ -1,0 +1,84 @@
+// Ported from testcontainers-go modules/azure/sqledge/examples_test.go (ExampleRun)
+// and modules/azure/sqledge/sqledge_test.go (the EULA and the connection string)
+//
+// Compile-checked only. The engine-free cases check the module's request
+// defaults, the EULA refusal and the connection string format for real. The
+// case that starts Azure SQL Edge runs only with TCAE_LIVE_SQLEDGE=1 and an
+// engine. Not ported: the go-mssqldb round trip of Go's test.
+
+import std.spec
+import std.string
+import std.os
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.azure.sqledge
+
+const IMAGE = "mcr.microsoft.com/azure-sql-edge:1.0.7"
+
+// 1 when TCAE_LIVE_SQLEDGE=1 and an engine answers. The variable is read
+// first so that nothing touches an engine unless asked to.
+fn live_on() -> int {
+    if os.getenv("TCAE_LIVE_SQLEDGE") != "1" { return 0 }
+    return testing.engine_ok()
+}
+
+main() {
+    fw = spec.init()
+    live = live_on()
+
+    spec.describe(fw, "modules/azure/sqledge") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("has the module's defaults and options (engine-free)") callback {
+            r = sqledge.sqledge_request_new()
+            exposed = tc.req_exposed(r)
+            spec.assert_eq(exposed.len, 1, "one port")
+            spec.assert_str_eq(exposed[0], "1433/tcp", "the SQL port")
+            spec.assert_str_eq(tc.req_env(r, "MSSQL_SA_PASSWORD"), "Strong!Passw0rd", "default password")
+            spec.assert_false(tc.req_has_env(r, "ACCEPT_EULA"), "the EULA is not accepted by default")
+            sqledge.accept_eula(r)
+            spec.assert_str_eq(tc.req_env(r, "ACCEPT_EULA"), "Y", "accept_eula")
+            sqledge.password(r, "Other!Passw0rd1")
+            spec.assert_str_eq(tc.req_env(r, "MSSQL_SA_PASSWORD"), "Other!Passw0rd1", "password")
+            sqledge.password(r, "")
+            spec.assert_str_eq(tc.req_env(r, "MSSQL_SA_PASSWORD"), sqledge.DEFAULT_PASSWORD, "an empty password is the default")
+            sqledge.sqledge_request_free(r)
+        }
+
+        spec.it("refuses to run without the EULA (engine-free)") callback {
+            s, err = sqledge.run(IMAGE) {
+                password("Strong!Passw0rd")
+            }
+            spec.assert_null(s as ptr, "no container")
+            spec.assert_contains(err, "EULA not accepted", "the error says why")
+        }
+
+        spec.it("formats the connection string (engine-free)") callback {
+            string[] no_args = []
+            spec.assert_str_eq(sqledge.connection_string_for("Strong!Passw0rd", "localhost:1433", no_args),
+                "sqlserver://sa:Strong%21Passw0rd@localhost:1433?database=master", "password percent-encoded, database=master")
+            spec.assert_str_eq(sqledge.connection_string_for("Strong!Passw0rd", "localhost:1433", ["encrypt=false", "TrustServerCertificate=true"]),
+                "sqlserver://sa:Strong%21Passw0rd@localhost:1433?database=master&encrypt=false&TrustServerCertificate=true", "extra arguments joined with &")
+            spec.assert_str_eq(sqledge.escape_userinfo("a@b/c?d:e f$&+,;=-_.~"), "a%40b%2Fc%3Fd%3Ae%20f$&+,;=-_.~", "Go's userinfo escaping")
+        }
+
+        spec.it_when(live, "starts Azure SQL Edge (ExampleRun)", "set TCAE_LIVE_SQLEDGE=1 and have an engine") callback {
+            s, err = sqledge.run(IMAGE) {
+                accept_eula()
+                password("Strong!Passw0rd")
+            }
+            if s != null { testing.cleanup_container(s.container) }
+            spec.assert_ok(err, "sqledge starts")
+            if err != "" { return }
+            st, serr = tc.state_of(s.container)
+            spec.assert_ok(serr, "state")
+            spec.assert_true(st.running, "state.Running")
+            url, uerr = sqledge.connection_string(s, ["encrypt=false"])
+            spec.assert_ok(uerr, "connection string")
+            spec.assert_true(string.starts_with(url, "sqlserver://sa:Strong%21Passw0rd@") == 1, "credentials: ${url}")
+            spec.assert_true(string.ends_with(url, "?database=master&encrypt=false") == 1, "query: ${url}")
+        }
+    }
+    return spec.run_summary(fw)
+}

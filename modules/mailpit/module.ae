@@ -1,0 +1,68 @@
+// Ported from testcontainers-go modules/mailpit/mailpit.go
+//
+// modules.mailpit: a Mailpit container (SMTP server, web UI and REST API).
+//
+//     import modules.mailpit
+//
+//     c, err = mailpit.run("axllent/mailpit:v1.20") {
+//         smtp_auth("user", "secret")
+//         message_limit(100)
+//     }
+//     defer tc.terminate(c)
+//     smtp, _ = mailpit.smtp_endpoint(c)   // "localhost:32771"
+//     api, _  = mailpit.http_url(c)        // "http://localhost:32772"
+//
+// Everything in the Go module is ported (Run, SMTPEndpoint, HTTPURL,
+// WithSMTPAuth, WithMessageLimit). Go's Container embeds the core container;
+// here run returns the *docker.Container itself and the helpers take it.
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, smtp_endpoint, http_url, smtp_auth, message_limit,
+    SMTP_PORT, HTTP_PORT, DEFAULT_IMAGE, mailpit_request_new, mailpit_request_free
+)
+
+const SMTP_PORT = "1025/tcp"
+const HTTP_PORT = "8025/tcp"
+const DEFAULT_IMAGE = "axllent/mailpit:v1.20"
+
+// Go's moduleOpts: both ports, ready when GET /readyz answers 200.
+mailpit_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, SMTP_PORT)
+    tc.expose(r, HTTP_PORT)
+    tc.wait_for(r, wait.for_http("/readyz") { with_port(HTTP_PORT); with_status(200) })
+    return r
+}
+
+mailpit_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithSMTPAuth: MP_SMTP_AUTH=user:password, plaintext auth allowed.
+smtp_auth(_ctx: ptr, user: string, password: string) {
+    tc.env(_ctx, "MP_SMTP_AUTH", "${user}:${password}")
+    tc.env(_ctx, "MP_SMTP_AUTH_ALLOW_INSECURE", "true")
+}
+
+// Go's WithMessageLimit: MP_MAX_MESSAGES.
+message_limit(_ctx: ptr, limit: int) { tc.env(_ctx, "MP_MAX_MESSAGES", "${limit}") }
+
+builder run(image: string) with mailpit_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = mailpit_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run mailpit: ${err}" }
+    return c, ""
+}
+
+// "host:port" of the SMTP server.
+smtp_endpoint(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, SMTP_PORT, "")
+}
+
+// "http://host:port" of the web UI and REST API.
+http_url(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, HTTP_PORT, "http")
+}

@@ -1,0 +1,96 @@
+// Ported from testcontainers-go modules/memcached/memcached_test.go
+//
+// Go's test only starts the container ("perform assertions" is empty); this
+// one also speaks memcached's text protocol over the mapped port: version,
+// set, get, and a miss.
+
+import std.spec
+import std.string
+import std.tcp
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.memcached
+
+const IMAGE = "memcached:1.6-alpine"
+
+// Send text, read until the reply ends with the given terminator.
+fn talk(sock: ptr, text: string, terminator: string) -> (string, string) {
+    _, werr = tcp.write(sock, text)
+    if werr != "" { return "", werr }
+    buf = ""
+    tries = 0
+    while tries < 100 {
+        chunk, rerr = tcp.read(sock, 4096)
+        if rerr != "" && rerr != "timeout" { return "", rerr }
+        buf = string.concat(buf, chunk)
+        if string.ends_with(buf, terminator) == 1 { return buf, "" }
+        tries = tries + 1
+    }
+    return buf, "no complete reply"
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/memcached") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("runs and speaks the text protocol (TestRun)") callback {
+            c, err = memcached.run(IMAGE)
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "memcached starts")
+            if err == "" {
+                hp, herr = memcached.host_port(c)
+                spec.assert_ok(herr, "host_port")
+                h, _ = tc.host(c)
+                port, perr = tc.mapped_port(c, memcached.PORT)
+                spec.assert_ok(perr, "mapped port")
+                spec.assert_str_eq(hp, "${h}:${port}", "host_port is host:mapped port")
+                sock, cerr = tcp.connect(h, port)
+                spec.assert_ok(cerr, "connect")
+                if cerr == "" {
+                    v, e1 = talk(sock, "version\r\n", "\r\n")
+                    spec.assert_ok(e1, "version")
+                    spec.assert_true(string.starts_with(v, "VERSION 1.6") == 1, "VERSION 1.6.x: ${v}")
+                    s, e2 = talk(sock, "set greeting 0 0 5\r\nhello\r\n", "\r\n")
+                    spec.assert_ok(e2, "set")
+                    spec.assert_str_eq(s, "STORED\r\n", "set is STORED")
+                    g, e3 = talk(sock, "get greeting\r\n", "END\r\n")
+                    spec.assert_ok(e3, "get")
+                    spec.assert_str_eq(g, "VALUE greeting 0 5\r\nhello\r\nEND\r\n", "get returns what set stored")
+                    m, e4 = talk(sock, "get nothing\r\n", "END\r\n")
+                    spec.assert_ok(e4, "get miss")
+                    spec.assert_str_eq(m, "END\r\n", "a miss is just END")
+                    tcp.tcp_close(sock)
+                }
+            }
+        }
+
+        spec.it("mixes core options into the module's block") callback {
+            c, err = memcached.run(IMAGE) {
+                tc.cmd(["memcached", "-m", "16"])
+                tc.env("TCAE_MARK", "from-the-block")
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "memcached starts")
+            if err == "" {
+                _, out, eerr = tc.exec(c, ["sh", "-c", "echo $TCAE_MARK"])
+                spec.assert_ok(eerr, "exec")
+                spec.assert_str_eq(string.trim(out), "from-the-block", "the core env setter reached the request")
+                h, _ = tc.host(c)
+                port, _ = tc.mapped_port(c, memcached.PORT)
+                sock, cerr = tcp.connect(h, port)
+                spec.assert_ok(cerr, "connect")
+                if cerr == "" {
+                    st, e1 = talk(sock, "stats settings\r\n", "END\r\n")
+                    spec.assert_ok(e1, "stats settings")
+                    spec.assert_contains(st, "STAT maxbytes 16777216", "-m 16 from the block's cmd took effect")
+                    tcp.tcp_close(sock)
+                }
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

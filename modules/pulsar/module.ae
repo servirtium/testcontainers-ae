@@ -1,0 +1,120 @@
+// Ported from testcontainers-go modules/pulsar/pulsar.go
+//
+// modules.pulsar: an Apache Pulsar standalone container (broker on 6650,
+// admin REST API on 8080).
+//
+//     import modules.pulsar
+//
+//     c, err = pulsar.run("apachepulsar/pulsar:4.0.9") {
+//         transactions()
+//         pulsar_env("brokerDeduplicationEnabled", "true")
+//     }
+//     defer tc.terminate(c)
+//     broker, _ = pulsar.broker_url(c)         // "pulsar://localhost:32771"
+//     admin, _ = pulsar.http_service_url(c)    // "http://localhost:32772"
+//
+// Like Go, the wait strategy options (functions_worker, transactions)
+// replace the default wait with their own combination of waits, in the order
+// they are called last-wins. Go's wait timeouts are the default 60s; Pulsar
+// standalone is slow to start (especially under emulation) so the default
+// ones here are 180s.
+//
+// Not ported: the deprecated RunContainer, WithLogConsumers (deprecated:
+// use tc.log_consumer) and the Container.LogConsumers field; the Go test
+// uses the Pulsar Go client, which has no equivalent here (the test checks
+// the admin REST API instead).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, broker_url, http_service_url, functions_worker, pulsar_env,
+    transactions, BROKER_PORT, ADMIN_PORT, DEFAULT_IMAGE,
+    pulsar_request_new, pulsar_request_free
+)
+
+const BROKER_PORT = "6650/tcp"
+const ADMIN_PORT = "8080/tcp"
+const DEFAULT_IMAGE = "apachepulsar/pulsar:4.0.9"
+const BASE_CMD = "/pulsar/bin/apply-config-from-env.py /pulsar/conf/standalone.conf && bin/pulsar standalone"
+const NO_FUNCTIONS_WORKER = "--no-functions-worker -nss"
+const TRANSACTION_TOPIC_ENDPOINT = "/admin/v2/persistent/pulsar/system/transaction_coordinator_assign/partitions"
+
+fn clusters_ready(body: string) -> bool {
+    return body == "[\"standalone\"]"
+}
+
+// Go's defaultWaitStrategies: the admin API lists the one cluster
+// "standalone", and the broker port listens.
+fn wait_clusters() -> ptr {
+    return wait.for_http("/admin/v2/clusters") {
+        with_port(ADMIN_PORT)
+        with_response_matcher(|body: string| -> clusters_ready(body))
+        with_startup_timeout(180s)
+    }
+}
+
+fn wait_broker() -> ptr { return wait.for_listening_port(BROKER_PORT) { with_startup_timeout(180s) } }
+
+// Go's moduleOpts: both ports, the default waits, and the standalone command
+// without the functions worker.
+pulsar_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, BROKER_PORT)
+    tc.expose(r, ADMIN_PORT)
+    tc.wait_for(r, wait.for_all([wait_clusters(), wait_broker()]) { with_deadline(300s) })
+    tc.cmd(r, ["/bin/bash", "-c", "${BASE_CMD} ${NO_FUNCTIONS_WORKER}"])
+    return r
+}
+
+pulsar_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithFunctionsWorker: the command without --no-functions-worker, and
+// the wait for the worker's log line as well as the defaults.
+functions_worker(_ctx: ptr) {
+    tc.cmd(_ctx, ["/bin/bash", "-c", BASE_CMD])
+    tc.wait_for(_ctx, wait.for_all([
+        wait.for_log("Function worker service started") { with_startup_timeout(180s) },
+        wait_clusters(), wait_broker()
+    ]) { with_deadline(300s) })
+}
+
+// Go's WithPulsarEnv: PULSAR_PREFIX_<name>=<value>, which the image's
+// apply-config-from-env script writes into standalone.conf.
+pulsar_env(_ctx: ptr, config_var: string, config_value: string) {
+    tc.env(_ctx, "PULSAR_PREFIX_${config_var}", config_value)
+}
+
+// Go's WithTransactions: transactionCoordinatorEnabled=true, and waiting for
+// the transaction coordinator topic before the defaults.
+transactions(_ctx: ptr) {
+    pulsar_env(_ctx, "transactionCoordinatorEnabled", "true")
+    tc.wait_for(_ctx, wait.for_all([
+        wait.for_http(TRANSACTION_TOPIC_ENDPOINT) {
+            with_port(ADMIN_PORT)
+            with_status(200)
+            with_startup_timeout(180s)
+        },
+        wait_clusters(), wait_broker()
+    ]) { with_deadline(300s) })
+}
+
+builder run(image: string) with pulsar_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = pulsar_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run pulsar: ${err}" }
+    return c, ""
+}
+
+// "pulsar://host:port" of the broker (Go's BrokerURL).
+broker_url(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, BROKER_PORT, "pulsar")
+}
+
+// "http://host:port" of the admin REST API (Go's HTTPServiceURL).
+http_service_url(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, ADMIN_PORT, "http")
+}

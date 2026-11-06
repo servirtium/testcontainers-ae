@@ -1,0 +1,141 @@
+// Ported from testcontainers-go modules/scylladb/scylladb_test.go
+//
+// A real ScyllaDB: the CQL port (non_shard_aware_connection_host) and the
+// shard-aware port (shard_awareness) both answer a native-protocol OPTIONS
+// with SUPPORTED over std.tcp, Alternator answers its HTTP port, and
+// custom_commands is checked on the container's Cmd. (No CQL client in std;
+// Go's gocql queries are not ported.)
+
+import std.spec
+import std.string
+import std.tcp
+import std.bytes
+import std.json
+import std.http.client
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.scylladb
+
+const IMAGE = "scylladb/scylla:6.2"
+
+fn put(buf: ptr, v: int) { bytes.set(buf, bytes.length(buf), v) }
+
+// Read exactly n bytes as hex text.
+fn read_hex(sock: ptr, n: int) -> (string, string) {
+    buf = bytes.new(n + 16)
+    got = 0
+    tries = 0
+    out = ""
+    while got < n && tries < 200 {
+        cv = bytes.capacity_view(buf)
+        m, rerr = tcp.read_into(sock, cv[got..n])
+        if rerr != "" && rerr != "timeout" { bytes.free(buf); return "", rerr }
+        got = got + m
+        tries = tries + 1
+    }
+    if got < n { bytes.free(buf); return "", "short read: ${got} of ${n} bytes" }
+    v = bytes.capacity_view(buf)
+    i = 0
+    hexd = "0123456789abcdef"
+    while i < n {
+        d = v[i] & 255
+        out = "${out}${string.substring(hexd, d / 16, d / 16 + 1)}${string.substring(hexd, d % 16, d % 16 + 1)}"
+        i = i + 1
+    }
+    bytes.free(buf)
+    return out, ""
+}
+
+// One CQL native-protocol v4 exchange: OPTIONS (opcode 0x05, stream 0, no
+// body) must be answered by a SUPPORTED (0x06) response frame (version 0x84).
+// Returns the 9-byte response header as hex.
+fn cql_options(host: string, port: int) -> (string, string) {
+    sock, cerr = tcp.connect(host, port)
+    if cerr != "" { return "", cerr }
+    req = bytes.new(16)
+    put(req, 4)
+    put(req, 0)
+    put(req, 0)
+    put(req, 0)
+    put(req, 5)
+    put(req, 0)
+    put(req, 0)
+    put(req, 0)
+    put(req, 0)
+    _, werr = tcp.write_all(sock, bytes.view(req))
+    bytes.free(req)
+    if werr != "" { tcp.tcp_close(sock); return "", werr }
+    hdr, rerr = read_hex(sock, 9)
+    tcp.tcp_close(sock)
+    return hdr, rerr
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/scylladb") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("rejects an invalid flag (TestScyllaWithCustomCommands, invalid)") callback {
+            c, err = scylladb.run(IMAGE) { custom_commands(["smp=2"]) }
+            spec.assert_true(c == null, "no container")
+            spec.assert_contains(err, "invalid flag: smp=2", "the error")
+        }
+
+        spec.it("speaks CQL on both ports and serves Alternator") callback {
+            c, err = scylladb.run(IMAGE) {
+                shard_awareness()
+                alternator()
+                custom_commands(["--smp=1", "--memory=768M"])
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "scylladb starts")
+            if err == "" {
+                h, _ = tc.host(c)
+                p1, e1 = tc.mapped_port(c, scylladb.PORT)
+                spec.assert_ok(e1, "cql port")
+                hdr, terr = cql_options(h, p1)
+                spec.assert_ok(terr, "OPTIONS round trip")
+                spec.assert_str_eq(string.substring(hdr, 8, 10), "06", "SUPPORTED on 9042")
+                p2, e2 = tc.mapped_port(c, scylladb.SHARD_AWARE_PORT)
+                spec.assert_ok(e2, "shard-aware port")
+                hdr2, terr2 = cql_options(h, p2)
+                spec.assert_ok(terr2, "OPTIONS on the shard-aware port")
+                spec.assert_str_eq(string.substring(hdr2, 8, 10), "06", "SUPPORTED on 19042")
+
+                alt, aerr = scylladb.alternator_connection_host(c)
+                spec.assert_ok(aerr, "alternator host")
+                req = client.request("GET", "http://${alt}/")
+                client.set_timeout(req, 30s)
+                r, rerr = client.send_request(req)
+                client.request_free(req)
+                spec.assert_ok(rerr, "GET alternator /")
+                if rerr == "" {
+                    spec.assert_eq(client.response_status(r), 200, "Alternator answers")
+                    client.response_free(r)
+                }
+
+                doc, ierr = tc.inspect(c)
+                spec.assert_ok(ierr, "inspect")
+                cfg, _ = json.object_get(doc, "Config")
+                cmdv, _ = json.object_get(cfg, "Cmd")
+                joined = ""
+                n = json.json_array_size(cmdv)
+                i = 0
+                while i < n {
+                    v, _ = json.array_get(cmdv, i)
+                    s, _ = json.get_string(v)
+                    joined = "${joined} ${s}"
+                    i = i + 1
+                }
+                json.free(doc)
+                spec.assert_contains(joined, "--memory=768M", "the custom flag replaced the default")
+                spec.assert_true(string.contains(joined, "--memory=512M") == 0, "and the default is gone")
+                spec.assert_contains(joined, "--alternator-write-isolation=always", "the alternator flag")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

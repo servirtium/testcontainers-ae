@@ -1,0 +1,175 @@
+// Ported from testcontainers-go modules/elasticsearch/elasticsearch.go,
+// modules/elasticsearch/options.go, modules/elasticsearch/version.go
+//
+// modules.elasticsearch: an Elasticsearch container (HTTP 9200, transport 9300).
+//
+//     import modules.elasticsearch
+//
+//     es, err = elasticsearch.run("docker.elastic.co/elasticsearch/elasticsearch:8.9.0") {
+//         password("foo")
+//     }
+//     defer tc.terminate(es.container)
+//     es.address     // "https://localhost:32771" (http:// when security is off)
+//     es.username    // "elastic"
+//     es.password    // "foo"
+//     es.ca_cert     // the PEM of the generated CA (8.x with security), else ""
+//
+// Go's ElasticsearchContainer.Settings (Address, CACert, Password, Username)
+// are the fields of the struct here. Elasticsearch 8 is secure by default: it
+// gets the password "changeme" unless one is set, runs over HTTPS with a
+// generated CA, and the module reads that CA out of the container.
+//
+// Differences from Go:
+//
+//  - For an HTTPS start (8.x with security) the HTTP wait verifies the
+//    certificate against the CA read from the container
+//    (wait.for_tls_root_cas + with_tls_config_from); Go reads the CA too but
+//    then also sets WithAllowInsecure, which skips verification.
+//  - The JVM options file is copied before start, not in a post-create hook.
+//
+// Not ported: the deprecated RunContainer and Go's examples (they use the
+// go-elasticsearch client).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    ElasticsearchContainer, run, password, HTTP_PORT, TCP_PORT,
+    DEFAULT_USERNAME, DEFAULT_PASSWORD, DEFAULT_IMAGE, CA_CERT_PATH,
+    is_at_least_version, is_oss,
+    elasticsearch_request_new, elasticsearch_request_free
+)
+
+const HTTP_PORT = "9200/tcp"
+const TCP_PORT = "9300/tcp"
+const DEFAULT_USERNAME = "elastic"
+const DEFAULT_PASSWORD = "changeme"
+const DEFAULT_IMAGE = "docker.elastic.co/elasticsearch/elasticsearch:8.9.0"
+const CA_CERT_PATH = "/usr/share/elasticsearch/config/certs/http_ca.crt"
+const BASE_IMAGE_OSS = "docker.elastic.co/elasticsearch/elasticsearch-oss"
+const SET_PASSWORD = "elasticsearch.password"
+
+const JVM_OPTS = <<JVM
+-Xms2G
+-Xmx2G
+-Dingest.geoip.downloader.enabled.default=false
+JVM
+
+struct ElasticsearchContainer {
+    container: *docker.Container
+    address: string
+    ca_cert: string
+    password: string
+    username: string
+}
+
+elasticsearch_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, TCP_PORT)
+    tc.env(r, "discovery.type", "single-node")
+    tc.env(r, "cluster.routing.allocation.disk.threshold_enabled", "false")
+    return r
+}
+
+elasticsearch_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithPassword.
+password(_ctx: ptr, pw: string) { tc.set_setting(_ctx, SET_PASSWORD, pw) }
+
+// Go's isOSS.
+is_oss(image: string) -> bool { return string.starts_with(image, BASE_IMAGE_OSS) == 1 }
+
+// Go's isAtLeastVersion: the tag's leading major version is >= major, or the
+// tag is "latest". A tag that does not start with digits is not a version.
+is_at_least_version(image: string, major: int) -> bool {
+    tag = image
+    i = string.index_of(tag, ":")
+    while i >= 0 {
+        tag = string.substring(tag, i + 1, string.length(tag))
+        i = string.index_of(tag, ":")
+    }
+    if tag == "latest" { return true }
+    if string.starts_with(tag, "v") == 1 { tag = string.substring(tag, 1, string.length(tag)) }
+    n = 0
+    digits = 0
+    k = 0
+    while k < string.length(tag) {
+        ch = string.string_char_at(tag, k)
+        if ch < 48 || ch > 57 { break }
+        n = n * 10 + (ch - 48)
+        digits = digits + 1
+        k = k + 1
+    }
+    if digits == 0 { return false }
+    return n >= major
+}
+
+// Go's sslRequired: 8.x unless an env key disables security.
+fn ssl_required(r: ptr, image: string) -> bool {
+    if !is_at_least_version(image, 8) { return false }
+    keys = ["xpack.security.enabled", "xpack.security.http.ssl.enabled", "xpack.security.transport.ssl.enabled"]
+    for k in keys {
+        if tc.req_has_env(r, k) && tc.req_env(r, k) == "false" { return false }
+    }
+    return true
+}
+
+// Run an Elasticsearch container (Go's elasticsearch.Run).
+builder run(image: string) with elasticsearch_request_new -> (*ElasticsearchContainer, string) {
+    r = _builder
+    if r == null { r = elasticsearch_request_new() }
+    username = DEFAULT_USERNAME
+    pw = tc.req_setting(r, SET_PASSWORD)
+    ssl = ssl_required(r, image)
+
+    // configurePassword
+    if is_at_least_version(image, 8) && string.length(pw) == 0 { pw = DEFAULT_PASSWORD }
+    if string.length(pw) > 0 {
+        if is_oss(image) {
+            tc.request_free(r)
+            return null, "run elasticsearch: it's not possible to activate security on Elastic OSS Image. Please switch to the default distribution"
+        }
+        if !tc.req_has_env(r, "ELASTIC_PASSWORD") { tc.env(r, "ELASTIC_PASSWORD", pw) }
+        if !is_at_least_version(image, 8) { tc.env(r, "xpack.security.enabled", "true") }
+    }
+
+    // configureJvmOpts
+    if is_at_least_version(image, 7) {
+        tc.file_content(r, JVM_OPTS, "/usr/share/elasticsearch/config/jvm.options.d/ elasticsearch-default-memory-vm.options", 420)
+    }
+
+    // configureWaitFor
+    w = wait.for_http("/") { with_port("9200") }
+    t = wait.for_nop()
+    if ssl {
+        t = wait.for_tls_root_cas([CA_CERT_PATH])
+        tc.additional_wait(r, t)
+        w = wait.with_tls_config_from(w, t)
+    }
+    if string.length(pw) > 0 { w = wait.with_basic_auth(w, username, pw) }
+    tc.additional_wait(r, w)
+
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run elasticsearch: ${err}" }
+    es = heap.new(ElasticsearchContainer)
+    es.container = c
+    es.address = ""
+    es.ca_cert = ""
+    es.password = pw
+    es.username = username
+    if err != "" { return es, "run elasticsearch: ${err}" }
+
+    // configureAddress
+    proto = "http"
+    if ssl {
+        es.ca_cert = wait.tls_ca_pem(t)
+        proto = "https"
+    }
+    ep, eerr = tc.endpoint(c, HTTP_PORT, proto)
+    if eerr != "" { return es, "run elasticsearch: port endpoint: ${eerr}" }
+    es.address = ep
+    return es, ""
+}

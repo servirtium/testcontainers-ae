@@ -1,0 +1,518 @@
+// Ported from testcontainers-go modules/redpanda/redpanda.go, modules/redpanda/options.go, modules/redpanda/admin_api.go, modules/redpanda/mounts/{redpanda.yaml.tpl,bootstrap.yaml.tpl,entrypoint-tc.sh}
+//
+// modules.redpanda: a Redpanda broker (Kafka API 9092, Admin API 9644,
+// Schema Registry 8081, HTTP Proxy 8082), with the advertised-listener dance
+// Go does: the container starts through a wrapper entrypoint that waits for
+// the node config (redpanda.yaml), which `run` renders and copies in once the
+// Kafka port is mapped, so the config can advertise host:mapped-port.
+//
+//     import modules.redpanda
+//
+//     r, err = redpanda.run("docker.redpanda.com/redpandadata/redpanda:v25.2.4") {
+//         enable_sasl()
+//         new_service_account("alice", "s3cret")
+//         superusers(["alice"])
+//         auto_create_topics()
+//     }
+//     defer tc.terminate(r.container)
+//     broker, _ = redpanda.kafka_seed_broker(r)     // "localhost:32771"
+//     admin, _ = redpanda.admin_api_address(r)      // "http://localhost:32772"
+//     sr, _ = redpanda.schema_registry_address(r)
+//
+// The options are module settings on the request (tc.set_setting, never sent
+// to the engine) that `run` reads after the caller's block. Go renders the
+// two YAML files with text/template; here they are built with string
+// interpolation. Extra bootstrap config values are strings, written as they
+// are (so "true" is a YAML boolean, as Go's `any` bool is).
+//
+// Not ported: WithTLS (the caller's PEM cert and key, plus a TLS client for
+// the admin wait and the user-creation calls; std.http.client has no custom
+// root store), the deprecated RunContainer, and the AdminAPIClient type
+// beyond what run needs (CreateUser is internal here: create_user).
+
+import std.string
+import std.json
+import std.encoding
+import std.http.client
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    RedpandaContainer, run, kafka_seed_broker, admin_api_address,
+    schema_registry_address, http_proxy_address, create_user,
+    new_service_account, superusers, enable_sasl, enable_kafka_authorization,
+    enable_wasm_transform, enable_schema_registry_http_basic_auth,
+    http_proxy_auth_method, auto_create_topics, listener, bootstrap_config,
+    admin_api_authentication,
+    HTTP_PROXY_AUTH_NONE, HTTP_PROXY_AUTH_HTTP_BASIC, HTTP_PROXY_AUTH_OIDC,
+    KAFKA_API_PORT, ADMIN_API_PORT, SCHEMA_REGISTRY_PORT, HTTP_PROXY_PORT,
+    DEFAULT_IMAGE, BOOTSTRAP_ADMIN_USER, BOOTSTRAP_ADMIN_PASSWORD,
+    redpanda_request_new, redpanda_request_free
+)
+
+const KAFKA_API_PORT = "9092/tcp"
+const ADMIN_API_PORT = "9644/tcp"
+const SCHEMA_REGISTRY_PORT = "8081/tcp"
+const HTTP_PROXY_PORT = "8082/tcp"
+const DEFAULT_IMAGE = "docker.redpanda.com/redpandadata/redpanda:v25.2.4"
+
+const REDPANDA_DIR = "/etc/redpanda"
+const ENTRYPOINT_FILE = "/entrypoint-tc.sh"
+const BOOTSTRAP_CONFIG_FILE = ".bootstrap.yaml"
+
+const BOOTSTRAP_ADMIN_USER = "redpanda_bootstrap_admin_user"
+const BOOTSTRAP_ADMIN_PASSWORD = "redpanda_bootstrap_admin_password"
+
+const HTTP_PROXY_AUTH_NONE = "none"
+const HTTP_PROXY_AUTH_HTTP_BASIC = "http_basic"
+const HTTP_PROXY_AUTH_OIDC = "oidc"
+
+// the module settings (see the header)
+const S_SUPERUSERS = "redpanda.superusers"       // names, one a line
+const S_ACCOUNTS = "redpanda.accounts"           // "user\tpassword" lines
+const S_LISTENERS = "redpanda.listeners"         // "host\tport\tauth" lines
+const S_EXTRA = "redpanda.bootstrap_config"      // "key\tvalue" lines
+const S_SASL = "redpanda.sasl"
+const S_AUTHZ = "redpanda.kafka_authorization"
+const S_WASM = "redpanda.wasm"
+const S_SR_BASIC = "redpanda.schema_registry_basic"
+const S_PROXY_AUTH = "redpanda.http_proxy_auth"
+const S_AUTO_TOPICS = "redpanda.auto_create_topics"
+const S_ADMIN_AUTH = "redpanda.admin_auth"
+const S_ERROR = "redpanda.error"
+
+// Go's Container: the container and the URL scheme of the HTTP APIs.
+struct RedpandaContainer {
+    container: *docker.Container
+    url_scheme: string
+}
+
+// The wrapper entrypoint (mounts/entrypoint-tc.sh): wait until the node
+// config injected after start is in place, then run the image's own.
+const ENTRYPOINT_SCRIPT = <<SH
+#!/usr/bin/env bash
+
+# Wait for testcontainer's injected redpanda config with the port only known after docker start
+until grep -q "# Injected by testcontainers" "/etc/redpanda/redpanda.yaml"
+do
+  sleep 0.1
+done
+exec /entrypoint.sh $@
+SH
+
+// Go's moduleOpts: root user, the four ports, the wrapper entrypoint and
+// command, and waiting only for the ports to be mapped (Redpanda cannot
+// listen before its config, which needs the mapped port).
+redpanda_request_new() -> ptr {
+    r = tc.request_new()
+    tc.user(r, "root:root")
+    tc.expose(r, KAFKA_API_PORT)
+    tc.expose(r, ADMIN_API_PORT)
+    tc.expose(r, SCHEMA_REGISTRY_PORT)
+    tc.expose(r, HTTP_PROXY_PORT)
+    tc.entrypoint(r, [ENTRYPOINT_FILE])
+    tc.cmd(r, ["redpanda", "start", "--mode=dev-container", "--smp=1", "--memory=1G"])
+    tc.wait_for(r, wait.for_all([
+        wait.for_mapped_port(KAFKA_API_PORT),
+        wait.for_mapped_port(ADMIN_API_PORT),
+        wait.for_mapped_port(SCHEMA_REGISTRY_PORT),
+        wait.for_mapped_port(HTTP_PROXY_PORT)
+    ]))
+    return r
+}
+
+redpanda_request_free(p: ptr) { tc.request_free(p) }
+
+// ---- helpers over the line-list settings ----
+
+fn add_line(_ctx: ptr, key: string, line: string) {
+    if !tc.req_has_setting(_ctx, key) {
+        tc.set_setting(_ctx, key, line)
+    } else {
+        tc.set_setting(_ctx, key, "${tc.req_setting(_ctx, key)}\n${line}")
+    }
+}
+
+fn split_on(s: string, sep: string) -> string[] {
+    string[] out = []
+    if string.length(s) == 0 { return out }
+    rest = s
+    i = string.index_of(rest, sep)
+    while i >= 0 {
+        out.push(string.substring(rest, 0, i))
+        rest = string.substring(rest, i + string.length(sep), string.length(rest))
+        i = string.index_of(rest, sep)
+    }
+    out.push(rest)
+    return out
+}
+
+// Put "key\tvalue" in a map-like setting: a later value for a key replaces.
+fn put_kv(_ctx: ptr, setting: string, key: string, value: string) {
+    out = ""
+    found = false
+    for ln in split_on(tc.req_setting(_ctx, setting), "\n") {
+        t = string.index_of(ln, "\t")
+        line = ln
+        if string.substring(ln, 0, t) == key {
+            line = "${key}\t${value}"
+            found = true
+        }
+        if string.length(out) > 0 { out = "${out}\n" }
+        out = "${out}${line}"
+    }
+    if !found {
+        if string.length(out) > 0 { out = "${out}\n" }
+        out = "${out}${key}\t${value}"
+    }
+    tc.set_setting(_ctx, setting, out)
+}
+
+// ---- options ----
+
+// Go's WithNewServiceAccount: a user created through the Admin API once
+// Redpanda is ready (SCRAM-SHA-256).
+new_service_account(_ctx: ptr, username: string, password: string) {
+    put_kv(_ctx, S_ACCOUNTS, username, password)
+}
+
+// Go's WithSuperusers: replaces the list (default none).
+superusers(_ctx: ptr, names: string[]) {
+    out = ""
+    for n in names {
+        if string.length(out) > 0 { out = "${out}\n" }
+        out = "${out}${n}"
+    }
+    tc.set_setting(_ctx, S_SUPERUSERS, out)
+}
+
+// Go's WithEnableSASL: SCRAM-SHA-256 on the Kafka API.
+enable_sasl(_ctx: ptr) { tc.set_setting(_ctx, S_SASL, "1") }
+
+// Go's WithEnableKafkaAuthorization.
+enable_kafka_authorization(_ctx: ptr) { tc.set_setting(_ctx, S_AUTHZ, "1") }
+
+// Go's WithEnableWasmTransform (only honoured from image v23.3).
+enable_wasm_transform(_ctx: ptr) { tc.set_setting(_ctx, S_WASM, "1") }
+
+// Go's WithEnableSchemaRegistryHTTPBasicAuth.
+enable_schema_registry_http_basic_auth(_ctx: ptr) { tc.set_setting(_ctx, S_SR_BASIC, "1") }
+
+// Go's WithHTTPProxyAuthMethod: "none", "http_basic" or "oidc"; anything
+// else is "none".
+http_proxy_auth_method(_ctx: ptr, method: string) {
+    m = method
+    if m != HTTP_PROXY_AUTH_NONE && m != HTTP_PROXY_AUTH_HTTP_BASIC && m != HTTP_PROXY_AUTH_OIDC {
+        m = HTTP_PROXY_AUTH_NONE
+    }
+    tc.set_setting(_ctx, S_PROXY_AUTH, m)
+}
+
+// Go's WithAutoCreateTopics.
+auto_create_topics(_ctx: ptr) { tc.set_setting(_ctx, S_AUTO_TOPICS, "1") }
+
+// Go's WithListener("host:port"): an extra Kafka listener reachable from
+// other containers on the networks, by that name; aliased on every network
+// the block attached (at least one is required). It takes the Kafka
+// authentication method set so far (call enable_sasl before it, as in Go).
+listener(_ctx: ptr, hostport: string) {
+    i = -1
+    k = 0
+    while k < string.length(hostport) {
+        if string.char_at(hostport, k) == 58 { i = k }
+        k = k + 1
+    }
+    if i < 0 {
+        if !tc.req_has_setting(_ctx, S_ERROR) { tc.set_setting(_ctx, S_ERROR, "split host port: missing port in address") }
+        return
+    }
+    port, perr = string.to_int(string.substring(hostport, i + 1, string.length(hostport)))
+    if perr != "" {
+        if !tc.req_has_setting(_ctx, S_ERROR) { tc.set_setting(_ctx, S_ERROR, "parse port: ${perr}") }
+        return
+    }
+    auth = "none"
+    if tc.req_has_setting(_ctx, S_SASL) { auth = "sasl" }
+    add_line(_ctx, S_LISTENERS, "${string.substring(hostport, 0, i)}\t${port}\t${auth}")
+}
+
+// Go's WithBootstrapConfig: an arbitrary cluster property written into the
+// bootstrap file as `key: value`.
+bootstrap_config(_ctx: ptr, key: string, value: string) {
+    put_kv(_ctx, S_EXTRA, key, value)
+}
+
+// Go's WithAdminAPIAuthentication: admin_api_require_auth, with a bootstrap
+// user account that is made a superuser.
+admin_api_authentication(_ctx: ptr) { tc.set_setting(_ctx, S_ADMIN_AUTH, "1") }
+
+// ---- rendering (mounts/*.tpl) ----
+
+fn bool_text(b: bool) -> string {
+    if b { return "true" }
+    return "false"
+}
+
+fn render_bootstrap(r: ptr, supers: string[], extra: string[], wasm: bool) -> string {
+    out = "# Injected by testcontainers
+# This file contains cluster properties which will only be considered when
+# starting the cluster for the first time. Afterwards, you can configure cluster
+# properties via the Redpanda Admin API.
+superusers:"
+    if supers.len == 0 {
+        out = "${out}\n  []"
+    } else {
+        for s in supers { out = "${out}\n  - ${s}" }
+    }
+    if tc.req_has_setting(r, S_AUTHZ) { out = "${out}\nkafka_enable_authorization: true" }
+    if wasm { out = "${out}\ndata_transforms_enabled: true" }
+    if tc.req_has_setting(r, S_AUTO_TOPICS) { out = "${out}\nauto_create_topics_enabled: true" }
+    for kv in extra {
+        t = string.index_of(kv, "\t")
+        out = "${out}\n${string.substring(kv, 0, t)}: ${string.substring(kv, t + 1, string.length(kv))}"
+    }
+    return "${out}\n"
+}
+
+// The pieces of redpanda.yaml that depend on the request, read before it is
+// handed to run (which owns it): Kafka, internal, schema registry and HTTP
+// proxy authentication methods, and auto-create-topics.
+fn render_node_config(kafka_auth: string, internal_auth: string, sr_auth: string, proxy_auth: string, auto_topics: bool, host: string, kafka_port: int, listeners: string[]) -> string {
+    out = "# Injected by testcontainers
+redpanda:
+  admin:
+    address: 0.0.0.0
+    port: 9644
+
+  kafka_api:
+    - address: 0.0.0.0
+      name: external
+      port: 9092
+      authentication_method: ${kafka_auth}
+
+    # This listener is required for the schema registry client. The schema
+    # registry client connects via an advertised listener like a normal Kafka
+    # client would do. It can't use the other listener because the mapped
+    # port is not accessible from within the Redpanda container.
+    - address: 0.0.0.0
+      name: internal
+      port: 9093
+      authentication_method: ${internal_auth}
+"
+    for ln in listeners {
+        p = split_on(ln, "\t")
+        out = "${out}    - address: 0.0.0.0
+      name: ${p[0]}
+      port: ${p[1]}
+      authentication_method: ${p[2]}
+"
+    }
+    out = "${out}
+  advertised_kafka_api:
+    - address: ${host}
+      name: external
+      port: ${kafka_port}
+    - address: 127.0.0.1
+      name: internal
+      port: 9093
+"
+    for ln in listeners {
+        p = split_on(ln, "\t")
+        out = "${out}    - address: ${p[0]}
+      name: ${p[0]}
+      port: ${p[1]}
+"
+    }
+    out = "${out}
+schema_registry:
+  schema_registry_api:
+  - address: \"0.0.0.0\"
+    name: main
+    port: 8081
+    authentication_method: ${sr_auth}
+
+schema_registry_client:
+  brokers:
+    - address: localhost
+      port: 9093
+
+pandaproxy:
+  pandaproxy_api:
+    - address: 0.0.0.0
+      port: 8082
+      name: main
+      authentication_method: ${proxy_auth}
+
+pandaproxy_client:
+  brokers:
+    - address: localhost
+      port: 9093
+
+auto_create_topics_enabled: ${bool_text(auto_topics)}
+"
+    return out
+}
+
+// Go's isAtLeastVersion(img, "23.3"): the image tag, "latest" or major.minor.
+fn at_least_23_3(image: string) -> bool {
+    i = -1
+    k = 0
+    while k < string.length(image) {
+        if string.char_at(image, k) == 58 { i = k }
+        k = k + 1
+    }
+    if i < 0 { return false }
+    v = string.substring(image, i + 1, string.length(image))
+    if v == "latest" { return true }
+    if string.starts_with(v, "v") == 1 { v = string.substring(v, 1, string.length(v)) }
+    parts = split_on(v, ".")
+    if parts.len < 2 { return false }
+    major, e1 = string.to_int(parts[0])
+    minor, e2 = string.to_int(parts[1])
+    if e1 != "" || e2 != "" { return false }
+    return major > 23 || (major == 23 && minor >= 3)
+}
+
+fn basic(user: string, password: string) -> string {
+    return "Basic ${encoding.base64_encode_padded(string.bytes("${user}:${password}"))}"
+}
+
+// Go's AdminAPIClient.CreateUser: POST /v1/security/users (SCRAM-SHA-256);
+// user/password for the Admin API's basic auth, "" for none.
+create_user(admin_url: string, auth_user: string, auth_password: string, username: string, password: string) -> string {
+    body = json.obj()
+    json.set(body, "username", json.str(username))
+    json.set(body, "password", json.str(password))
+    json.set(body, "algorithm", json.str("SCRAM-SHA-256"))
+    text, eerr = json.encode(body)
+    json.free(body)
+    if eerr != "" { return "failed to marshal create user request: ${eerr}" }
+    req = client.request("POST", "${admin_url}/v1/security/users")
+    client.set_timeout(req, 10s)
+    client.set_body(req, string.bytes(text), "application/json")
+    if string.length(auth_user) > 0 || string.length(auth_password) > 0 {
+        client.set_header(req, "Authorization", basic(auth_user, auth_password))
+    }
+    resp, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return "request failed: ${err}" }
+    status = client.response_status(resp)
+    rb = client.response_body(resp)
+    client.response_free(resp)
+    if status != 200 { return "unexpected status code in response: ${status}. Response body is: \"${rb}\"" }
+    return ""
+}
+
+// Run a Redpanda container (Go's redpanda.Run). The returned struct is
+// non-null whenever a container was created, with the error.
+builder run(image: string) with redpanda_request_new -> (*RedpandaContainer, string) {
+    r = _builder
+    if r == null { r = redpanda_request_new() }
+    if tc.req_has_setting(r, S_ERROR) {
+        e = tc.req_setting(r, S_ERROR)
+        redpanda_request_free(r)
+        return null, "apply option: ${e}"
+    }
+    // the superusers and bootstrap config, with the Admin API bootstrap user if asked for
+    supers = split_on(tc.req_setting(r, S_SUPERUSERS), "\n")
+    extra = split_on(tc.req_setting(r, S_EXTRA), "\n")
+    admin_auth = tc.req_has_setting(r, S_ADMIN_AUTH)
+    if admin_auth {
+        tc.env(r, "RP_BOOTSTRAP_USER", "${BOOTSTRAP_ADMIN_USER}:${BOOTSTRAP_ADMIN_PASSWORD}")
+        supers.push(BOOTSTRAP_ADMIN_USER)
+        extra.push("admin_api_require_auth\ttrue")
+    }
+    wasm = tc.req_has_setting(r, S_WASM) && at_least_23_3(image)
+    tc.file_content(r, ENTRYPOINT_SCRIPT, ENTRYPOINT_FILE, 448)
+    tc.file_content(r, render_bootstrap(r, supers, extra, wasm), "${REDPANDA_DIR}/${BOOTSTRAP_CONFIG_FILE}", 384)
+
+    // listeners become network aliases on every network (after the block)
+    listeners = split_on(tc.req_setting(r, S_LISTENERS), "\n")
+    if listeners.len > 0 {
+        nets = tc.req_networks(r)
+        if nets.len == 0 {
+            redpanda_request_free(r)
+            return null, "container must be attached to at least one network"
+        }
+        for ln in listeners {
+            p = split_on(ln, "\t")
+            for nw in nets { tc.network_alias(r, nw, p[0]) }
+        }
+    }
+    accounts = split_on(tc.req_setting(r, S_ACCOUNTS), "\n")
+    kafka_auth = "none"
+    if tc.req_has_setting(r, S_SASL) { kafka_auth = "sasl" }
+    internal_auth = "none"
+    if tc.req_has_setting(r, S_AUTHZ) { internal_auth = "sasl" }
+    sr_auth = "none"
+    if tc.req_has_setting(r, S_SR_BASIC) { sr_auth = "http_basic" }
+    proxy_auth = HTTP_PROXY_AUTH_NONE
+    if tc.req_has_setting(r, S_PROXY_AUTH) { proxy_auth = tc.req_setting(r, S_PROXY_AUTH) }
+    auto_topics = tc.req_has_setting(r, S_AUTO_TOPICS)
+
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run redpanda: ${err}" }
+    rp = heap.new(RedpandaContainer)
+    rp.container = c
+    rp.url_scheme = ""
+    if err != "" { return rp, "run redpanda: ${err}" }
+
+    // the Kafka API's mapped port is needed for the advertised listener
+    host, herr = tc.host(c)
+    if herr != "" { return rp, "host: ${herr}" }
+    kport, kerr = tc.mapped_port(c, KAFKA_API_PORT)
+    if kerr != "" { return rp, "mapped kafka port: ${kerr}" }
+    cerr = tc.copy_to_container(c, render_node_config(kafka_auth, internal_auth, sr_auth, proxy_auth, auto_topics, host, kport, listeners), "${REDPANDA_DIR}/redpanda.yaml", 384)
+    if cerr != "" { return rp, "copy to container: ${cerr}" }
+
+    // wait until Redpanda serves (the Admin API answers 404 on "/")
+    werr = wait.until_ready(wait.for_all([
+        wait.for_listening_port(KAFKA_API_PORT),
+        wait.for_http("/") { with_port(ADMIN_API_PORT); with_status(404) },
+        wait.for_listening_port(SCHEMA_REGISTRY_PORT),
+        wait.for_listening_port(HTTP_PROXY_PORT),
+        wait.for_log("Successfully started Redpanda!")
+    ]) { with_deadline(180s) }, c)
+    if werr != "" { return rp, "wait for readiness: ${werr}" }
+    rp.url_scheme = "http"
+
+    // service accounts, through the Admin API
+    if accounts.len > 0 {
+        admin_url, aerr = tc.endpoint(c, ADMIN_API_PORT, rp.url_scheme)
+        if aerr != "" { return rp, "port endpoint: ${aerr}" }
+        au = ""
+        ap = ""
+        if admin_auth {
+            au = BOOTSTRAP_ADMIN_USER
+            ap = BOOTSTRAP_ADMIN_PASSWORD
+        }
+        for acc in accounts {
+            t = string.index_of(acc, "\t")
+            uname = string.substring(acc, 0, t)
+            uerr = create_user(admin_url, au, ap, uname, string.substring(acc, t + 1, string.length(acc)))
+            if uerr != "" { return rp, "create user \"${uname}\": ${uerr}" }
+        }
+    }
+    return rp, ""
+}
+
+// "host:port" of the Kafka API for a client's seed brokers (Go's KafkaSeedBroker).
+kafka_seed_broker(rp: *RedpandaContainer) -> (string, string) {
+    return tc.endpoint(rp.container, KAFKA_API_PORT, "")
+}
+
+// "http://host:port" of the Admin API (Go's AdminAPIAddress).
+admin_api_address(rp: *RedpandaContainer) -> (string, string) {
+    return tc.endpoint(rp.container, ADMIN_API_PORT, rp.url_scheme)
+}
+
+// "http://host:port" of the Schema Registry (Go's SchemaRegistryAddress).
+schema_registry_address(rp: *RedpandaContainer) -> (string, string) {
+    return tc.endpoint(rp.container, SCHEMA_REGISTRY_PORT, rp.url_scheme)
+}
+
+// "http://host:port" of the HTTP Proxy / pandaproxy (Go's HTTPProxyAddress).
+http_proxy_address(rp: *RedpandaContainer) -> (string, string) {
+    return tc.endpoint(rp.container, HTTP_PROXY_PORT, rp.url_scheme)
+}

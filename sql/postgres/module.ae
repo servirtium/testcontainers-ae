@@ -1,0 +1,345 @@
+// Ported from jackc/pgx v5.9.2 stdlib/sql.go (the database/sql driver), tx.go
+// (ErrTxCommitRollback), pgtype/{pgtype.go (type OIDs),bytea.go,bool.go,
+// float8.go,int.go,text.go} (text-format conversions only)
+// Copyright (c) 2013-2021 Jack Christensen. MIT License: see sql/LICENSE.
+//
+// sql.postgres: the PostgreSQL driver for `sql`, over sql.postgres.pgconn.
+//
+//     import sql
+//     import sql.postgres as pgsql     // alias it beside modules.postgres
+//
+//     pgsql.register()                 // "postgres", "pgx" and "pgx/v5"
+//     db, err = sql.open("postgres", "postgres://app:secret@localhost:5432/app?sslmode=disable")
+//
+// Registration is an explicit call (Aether has no import-time init): call
+// register() once before sql.open; calling it again is harmless. The names
+// are pgx's stdlib names ("pgx", "pgx/v5") and lib/pq's ("postgres"), so a
+// port of Go code that opens either finds this driver.
+//
+// Statements without arguments run with the simple query protocol (several
+// statements in one string are fine, as in pgx's Exec with no arguments);
+// with arguments, the extended protocol, parameters bound in text format
+// (a NULL as length -1, a blob as bytea's "\x" hex, a bool as t/f, a float
+// as %.17g). Results come back in text format; a bytea column is decoded
+// from hex (or the escape format) to its bytes, every other value is the
+// server's text, which sql's accessors convert. Column type names are
+// pgx's DatabaseTypeName for the built-in types ("INT4", "TEXT", ...).
+// Not ported: binary format, arrays/composites/ranges decoding (they come
+// back as Postgres' text), the statement cache, the pgx.ConnConfig
+// registry (RegisterConnConfig), named arguments.
+
+import std.string
+import std.bytes
+import std.encoding
+import sql
+import sql.postgres.pgconn
+import sql.postgres.pgproto3
+
+exports(
+    register, driver, encode_value, decode_bytea, type_name, OID_BYTEA,
+    PgHandle, conn_of
+)
+
+const OID_BOOL = 16
+const OID_BYTEA = 17
+
+struct PgHandle {
+    c: *pgconn.PgConn
+    seq: int
+}
+
+struct PgStmt {
+    sd: *pgconn.StatementDescription
+}
+
+// pgx's DatabaseTypeName for the common OIDs ("" for others; the OID's
+// number is not a name).
+type_name(oid: long) -> string {
+    if oid == 16 { return "BOOL" }
+    if oid == 17 { return "BYTEA" }
+    if oid == 18 { return "CHAR" }
+    if oid == 19 { return "NAME" }
+    if oid == 20 { return "INT8" }
+    if oid == 21 { return "INT2" }
+    if oid == 23 { return "INT4" }
+    if oid == 25 { return "TEXT" }
+    if oid == 26 { return "OID" }
+    if oid == 114 { return "JSON" }
+    if oid == 700 { return "FLOAT4" }
+    if oid == 701 { return "FLOAT8" }
+    if oid == 869 { return "INET" }
+    if oid == 1042 { return "BPCHAR" }
+    if oid == 1043 { return "VARCHAR" }
+    if oid == 1082 { return "DATE" }
+    if oid == 1083 { return "TIME" }
+    if oid == 1114 { return "TIMESTAMP" }
+    if oid == 1184 { return "TIMESTAMPTZ" }
+    if oid == 1186 { return "INTERVAL" }
+    if oid == 1700 { return "NUMERIC" }
+    if oid == 2950 { return "UUID" }
+    if oid == 3802 { return "JSONB" }
+    return ""
+}
+
+// A value's text form for a text-format parameter, and whether it is NULL.
+encode_value(v: sql.Value) -> (string, bool) {
+    k = v.kind
+    if k == sql.KIND_NULL { return "", true }
+    if k == sql.KIND_BOOL {
+        if v.b { return "t", false }
+        return "f", false
+    }
+    if k == sql.KIND_BYTES {
+        return "\\x${encoding.hex_encode(string.bytes(v.s))}", false
+    }
+    return sql.value_text(v), false
+}
+
+fn hexval(c: int) -> int {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return -1
+}
+
+// bytea's text output, hex ("\x0102") or the escape format ("a\001\\"), as
+// its bytes in a string.
+decode_bytea(src: string) -> (string, string) {
+    b = string.bytes(src)
+    byte[] out = []
+    if b.len >= 2 && b[0] == 92 && b[1] == 120 {
+        if (b.len - 2) % 2 != 0 { return "", "encoding/hex: odd length hex string" }
+        i = 2
+        while i < b.len {
+            hi = hexval(b[i] as int)
+            lo = hexval(b[i + 1] as int)
+            if hi < 0 || lo < 0 { return "", "encoding/hex: invalid byte" }
+            out.push(((hi << 4) | lo) as byte)
+            i = i + 2
+        }
+        return bytes.string_from_slice(out), ""
+    }
+    i = 0
+    while i < b.len {
+        if b[i] == 92 {
+            if i + 1 < b.len && b[i + 1] == 92 {
+                out.push(92 as byte)
+                i = i + 2
+            } else if i + 3 < b.len {
+                v = ((b[i + 1] as int) - 48) * 64 + ((b[i + 2] as int) - 48) * 8 + ((b[i + 3] as int) - 48)
+                out.push((v & 255) as byte)
+                i = i + 4
+            } else {
+                return "", "invalid bytea escape"
+            }
+        } else {
+            out.push(b[i])
+            i = i + 1
+        }
+    }
+    return bytes.string_from_slice(out), ""
+}
+
+
+// The pgconn connection under a sql handle (for a caller who needs
+// ParameterStatus, the PID, the last PgError).
+conn_of(h: ptr) -> *pgconn.PgConn { return (h as *PgHandle).c }
+
+fn args_text(args: sql.Value[]) -> (string[], bool[]) {
+    string[] vals = []
+    bool[] nulls = []
+    for a in args {
+        t, n = encode_value(a)
+        vals.push(t)
+        nulls.push(n)
+    }
+    return vals, nulls
+}
+
+fn fill_rows(r: *pgconn.Result, rows_p: ptr) -> string {
+    rows = rows_p as *sql.Rows
+    string[] names = []
+    string[] types = []
+    bool[] is_bytea = []
+    for f in r.fields {
+        names.push(f.name)
+        types.push(type_name(f.data_type_oid))
+        is_bytea.push(f.data_type_oid == OID_BYTEA)
+    }
+    sql.rows_set_columns(rows, names, types)
+    ncols = names.len
+    i = 0
+    while i < r.nrows {
+        string[] vals = []
+        bool[] nulls = []
+        j = 0
+        while j < ncols {
+            k = i * ncols + j
+            v = r.values[k]
+            n = r.nulls[k]
+            if !n && is_bytea[j] {
+                d, derr = decode_bytea(v)
+                if derr != "" { return "can't scan into dest[${j}]: ${derr}" }
+                v = d
+            }
+            vals.push(v)
+            nulls.push(n)
+            j = j + 1
+        }
+        sql.rows_append(rows, vals, nulls)
+        i = i + 1
+    }
+    return ""
+}
+
+fn set_result(tag: string, res_p: ptr) {
+    res = res_p as *sql.Result
+    res.tag = tag
+    res.rows_affected = pgconn.rows_affected(tag)
+    res.has_last_insert_id = false
+}
+
+// ---- the vtable ----
+
+fn d_connect(dsn: string, conn_p: ptr) -> string {
+    c, err = pgconn.connect(dsn)
+    if err != "" { return err }
+    h = heap.new(PgHandle)
+    h.c = c
+    h.seq = 0
+    conn = conn_p as *sql.Conn
+    conn.handle = h as ptr
+    return ""
+}
+
+fn d_close(h: ptr) -> string { return pgconn.close((h as *PgHandle).c) }
+
+fn d_ping(h: ptr) -> string {
+    c = (h as *PgHandle).c
+    if pgconn.is_closed(c) { return "driver: bad connection" }
+    err = pgconn.ping(c)
+    if err != "" {
+        pgconn.close(c)
+        return "driver: bad connection"
+    }
+    return ""
+}
+
+fn d_exec(h: ptr, q: string, args: sql.Value[], res_p: ptr) -> string {
+    c = (h as *PgHandle).c
+    if args.len == 0 {
+        rs, err = pgconn.exec(c, q)
+        if err != "" { return err }
+        tag = ""
+        if rs.len > 0 { tag = (rs[rs.len - 1] as *pgconn.Result).tag }
+        set_result(tag, res_p)
+        return ""
+    }
+    vals, nulls = args_text(args)
+    r, err = pgconn.exec_params(c, q, vals, nulls)
+    if err != "" { return err }
+    set_result(r.tag, res_p)
+    return ""
+}
+
+fn d_query(h: ptr, q: string, args: sql.Value[], rows_p: ptr) -> string {
+    c = (h as *PgHandle).c
+    if args.len == 0 {
+        rs, err = pgconn.exec(c, q)
+        if err != "" { return err }
+        if rs.len == 0 { return "" }
+        // the first statement's result, as pgx's Query reads
+        return fill_rows(rs[0] as *pgconn.Result, rows_p)
+    }
+    vals, nulls = args_text(args)
+    r, err = pgconn.exec_params(c, q, vals, nulls)
+    if err != "" { return err }
+    return fill_rows(r, rows_p)
+}
+
+fn d_prepare(h: ptr, q: string, st_p: ptr) -> string {
+    ph = (h as *PgHandle)
+    ph.seq = ph.seq + 1
+    name = "aesql_stmt_${ph.seq}"
+    sd, err = pgconn.prepare(ph.c, name, q)
+    if err != "" { return err }
+    ps = heap.new(PgStmt)
+    ps.sd = sd
+    st = st_p as *sql.Stmt
+    st.handle = ps as ptr
+    st.inputs = sd.param_oids.len
+    return ""
+}
+
+fn d_stmt_exec(h: ptr, sh: ptr, args: sql.Value[], res_p: ptr) -> string {
+    ps = sh as *PgStmt
+    vals, nulls = args_text(args)
+    r, err = pgconn.exec_prepared((h as *PgHandle).c, ps.sd, vals, nulls)
+    if err != "" { return err }
+    set_result(r.tag, res_p)
+    return ""
+}
+
+fn d_stmt_query(h: ptr, sh: ptr, args: sql.Value[], rows_p: ptr) -> string {
+    ps = sh as *PgStmt
+    vals, nulls = args_text(args)
+    r, err = pgconn.exec_prepared((h as *PgHandle).c, ps.sd, vals, nulls)
+    if err != "" { return err }
+    return fill_rows(r, rows_p)
+}
+
+fn d_stmt_close(h: ptr, sh: ptr) -> string {
+    ps = sh as *PgStmt
+    return pgconn.deallocate((h as *PgHandle).c, ps.sd.name)
+}
+
+fn d_begin(h: ptr) -> string {
+    _, err = pgconn.exec((h as *PgHandle).c, "begin")
+    return err
+}
+
+// pgx's Tx.Commit: a COMMIT that the server answers ROLLBACK (the
+// transaction had failed) is ErrTxCommitRollback.
+fn d_commit(h: ptr) -> string {
+    rs, err = pgconn.exec((h as *PgHandle).c, "commit")
+    if err != "" { return err }
+    if rs.len > 0 && (rs[0] as *pgconn.Result).tag == "ROLLBACK" {
+        return "commit unexpectedly resulted in rollback"
+    }
+    return ""
+}
+
+fn d_rollback(h: ptr) -> string {
+    _, err = pgconn.exec((h as *PgHandle).c, "rollback")
+    return err
+}
+
+fn d_is_bad(h: ptr) -> bool { return pgconn.is_closed((h as *PgHandle).c) }
+
+// The driver's vtable (one value; register() puts it in sql's registry).
+driver() -> *sql.Driver {
+    d = sql.new_driver("pgx/v5")
+    d.connect = d_connect as fn(string, ptr) -> string
+    d.close = d_close as fn(ptr) -> string
+    d.ping = d_ping as fn(ptr) -> string
+    d.exec = d_exec as fn(ptr, string, sql.Value[], ptr) -> string
+    d.query = d_query as fn(ptr, string, sql.Value[], ptr) -> string
+    d.prepare = d_prepare as fn(ptr, string, ptr) -> string
+    d.stmt_exec = d_stmt_exec as fn(ptr, ptr, sql.Value[], ptr) -> string
+    d.stmt_query = d_stmt_query as fn(ptr, ptr, sql.Value[], ptr) -> string
+    d.stmt_close = d_stmt_close as fn(ptr, ptr) -> string
+    d.begin = d_begin as fn(ptr) -> string
+    d.commit = d_commit as fn(ptr) -> string
+    d.rollback = d_rollback as fn(ptr) -> string
+    d.is_bad = d_is_bad as fn(ptr) -> bool
+    return d
+}
+
+// Register the driver as "postgres", "pgx" and "pgx/v5" (pgx stdlib's
+// init, and lib/pq's name). Idempotent.
+register() {
+    d = driver()
+    sql.register("pgx/v5", d)
+    sql.register("pgx", d)
+    sql.register("postgres", d)
+}

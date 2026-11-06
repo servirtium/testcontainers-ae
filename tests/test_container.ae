@@ -1,0 +1,385 @@
+// Ported from testcontainers-go docker_test.go, container_test.go, docker_exec_test.go, docker_files_test.go, file_test.go, lifecycle_test.go, mounts_test.go, options_test.go, generic_test.go, image_substitutors_test.go
+//
+// A container's whole life against the real engine: the request's
+// settings as the engine reports them, ports, state, exec, files in and
+// out, logs, hooks, start/stop, terminate.
+
+import std.spec
+import std.string
+import std.json
+import std.fs
+import std.tcp
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.wait
+import testcontainers.testing
+
+const ALPINE = "alpine:3"
+
+fn jstr(doc: ptr, a: string, b: string) -> string {
+    o, _ = json.object_get(doc, a)
+    v, _ = json.object_get(o, b)
+    if v == null { return "" }
+    if json.json_type(v) == json.JSON_STRING {
+        s, _ = json.get_string(v)
+        return s
+    }
+    if json.json_type(v) == json.JSON_BOOL { return "${json.json_get_bool(v)}" }
+    t, _ = json.encode(v)
+    return t
+}
+
+fn sleeper() -> (*docker.Container, string) {
+    return tc.run(ALPINE) { cmd(["sleep", "300"]) }
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "a container's request") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("reaches the engine: env, cmd, entrypoint, labels, workdir, user, hostname, name") callback {
+            nm = "tcae-req-${string.substring(tc.session_id(), 0, 8)}"
+            c, err = tc.run(ALPINE) {
+                env("A", "1")
+                env("B", "two words")
+                env("A", "3")                 // a later value replaces
+                entrypoint(["/bin/sh", "-c"])
+                cmd(["echo started; sleep 300"])
+                label("team", "aether")
+                workdir("/tmp")
+                user("nobody")
+                hostname("tcae-host")
+                name(nm)
+                wait_for(wait.for_log("started"))
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "run")
+            if err != "" { return }
+            doc, ierr = tc.inspect(c)
+            spec.assert_ok(ierr, "inspect")
+            envs = jstr(doc, "Config", "Env")
+            spec.assert_contains(envs, "\"A=3\"", "the later env value")
+            spec.assert_false(string.contains(envs, "\"A=1\"") == 1, "the earlier value is gone")
+            spec.assert_contains(envs, "\"B=two words\"", "a value with a space")
+            spec.assert_str_eq(jstr(doc, "Config", "Cmd"), "[\"echo started; sleep 300\"]", "cmd")
+            spec.assert_str_eq(jstr(doc, "Config", "Entrypoint"), "[\"/bin/sh\",\"-c\"]", "entrypoint")
+            spec.assert_str_eq(jstr(doc, "Config", "WorkingDir"), "/tmp", "workdir")
+            spec.assert_str_eq(jstr(doc, "Config", "User"), "nobody", "user")
+            spec.assert_str_eq(jstr(doc, "Config", "Hostname"), "tcae-host", "hostname")
+            labels = jstr(doc, "Config", "Labels")
+            spec.assert_contains(labels, "\"team\":\"aether\"", "a custom label")
+            spec.assert_contains(labels, "\"org.testcontainers.sessionId\":\"${tc.session_id()}\"", "the session label")
+            spec.assert_contains(labels, "\"org.testcontainers.lang\":\"aether\"", "the lang label")
+            n, _ = json.object_get(doc, "Name")
+            ns, _ = json.get_string(n)
+            spec.assert_str_eq(ns, "/${nm}", "name")
+            json.free(doc)
+            code, out, _ = tc.exec(c, ["sh", "-c", "id -un; pwd; hostname"])
+            spec.assert_eq(code, 0, "exec")
+            spec.assert_str_eq(out, "nobody\n/tmp\ntcae-host\n", "the process runs as the request said")
+        }
+
+        spec.it("publishes exposed ports, and pins a fixed one") callback {
+            c, err = tc.run("nginx:alpine") {
+                expose("80/tcp")
+                expose("18089:81/tcp")
+                wait_for(wait.for_listening_port("80/tcp"))
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "nginx runs")
+            if err != "" { return }
+            p, perr = tc.mapped_port(c, "80")
+            spec.assert_ok(perr, "mapped port")
+            spec.assert_true(p > 0, "a host port")
+            p81, _ = tc.mapped_port(c, "81/tcp")
+            spec.assert_eq(p81, 18089, "the pinned host port")
+            _, merr = tc.mapped_port(c, "9999/tcp")
+            spec.assert_err_contains(merr, "not mapped", "an unexposed port")
+            ep, _ = tc.endpoint(c, "80/tcp", "http")
+            spec.assert_str_eq(ep, "http://localhost:${p}", "PortEndpoint")
+            low, _ = tc.endpoint(c, "", "")
+            spec.assert_str_eq(low, "localhost:${p}", "Endpoint: the lowest exposed port")
+            h, _ = tc.host(c)
+            sock, cerr = tcp.connect(h, p)
+            spec.assert_ok(cerr, "the mapped port answers on ${h}")
+            if cerr == "" {
+                tcp.write(sock, "GET / HTTP/1.0\r\n\r\n")
+                resp, _ = tcp.read(sock, 4096)
+                spec.assert_contains(resp, "200 OK", "nginx answered")
+                tcp.tcp_close(sock)
+            }
+            ip, ierr = tc.container_ip(c)
+            spec.assert_ok(ierr, "container ip")
+            spec.assert_true(string.length(ip) > 0, "an IP on the default network")
+        }
+
+        spec.it("applies the modifiers to the documents sent") callback {
+            c, err = tc.run(ALPINE) {
+                cmd(["sleep", "300"])
+                config_modifier(|cfg: ptr| { json.set(cfg, "StopSignal", json.str("SIGKILL")) })
+                host_config_modifier(|hc: ptr| { json.set(hc, "ReadonlyRootfs", json.boolean(1)) })
+                tmpfs("/scratch", "rw,size=1m")
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "run")
+            if err != "" { return }
+            doc, _ = tc.inspect(c)
+            sig = jstr(doc, "Config", "StopSignal")
+            spec.assert_true(sig == "SIGKILL" || sig == "9", "config modifier (Podman reports the number): ${sig}")
+            spec.assert_str_eq(jstr(doc, "HostConfig", "ReadonlyRootfs"), "1", "host config modifier")
+            json.free(doc)
+            code, _, _ = tc.exec(c, ["sh", "-c", "touch /should-fail"])
+            spec.assert_not_eq(code, 0, "the root filesystem is read-only")
+            code2, out2, _ = tc.exec(c, ["sh", "-c", "echo hi > /scratch/x && cat /scratch/x && grep /scratch /proc/mounts"])
+            spec.assert_eq(code2, 0, "the tmpfs is writable")
+            spec.assert_contains(out2, "tmpfs", "and is a tmpfs")
+        }
+
+        spec.it("mounts a host directory and a named volume") callback {
+            // under the repository: a Podman machine shares the home directory
+            fs.mkdir_p("build")
+            base, _, _ = fs.realpath("build")
+            dir, _ = fs.make_temp_dir(base, "bind")
+            fs.write("${dir}/hello.txt", "from the host\n")
+            vol = "tcae-vol-${string.substring(tc.session_id(), 0, 8)}"
+            c, err = tc.run(ALPINE) {
+                cmd(["sleep", "300"])
+                bind_ro(dir, "/data")
+                volume(vol, "/vol")
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "run")
+            if err != "" { return }
+            code, out, _ = tc.exec(c, ["sh", "-c", "cat /data/hello.txt && echo v > /vol/f && cat /vol/f"])
+            spec.assert_eq(code, 0, "exec in the mounts")
+            spec.assert_str_eq(out, "from the host\nv\n", "the bind mount and the volume")
+            cl, _ = docker.client()
+            st, vbody, _ = docker.api(cl, "GET", "/volumes/${vol}", "")
+            spec.assert_eq(st, 200, "the volume exists")
+            spec.assert_contains(vbody, tc.session_id(), "labelled with the session, so the reaper removes it")
+            tc.terminate(c)
+            spec.assert_ok(docker.remove_volume(cl, vol), "remove the volume")
+            fs.remove_tree(dir)
+        }
+    }
+
+    spec.describe(fw, "exec") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("returns the exit code and the output, split or interleaved") callback {
+            c, err = sleeper()
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "run")
+            if err != "" { return }
+            code, out, eerr = tc.exec(c, ["sh", "-c", "echo one; echo two >&2; exit 7"])
+            spec.assert_ok(eerr, "exec")
+            spec.assert_eq(code, 7, "the exit code")
+            spec.assert_contains(out, "one\n", "stdout in the output")
+            spec.assert_contains(out, "two\n", "stderr in the output")
+            string[] envs = []
+            envs.push("GREETING=hello")
+            res, rerr = tc.exec_with(c, ["sh", "-c", "echo $GREETING; pwd; id -u; echo oops >&2"], "nobody", "/tmp", envs)
+            spec.assert_ok(rerr, "exec_with")
+            spec.assert_str_eq(res.stdout, "hello\n/tmp\n65534\n", "env, workdir and user")
+            spec.assert_str_eq(res.stderr, "oops\n", "stderr apart")
+            spec.assert_eq(res.exit_code, 0, "exit code")
+            big, _, _ = tc.exec(c, ["sh", "-c", "head -c 200000 /dev/zero | tr '\\0' 'x'"])
+            _, bigout, _ = tc.exec(c, ["sh", "-c", "head -c 200000 /dev/zero | tr '\\0' 'x'"])
+            spec.assert_eq(big, 0, "a large output")
+            spec.assert_eq(string.length(bigout), 200000, "every byte of a 200 KB output")
+            _, _, xerr = tc.exec(c, ["/no/such/binary"])
+            code3, _, _ = tc.exec(c, ["/no/such/binary"])
+            spec.assert_true(xerr != "" || code3 != 0, "a missing binary fails")
+        }
+    }
+
+    spec.describe(fw, "files") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("copies files and content in before start, with their modes") callback {
+            dir, _ = fs.make_temp_dir("", "tcae-files")
+            fs.write("${dir}/script.sh", "#!/bin/sh\necho script ran\n")
+            fs.mkdir_p("${dir}/tree/sub")
+            fs.write("${dir}/tree/a.txt", "A")
+            fs.write("${dir}/tree/sub/b.txt", "B")
+            c, err = tc.run(ALPINE) {
+                file("${dir}/script.sh", "/opt/script.sh", 493)
+                file_content("inline text\n", "/etc/tcae/inline.txt", 420)
+                file("${dir}/tree", "/srv/tree", 420)
+                cmd(["sh", "-c", "/opt/script.sh; cat /etc/tcae/inline.txt; cat /srv/tree/a.txt /srv/tree/sub/b.txt; echo; sleep 300"])
+                wait_for(wait.for_log("AB"))
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "the files were there when the command started")
+            out, _ = tc.logs(c)
+            spec.assert_str_eq(out, "script ran\ninline text\nAB\n", "each file's content")
+            code, mode, _ = tc.exec(c, ["stat", "-c", "%a", "/opt/script.sh", "/etc/tcae/inline.txt"])
+            spec.assert_eq(code, 0, "stat")
+            spec.assert_str_eq(mode, "755\n644\n", "the modes asked for")
+            fs.remove_tree(dir)
+        }
+
+        spec.it("puts a file at its path and a directory in the path's parent, as Go's WithFiles") callback {
+            dir, _ = fs.make_temp_dir("", "tcae-files")
+            fs.write("${dir}/one.txt", "one")
+            fs.mkdir_p("${dir}/data/sub")
+            fs.write("${dir}/data/a.txt", "A")
+            fs.write("${dir}/data/sub/b.txt", "B")
+            c, err = tc.run(ALPINE) {
+                // a file: exactly at the path, its missing parents made
+                file("${dir}/one.txt", "/made/for/one.txt", 420)
+                // a directory: extracted into Dir(path) under its own name, so
+                // "data" to "/data" is /data, not /data/data ...
+                file("${dir}/data", "/data", 0)
+                // ... to "/opt/other" is /opt/data (Go's rule: the base name
+                // is the host directory's) ...
+                file("${dir}/data", "/opt/other", 0)
+                // ... and to "/srv/" is /srv/data
+                file("${dir}/data", "/srv/", 0)
+                cmd(["sleep", "300"])
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "run")
+            if err == "" {
+                code, out, _ = tc.exec(c, ["sh", "-c", "cat /made/for/one.txt; echo; cat /data/a.txt /data/sub/b.txt; echo; cat /opt/data/a.txt; echo; cat /srv/data/sub/b.txt; echo; ls /data; test -e /data/data || echo no-nesting; test -e /opt/other || echo no-other"])
+                spec.assert_eq(code, 0, "exec: ${out}")
+                spec.assert_str_eq(out, "one\nAB\nA\nB\na.txt\nsub\nno-nesting\nno-other\n", "where each copy landed")
+                // the same rule on a running container
+                spec.assert_ok(tc.copy_dir_to_container(c, "${dir}/data/", "/tmp/data", 0), "copy a directory in (a trailing / on the host path is fine)")
+                spec.assert_ok(tc.copy_file_to_container(c, "${dir}/one.txt", "/tmp/x/y/one.txt", 420), "copy a file in")
+                code2, out2, _ = tc.exec(c, ["sh", "-c", "cat /tmp/data/sub/b.txt /tmp/x/y/one.txt"])
+                spec.assert_eq(code2, 0, "exec")
+                spec.assert_str_eq(out2, "Bone", "at /tmp/data and /tmp/x/y/one.txt")
+                spec.assert_err_contains(tc.copy_to_container(c, "x", "/", 420), "invalid container file path", "/ is not a file path")
+                spec.assert_err_contains(tc.copy_to_container(c, "x", "../x", 420), "escapes", "nor is one that climbs out")
+            }
+            fs.remove_tree(dir)
+        }
+
+        spec.it("copies to and from a running container, binary-safe") callback {
+            c, err = sleeper()
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "run")
+            if err != "" { return }
+            data = "bin\x00ary\x01\x02\xff end"
+            cerr = tc.copy_to_container(c, data, "/tmp/deep/dir/blob.bin", 384)
+            spec.assert_ok(cerr, "copy in")
+            back, berr = tc.copy_file_from_container(c, "/tmp/deep/dir/blob.bin")
+            spec.assert_ok(berr, "copy out")
+            spec.assert_eq(string.length(back), string.length(data), "the same number of bytes")
+            spec.assert_true(back == data, "the same bytes")
+            _, nerr = tc.copy_file_from_container(c, "/no/such/file")
+            spec.assert_err(nerr, "a missing file is an error")
+            code, _, _ = tc.exec(c, ["test", "-f", "/tmp/deep/dir/blob.bin"])
+            spec.assert_eq(code, 0, "the parents were made")
+        }
+    }
+
+    spec.describe(fw, "lifecycle") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("runs the hooks in Go's order") callback {
+            seen = ref(0)
+            order = ""
+            c, err = tc.run(ALPINE) {
+                cmd(["sleep", "300"])
+                on_pre_create(|c: *docker.Container| { order = "${order}pre-create(${string.length(c.id)}) "; return "" })
+                on_post_create(|c: *docker.Container| { order = "${order}post-create "; return "" })
+                on_pre_start(|c: *docker.Container| { order = "${order}pre-start "; return "" })
+                on_post_start(|c: *docker.Container| { order = "${order}post-start(${docker.is_running(c)}) "; return "" })
+                on_post_ready(|c: *docker.Container| { order = "${order}post-ready "; return "" })
+                on_pre_stop(|c: *docker.Container| { order = "${order}pre-stop "; return "" })
+                on_post_stop(|c: *docker.Container| { order = "${order}post-stop "; return "" })
+                on_pre_terminate(|c: *docker.Container| { order = "${order}pre-terminate "; return "" })
+                on_post_terminate(|c: *docker.Container| { order = "${order}post-terminate"; ref_set(seen, 1); return "" })
+                startup_command(["sh", "-c", "echo s > /tmp/startup"])
+                after_ready_command(["sh", "-c", "echo r > /tmp/ready"])
+            }
+            spec.assert_ok(err, "run")
+            if err != "" { return }
+            code, out, _ = tc.exec(c, ["cat", "/tmp/startup", "/tmp/ready"])
+            spec.assert_eq(code, 0, "the startup and after-ready commands ran")
+            spec.assert_str_eq(out, "s\nr\n", "both")
+            spec.assert_ok(tc.stop(c, 1s), "stop")
+            spec.assert_false(tc.is_running(c), "stopped")
+            spec.assert_ok(tc.terminate(c), "terminate")
+            spec.assert_str_eq(order, "pre-create(0) post-create pre-start post-start(true) post-ready pre-stop post-stop pre-terminate post-terminate", "the order")
+            spec.assert_eq(ref_get(seen) as int, 1, "post-terminate ran")
+            ref_free(seen)
+        }
+
+        spec.it("fails the run with a hook's error, and returns the container") callback {
+            c, err = tc.run(ALPINE) {
+                cmd(["sleep", "300"])
+                on_post_start(|c: *docker.Container| { return "not today" })
+            }
+            testing.cleanup_container(c)
+            spec.assert_err_contains(err, "not today", "the hook's error")
+            spec.assert_not_null(c, "the container, to terminate")
+        }
+
+        spec.it("creates without starting, then starts, stops and starts again") callback {
+            c, err = tc.create(ALPINE) { cmd(["sleep", "300"]) }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "create")
+            st, _ = tc.state_of(c)
+            spec.assert_str_eq(st.status, "created", "created, not running")
+            spec.assert_ok(tc.start(c), "start")
+            spec.assert_true(tc.is_running(c), "running")
+            spec.assert_ok(tc.stop(c, 1s), "stop")
+            st2, _ = tc.state_of(c)
+            spec.assert_false(st2.running, "stopped")
+            spec.assert_ok(tc.start(c), "start again")
+            spec.assert_true(tc.is_running(c), "running again")
+        }
+
+        spec.it("terminates: removed, idempotent, null-safe") callback {
+            c, err = sleeper()
+            spec.assert_ok(err, "run")
+            cid = tc.id(c)
+            spec.assert_ok(tc.terminate(c), "terminate")
+            spec.assert_ok(tc.terminate(c), "again")
+            spec.assert_ok(tc.terminate(null), "null")
+            cl, _ = docker.client()
+            gone = docker.container_new(cl, cid, "")
+            _, ierr = docker.inspect(gone)
+            spec.assert_true(docker.is_not_found(ierr), "the engine no longer has it")
+        }
+
+        spec.it("reports a container that exits as the wait's failure, at once") callback {
+            c, err = tc.run(ALPINE) {
+                cmd(["sh", "-c", "echo bye; exit 3"])
+                wait_for(wait.for_log("never printed") { with_startup_timeout(30s) })
+            }
+            testing.cleanup_container(c)
+            spec.assert_err_contains(err, "exited with code 3", "the exit code, not a timeout")
+            st, _ = tc.state_of(c)
+            spec.assert_eq(st.exit_code, 3, "state has the exit code")
+            out, errs, _ = tc.logs_split(c)
+            spec.assert_str_eq(out, "bye\n", "stdout")
+            spec.assert_str_eq(errs, "", "stderr")
+        }
+
+        spec.it("substitutes the image name") callback {
+            c, err = tc.run("no-such-image-anywhere:1") {
+                image_substitutor(|img: string| -> "alpine:3")
+                cmd(["sleep", "300"])
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "the substituted image ran")
+            spec.assert_str_eq(tc.image_of(c), "alpine:3", "the image used")
+        }
+
+        spec.it("fails cleanly on an image that does not exist") callback {
+            c, err = tc.run("docker.io/testcontainersae/does-not-exist:never")
+            testing.cleanup_container(c)
+            spec.assert_null(c, "no container")
+            spec.assert_err_contains(err, "pull", "a pull error")
+        }
+    }
+
+    return spec.run_summary(fw)
+}

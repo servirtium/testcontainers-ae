@@ -1,0 +1,90 @@
+// Ported from testcontainers-go modules/aerospike/aerospike_test.go
+//
+// A real Aerospike (TestAeroSpike): the module's wait strategy passed, and
+// the client port answers the Aerospike info protocol (a "build" request)
+// with the server build, sent as bytes over std.tcp. A custom env var is
+// visible in the container (applies-container-customizations).
+
+import std.spec
+import std.string
+import std.tcp
+import std.bytes
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.aerospike
+
+const IMAGE = "aerospike/aerospike-server:latest"
+
+// Info protocol: header version 2, type 1 (info), 6-byte length, then the
+// text request. Returns the response body text ("build\t7.2.0.1\n").
+fn info(host: string, port: int, request: string) -> (string, string) {
+    sock, cerr = tcp.connect(host, port)
+    if cerr != "" { return "", cerr }
+    n = string.length(request)
+    p = bytes.new(64)
+    bytes.set(p, 0, 2)
+    bytes.set(p, 1, 1)
+    i = 2
+    while i < 7 { bytes.set(p, i, 0); i = i + 1 }
+    bytes.set(p, 7, n)
+    bytes.copy_from_string(p, 8, request, n)
+    _, werr = tcp.write_all(sock, bytes.view(p))
+    bytes.free(p)
+    if werr != "" { tcp.tcp_close(sock); return "", werr }
+    buf = bytes.new(1024)
+    got = 0
+    tries = 0
+    while got < 9 && tries < 100 {
+        m, rerr = tcp.read_into(sock, bytes.capacity_view(buf))
+        if rerr != "" && rerr != "timeout" { break }
+        if m > 0 { got = got + m; bytes.set_length(buf, got) }
+        tries = tries + 1
+    }
+    tcp.tcp_close(sock)
+    if got < 9 { bytes.free(buf); return "", "short reply: ${got} bytes" }
+    v = bytes.view(buf)
+    out = ""
+    i = 8
+    while i < got {
+        out = "${out}${string.from_char(v[i] & 255)}"
+        i = i + 1
+    }
+    bytes.free(buf)
+    return out, ""
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/aerospike") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("starts and answers the info protocol (TestAeroSpike valid-image-succeeds)") callback {
+            c, err = aerospike.run(IMAGE)
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "aerospike starts")
+            if err == "" {
+                h, _ = tc.host(c)
+                port, perr = tc.mapped_port(c, aerospike.PORT)
+                spec.assert_ok(perr, "mapped port")
+                out, ierr = info(h, port, "build\n")
+                spec.assert_ok(ierr, "info build")
+                spec.assert_true(string.starts_with(out, "build\t") == 1, "build reply: ${out}")
+            }
+        }
+
+        spec.it("applies container customizations (applies-container-customizations)") callback {
+            c, err = aerospike.run(IMAGE) { tc.env("CUSTOM_ENV", "TEST_ENV=value") }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "aerospike starts")
+            if err == "" {
+                code, out, _ = tc.exec(c, ["sh", "-c", "echo $CUSTOM_ENV:$AEROSPIKE_CONFIG_FILE"])
+                spec.assert_eq(code, 0, "exec")
+                spec.assert_str_eq(string.trim(out), "TEST_ENV=value:/etc/aerospike/aerospike.conf", "caller env plus the module's")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

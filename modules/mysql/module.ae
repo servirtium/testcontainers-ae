@@ -1,0 +1,149 @@
+// Ported from testcontainers-go modules/mysql/mysql.go
+//
+// modules.mysql: a MySQL container. Like modules.postgres, its container
+// type carries the credentials (Go's MySQLContainer { username, password,
+// database }), read back from the request after the caller's block ran.
+//
+//     import modules.mysql
+//
+//     m, err = mysql.run("mysql:8.0.36") {
+//         database("app")
+//         username("app")
+//         password("secret")
+//         scripts(["testdata/schema.sql"])
+//         config_file("testdata/my_8.cnf")
+//     }
+//     defer tc.terminate(m.container)
+//     dsn, _ = mysql.connection_string(m, "tls=skip-verify")
+//     // "app:secret@tcp(localhost:32771)/app?tls=skip-verify"
+//
+// Go applies WithDefaultCredentials and a credentials check AFTER the
+// caller's options; here run does the same on the request once the block has
+// finished: user "root" drops MYSQL_USER and sends the password as
+// MYSQL_ROOT_PASSWORD (or MYSQL_ALLOW_EMPTY_PASSWORD with none), and an
+// empty password for any other user is the error "empty password can be used
+// only with the root user" (the container is not started). Dropped variables
+// are removed from the request (tc.unset_env), as Go deletes them.
+//
+// Not ported: MustConnectionString (no Must* in this port) and the deprecated
+// RunContainer. The DSN connection_string returns is go-sql-driver/mysql's,
+// which this repository's `sql` with `sql.mysql` reads (tests/test_mysql.ae runs ExampleRun_connect through it);
+// wait.for_sql(PORT, "mysql", ...) works with it too.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    MySQLContainer, run, connection_string, database, username, password,
+    config_file, scripts, default_credentials, PORT, ROOT_USER, DEFAULT_USER,
+    DEFAULT_PASSWORD, DEFAULT_DATABASE, DEFAULT_IMAGE,
+    mysql_request_new, mysql_request_free
+)
+
+const PORT = "3306/tcp"
+const ROOT_USER = "root"
+const DEFAULT_USER = "test"
+const DEFAULT_PASSWORD = "test"
+const DEFAULT_DATABASE = "test"
+const DEFAULT_IMAGE = "mysql:8.0.36"
+
+struct MySQLContainer {
+    container: *docker.Container
+    username: string
+    password: string
+    database: string
+}
+
+// The module's defaults: the classic and X protocol ports, test/test/test,
+// and Go's wait on the final "port: 3306" server line.
+mysql_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.expose(r, "33060/tcp")
+    tc.env(r, "MYSQL_USER", DEFAULT_USER)
+    tc.env(r, "MYSQL_PASSWORD", DEFAULT_PASSWORD)
+    tc.env(r, "MYSQL_DATABASE", DEFAULT_DATABASE)
+    tc.wait_for(r, wait.for_log("port: 3306  MySQL Community Server"))
+    return r
+}
+
+mysql_request_free(p: ptr) { tc.request_free(p) }
+
+database(_ctx: ptr, name: string) { tc.env(_ctx, "MYSQL_DATABASE", name) }
+username(_ctx: ptr, user: string) { tc.env(_ctx, "MYSQL_USER", user) }
+password(_ctx: ptr, pw: string) { tc.env(_ctx, "MYSQL_PASSWORD", pw) }
+
+fn base_name(p: string) -> string {
+    rest = p
+    i = string.index_of(rest, "/")
+    while i >= 0 {
+        rest = string.substring(rest, i + 1, string.length(rest))
+        i = string.index_of(rest, "/")
+    }
+    return rest
+}
+
+// Go's WithConfigFile: the host file becomes /etc/mysql/conf.d/my.cnf.
+config_file(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, "/etc/mysql/conf.d/my.cnf", 493)
+}
+
+// Go's WithScripts: host files copied into /docker-entrypoint-initdb.d,
+// which the image runs in name order at first start.
+scripts(_ctx: ptr, host_paths: string[]) {
+    for p in host_paths {
+        tc.file(_ctx, p, "/docker-entrypoint-initdb.d/${base_name(p)}", 493)
+    }
+}
+
+// Go's WithDefaultCredentials, on a request (run calls it after the block;
+// call it yourself only when building a request by hand).
+default_credentials(r: ptr) {
+    user = tc.req_env(r, "MYSQL_USER")
+    pw = tc.req_env(r, "MYSQL_PASSWORD")
+    is_root = string.to_lower(user) == ROOT_USER
+    if is_root { tc.unset_env(r, "MYSQL_USER") }
+    if string.length(pw) != 0 {
+        tc.env(r, "MYSQL_ROOT_PASSWORD", pw)
+    } else if is_root {
+        tc.env(r, "MYSQL_ALLOW_EMPTY_PASSWORD", "yes")
+        tc.unset_env(r, "MYSQL_PASSWORD")
+    }
+}
+
+builder run(image: string) with mysql_request_new -> (*MySQLContainer, string) {
+    r = _builder
+    if r == null { r = mysql_request_new() }
+    default_credentials(r)
+    // Go's validateCreds: no MYSQL_USER at all means root
+    user = ROOT_USER
+    if tc.req_has_env(r, "MYSQL_USER") { user = tc.req_env(r, "MYSQL_USER") }
+    pw = tc.req_env(r, "MYSQL_PASSWORD")
+    if string.length(pw) == 0 && string.to_lower(user) != ROOT_USER {
+        tc.request_free(r)
+        return null, "run mysql: empty password can be used only with the root user"
+    }
+    db = tc.req_env(r, "MYSQL_DATABASE")
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run mysql: ${err}" }
+    m = heap.new(MySQLContainer)
+    m.container = c
+    m.username = user
+    m.password = pw
+    m.database = db
+    if err != "" { return m, "run mysql: ${err}" }
+    return m, ""
+}
+
+// "user:password@tcp(host:port)/db?args" (Go's ConnectionString, the
+// go-sql-driver DSN form; args are joined with &, e.g. "tls=skip-verify",
+// and "" means none).
+connection_string(m: *MySQLContainer, args: string) -> (string, string) {
+    ep, err = tc.endpoint(m.container, PORT, "")
+    if err != "" { return "", err }
+    extra = ""
+    if string.length(args) > 0 { extra = "?${args}" }
+    return "${m.username}:${m.password}@tcp(${ep})/${m.database}${extra}", ""
+}

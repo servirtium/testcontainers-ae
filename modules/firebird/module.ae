@@ -1,0 +1,98 @@
+// Ported from testcontainers-go modules/firebird/firebird.go
+//
+// modules.firebird: a Firebird container (jacobalberty/firebird layout: the
+// database files live in /firebird/data). The container type carries the
+// credentials, as Go's Container does.
+//
+//     import modules.firebird
+//
+//     f, err = firebird.run("jacobalberty/firebird:v3.0") {
+//         database("mydb.fdb")
+//         username("myuser")
+//         password("mypassword")
+//         sysdba_password("mysyspassword")
+//     }
+//     defer tc.terminate(f.container)
+//     dsn, _ = firebird.connection_string(f)
+//     // "firebird://myuser:mypassword@localhost:32771/firebird/data/mydb.fdb?charset=UTF8"
+//
+// Go reads the final credentials back from the container's Config.Env after
+// the start (so overrides are reflected); here run reads them from the
+// request once the block has finished, which is the same values.
+//
+// Not ported: nothing besides what Go leaves to its examples (a Firebird SQL
+// client; Aether's std has none).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    FirebirdContainer, run, connection_string, database, username, password,
+    sysdba_password, PORT, DB_PATH, DEFAULT_IMAGE,
+    firebird_request_new, firebird_request_free
+)
+
+const PORT = "3050/tcp"
+const DEFAULT_IMAGE = "jacobalberty/firebird:v3.0"
+const DEFAULT_DATABASE = "test.fdb"
+const DEFAULT_USER = "test"
+const DEFAULT_PASSWORD = "test"
+// where the jacobalberty/firebird image keeps databases; FIREBIRD_DATABASE
+// is relative to it
+const DB_PATH = "/firebird/data"
+
+struct FirebirdContainer {
+    container: *docker.Container
+    database: string
+    user: string
+    password: string
+}
+
+firebird_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.env(r, "FIREBIRD_DATABASE", DEFAULT_DATABASE)
+    tc.env(r, "FIREBIRD_USER", DEFAULT_USER)
+    tc.env(r, "FIREBIRD_PASSWORD", DEFAULT_PASSWORD)
+    tc.env(r, "ISC_PASSWORD", "masterkey")
+    tc.wait_for(r, wait.for_listening_port(PORT) { with_startup_timeout(60s) })
+    return r
+}
+
+firebird_request_free(p: ptr) { tc.request_free(p) }
+
+database(_ctx: ptr, name: string) { tc.env(_ctx, "FIREBIRD_DATABASE", name) }
+username(_ctx: ptr, user: string) { tc.env(_ctx, "FIREBIRD_USER", user) }
+password(_ctx: ptr, pw: string) { tc.env(_ctx, "FIREBIRD_PASSWORD", pw) }
+sysdba_password(_ctx: ptr, pw: string) { tc.env(_ctx, "ISC_PASSWORD", pw) }
+
+builder run(image: string) with firebird_request_new -> (*FirebirdContainer, string) {
+    r = _builder
+    if r == null { r = firebird_request_new() }
+    db = DEFAULT_DATABASE
+    user = DEFAULT_USER
+    pw = DEFAULT_PASSWORD
+    if tc.req_has_env(r, "FIREBIRD_DATABASE") { db = tc.req_env(r, "FIREBIRD_DATABASE") }
+    if tc.req_has_env(r, "FIREBIRD_USER") { user = tc.req_env(r, "FIREBIRD_USER") }
+    if tc.req_has_env(r, "FIREBIRD_PASSWORD") { pw = tc.req_env(r, "FIREBIRD_PASSWORD") }
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run firebird: ${err}" }
+    f = heap.new(FirebirdContainer)
+    f.container = c
+    f.database = db
+    f.user = user
+    f.password = pw
+    if err != "" { return f, "run firebird: ${err}" }
+    return f, ""
+}
+
+// "firebird://user:password@host:port/firebird/data/<db>?charset=UTF8": the
+// full server-side path, as Go builds it (a bare file name would make
+// clients fail with "database not found").
+connection_string(f: *FirebirdContainer) -> (string, string) {
+    ep, err = tc.endpoint(f.container, PORT, "")
+    if err != "" { return "", err }
+    return "firebird://${f.user}:${f.password}@${ep}${DB_PATH}/${f.database}?charset=UTF8", ""
+}

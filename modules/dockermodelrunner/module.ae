@@ -1,0 +1,132 @@
+// Ported from testcontainers-go modules/dockermodelrunner/dockermodelrunner.go
+// and options.go, with the REST client of its internal/sdk/client.
+//
+// modules.dockermodelrunner: reaches Docker Desktop's Model Runner from the
+// host through a socat container that forwards port 80 to the hostname
+// model-runner.docker.internal (which only Docker Desktop's containers can
+// resolve). STATUS: compile-checked only, and BLOCKED without Docker Desktop:
+// on any other engine (Docker Engine, Podman) that hostname does not exist,
+// so the forwarder has nothing to forward to and the wait for the Model
+// Runner's HTTP 200 on / can never succeed.
+//
+//     import modules.dockermodelrunner
+//
+//     m, err = dockermodelrunner.run() { model("ai/smollm2:360M-Q4_K_M") }
+//     defer dockermodelrunner.terminate(m)
+//     base = dockermodelrunner.base_url(m)       // OpenAI-compatible API under /engines/v1
+//     body, _ = dockermodelrunner.list_models(m) // GET /models
+//
+// Go builds this on its socat module, which is not ported yet; the socat
+// container (alpine/socat, `socat TCP-LISTEN:80,fork,reuseaddr
+// TCP:model-runner.docker.internal:80`) is started here directly.
+//
+// Not ported: the typed ModelResponse structs of the SDK (list_models and
+// inspect_model return the JSON text).
+
+import std.string
+import std.http.client
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    ModelRunner, run, terminate, container_of, base_url, pull_model, list_models,
+    inspect_model, model, ENTRYPOINT, SOCAT_IMAGE,
+    dockermodelrunner_request_new, dockermodelrunner_request_free
+)
+
+const ENTRYPOINT = "model-runner.docker.internal"
+const SOCAT_IMAGE = "alpine/socat:1.8.0.1"
+const S_MODEL = "dmr.model"
+
+struct ModelRunner {
+    container: *docker.Container
+    model: string
+    base: string
+}
+
+dockermodelrunner_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, "80/tcp")
+    tc.entrypoint(r, ["/bin/sh"])
+    tc.cmd(r, ["-c", "socat TCP-LISTEN:80,fork,reuseaddr TCP:${ENTRYPOINT}:80"])
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port("80/tcp"),
+        wait.for_http("/") { with_port("80/tcp"); with_status(200) }
+    ]))
+    return r
+}
+
+dockermodelrunner_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithModel: a model pulled once the runner is reachable, "ai/name:tag".
+model(_ctx: ptr, name: string) { tc.set_setting(_ctx, S_MODEL, name) }
+
+// Go's Run takes no image: the socat default is used.
+builder run() with dockermodelrunner_request_new -> (*ModelRunner, string) {
+    r = _builder
+    if r == null { r = dockermodelrunner_request_new() }
+    wanted = tc.req_setting(r, S_MODEL)
+    m = heap.new(ModelRunner)
+    m.container = null
+    m.model = wanted
+    m.base = ""
+    c, err = tc.run_request(r, SOCAT_IMAGE)
+    m.container = c
+    if err != "" { return m, "run model runner: ${err}" }
+    ep, eerr = tc.endpoint(c, "80/tcp", "http")
+    if eerr != "" { return m, "run model runner: ${eerr}" }
+    m.base = ep
+    if string.length(wanted) > 0 {
+        perr = pull_model(m, wanted)
+        if perr != "" { return m, "pull model: ${perr}" }
+    }
+    return m, ""
+}
+
+terminate(m: *ModelRunner) -> string {
+    if m == null { return "" }
+    return tc.terminate(m.container)
+}
+
+container_of(m: *ModelRunner) -> *docker.Container { return m.container }
+
+// "http://host:port" of the forwarded Model Runner.
+base_url(m: *ModelRunner) -> string { return m.base }
+
+fn call(method: string, url: string, body: string, timeout_s: int) -> (int, string, string) {
+    req = client.request(method, url)
+    client.set_timeout(req, timeout_s * 1s)
+    if string.length(body) > 0 { client.set_body(req, string.bytes(body), "application/json") }
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    st = client.response_status(r)
+    out = client.response_body(r)
+    client.response_free(r)
+    return st, out, ""
+}
+
+// Go's PullModel: POST /models/create {"from": name}; the answer streams
+// progress lines and is read to the end.
+pull_model(m: *ModelRunner, fully_qualified_name: string) -> string {
+    payload = "{\"from\": \"${fully_qualified_name}\"}"
+    st, _, err = call("POST", "${m.base}/models/create", payload, 3600)
+    if err != "" { return "http post: ${err}" }
+    if st != 200 { return "unexpected status code: ${st}" }
+    return ""
+}
+
+// Go's ListModels: the JSON array of models, as text.
+list_models(m: *ModelRunner) -> (string, string) {
+    _, body, err = call("GET", "${m.base}/models", "", 60)
+    if err != "" { return "", "http get: ${err}" }
+    return body, ""
+}
+
+// Go's InspectModel: the JSON of one model, as text.
+inspect_model(m: *ModelRunner, namespace: string, name: string) -> (string, string) {
+    _, body, err = call("GET", "${m.base}/models/${namespace}/${name}", "", 60)
+    if err != "" { return "", "http get: ${err}" }
+    return body, ""
+}

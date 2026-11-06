@@ -1,0 +1,82 @@
+// Ported from testcontainers-go modules/fakegcsserver/fakegcsserver.go and options.go
+//
+// modules.fakegcsserver: a fake-gcs-server container (an in-memory Google
+// Cloud Storage emulator), plain HTTP by default.
+//
+//     import modules.fakegcsserver
+//
+//     g, err = fakegcsserver.run("fsouza/fake-gcs-server:1.56.1") {
+//         scheme("https")
+//     }
+//     defer tc.terminate(g.container)
+//     url, _ = fakegcsserver.storage_url(g)   // "http://localhost:32771/storage/v1"
+//
+// scheme() takes "http" or "https"; anything else makes run return Go's
+// error. Go checks it inside Run; here too (the value is a module setting).
+// With "https" the HTTP wait skips certificate verification, as Go's
+// WithTLS(true).WithAllowInsecure(true): the server makes up its certificate.
+//
+// Not ported: the cloud.google.com/go/storage client of Go's examples.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    Container, run, storage_url, scheme,
+    PORT, DEFAULT_IMAGE, fakegcsserver_request_new, fakegcsserver_request_free
+)
+
+const PORT = "4443/tcp"
+const DEFAULT_IMAGE = "fsouza/fake-gcs-server:1.56.1"
+
+struct Container {
+    container: *docker.Container
+    scheme: string
+}
+
+fakegcsserver_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    return r
+}
+
+fakegcsserver_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithScheme: "http" (default) or "https".
+scheme(_ctx: ptr, s: string) { tc.set_setting(_ctx, "fakegcsserver.scheme", s) }
+
+builder run(image: string) with fakegcsserver_request_new -> (*Container, string) {
+    r = _builder
+    if r == null { r = fakegcsserver_request_new() }
+    sch = "http"
+    if tc.req_has_setting(r, "fakegcsserver.scheme") { sch = tc.req_setting(r, "fakegcsserver.scheme") }
+    if sch != "http" && sch != "https" {
+        tc.request_free(r)
+        return null, "fakegcsserver option: invalid scheme \"${sch}\": must be one of http, https"
+    }
+    tc.cmd(r, ["-scheme", sch, "-port", "4443", "-backend", "memory"])
+    w = wait.for_http("/storage/v1/b") {
+        with_port(PORT)
+        with_status_matcher(|status: int| -> status >= 200 && status < 500)
+    }
+    if sch == "https" { w = wait.with_allow_insecure(w) }
+    tc.wait_for(r, w)
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run fakegcsserver: ${err}" }
+    g = heap.new(Container)
+    g.container = c
+    g.scheme = sch
+    if err != "" { return g, "run fakegcsserver: ${err}" }
+    return g, ""
+}
+
+// "scheme://host:port/storage/v1".
+storage_url(g: *Container) -> (string, string) {
+    host, herr = tc.host(g.container)
+    if herr != "" { return "", "get host: ${herr}" }
+    port, perr = tc.mapped_port(g.container, PORT)
+    if perr != "" { return "", "get mapped port: ${perr}" }
+    return "${g.scheme}://${host}:${port}/storage/v1", ""
+}

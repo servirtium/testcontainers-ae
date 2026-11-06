@@ -1,0 +1,96 @@
+// Ported from testcontainers-go modules/cassandra/cassandra.go, modules/cassandra/options.go,
+// modules/cassandra/executable.go
+//
+// modules.cassandra: an Apache Cassandra container (CQL native protocol 9042).
+//
+//     import modules.cassandra
+//
+//     c, err = cassandra.run("cassandra:4.1.3") {
+//         init_script("testdata/init.cql")      // .cql runs with cqlsh -f, .sh with /bin/sh
+//     }
+//     defer tc.terminate(c)
+//     host, _ = cassandra.connection_host(c)    // "localhost:32771"
+//
+// Like Go the container is ready when 9042 listens and
+// `cqlsh -e "SELECT bootstrapped FROM system.local"` says COMPLETED. The init
+// scripts are copied to / and run after ready (tc.after_ready_command).
+//
+// Not ported: WithTLS and TLSConfig (the module generates a self-signed
+// certificate and a PKCS12 keystore at run time, and returns a *tls.Config;
+// std has no keystore builder), the deprecated RunContainer, and the gocql
+// code of Go's tests and examples.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, connection_host, config_file, init_script, PORT, DEFAULT_IMAGE,
+    cassandra_request_new, cassandra_request_free
+)
+
+const PORT = "9042/tcp"
+const DEFAULT_IMAGE = "cassandra:4.1.3"
+
+fn bootstrapped(body: string) -> bool { return string.contains(body, "COMPLETED") == 1 }
+
+cassandra_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.env(r, "CASSANDRA_SNITCH", "GossipingPropertyFileSnitch")
+    tc.env(r, "JVM_OPTS", "-Dcassandra.skip_wait_for_gossip_to_settle=0 -Dcassandra.initial_token=0")
+    tc.env(r, "HEAP_NEWSIZE", "128M")
+    tc.env(r, "MAX_HEAP_SIZE", "1024M")
+    tc.env(r, "CASSANDRA_ENDPOINT_SNITCH", "GossipingPropertyFileSnitch")
+    tc.env(r, "CASSANDRA_DC", "datacenter1")
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(PORT),
+        wait.for_exec(["cqlsh", "-e", "SELECT bootstrapped FROM system.local"]) {
+            with_response_matcher(|body: string| -> bootstrapped(body))
+        }
+    ]))
+    return r
+}
+
+cassandra_request_free(p: ptr) { tc.request_free(p) }
+
+fn base_name(p: string) -> string {
+    rest = p
+    i = string.index_of(rest, "/")
+    while i >= 0 {
+        rest = string.substring(rest, i + 1, string.length(rest))
+        i = string.index_of(rest, "/")
+    }
+    return rest
+}
+
+// Go's WithConfigFile: /etc/cassandra/cassandra.yaml.
+config_file(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, "/etc/cassandra/cassandra.yaml", 493)
+}
+
+// Go's WithInitScripts, one script a call: copied to /<name> and run once the
+// container is ready (cqlsh -f for .cql, /bin/sh for .sh; others are not run).
+init_script(_ctx: ptr, host_path: string) {
+    name = "/${base_name(host_path)}"
+    tc.file(_ctx, host_path, name, 493)
+    if string.ends_with(name, ".cql") == 1 {
+        tc.after_ready_command(_ctx, ["cqlsh", "-f", name])
+    } else if string.ends_with(name, ".sh") == 1 {
+        tc.after_ready_command(_ctx, ["/bin/sh", name])
+    }
+}
+
+builder run(image: string) with cassandra_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = cassandra_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run cassandra: ${err}" }
+    return c, ""
+}
+
+// "host:port" of the CQL native port (Go's ConnectionHost).
+connection_host(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "")
+}

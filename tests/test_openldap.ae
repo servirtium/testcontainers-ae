@@ -1,0 +1,197 @@
+// Ported from testcontainers-go modules/openldap/openldap_test.go and examples/openldap_test.go
+//
+// A real OpenLDAP: one hand-built BER BindRequest (LDAPv3 simple bind) goes
+// to the mapped port and the BindResponse's result code is read back: 0
+// (success) for the admin credentials, 49 (invalidCredentials) for a wrong
+// password. Go's examples use go-ldap for this; Aether's std has no LDAP
+// client. Loaded LDIF entries are proved by binding as the new user, and by
+// ldapsearch in the container.
+
+import std.spec
+import std.string
+import std.tcp
+import std.json
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.openldap
+
+const IMAGE = "bitnamilegacy/openldap:2.6.6"
+
+const USER_LDIF = "dn: uid=test.user,ou=users,dc=example,dc=org\nchangetype: add\nobjectclass: iNetOrgPerson\ncn: Test User\nsn: Test\nmail: test.user@example.org\nuserPassword: Password1\n"
+
+// Build a simple BindRequest (message id 1, version 3). Lengths are < 128,
+// so every BER length is a single byte.
+// Returns the wire bytes (a string would stop at a NUL).
+fn bind_request(dn: string, pw: string) -> byte[] {
+    dnb = string.bytes(dn)
+    pwb = string.bytes(pw)
+    inner = 3 + 2 + dnb.len + 2 + pwb.len          // version, name, authentication
+    total = 3 + 2 + inner                           // messageID, bindRequest header, inner
+    out = make([]byte, total + 2)
+    k = 0
+    out[k] = 48; k = k + 1                          // SEQUENCE
+    out[k] = total; k = k + 1
+    out[k] = 2; k = k + 1                           // INTEGER messageID 1
+    out[k] = 1; k = k + 1
+    out[k] = 1; k = k + 1
+    out[k] = 96; k = k + 1                          // [APPLICATION 0] BindRequest
+    out[k] = inner; k = k + 1
+    out[k] = 2; k = k + 1                           // INTEGER version 3
+    out[k] = 1; k = k + 1
+    out[k] = 3; k = k + 1
+    out[k] = 4; k = k + 1                           // OCTET STRING name
+    out[k] = dnb.len; k = k + 1
+    i = 0
+    while i < dnb.len { out[k] = dnb[i]; k = k + 1; i = i + 1 }
+    out[k] = 128; k = k + 1                         // [0] simple authentication
+    out[k] = pwb.len; k = k + 1
+    i = 0
+    while i < pwb.len { out[k] = pwb[i]; k = k + 1; i = i + 1 }
+    return out
+}
+
+// Bind and return the BindResponse's resultCode (0 success, 49 invalid credentials).
+fn ldap_bind(url: string, dn: string, pw: string) -> (int, string) {
+    // url is "ldap://host:port"
+    hp = string.substring(url, 7, string.length(url))
+    i = string.index_of(hp, ":")
+    h = string.substring(hp, 0, i)
+    port, _ = string.to_int(string.substring(hp, i + 1, string.length(hp)))
+    sock, cerr = tcp.connect(h, port)
+    if cerr != "" { return -1, "connect ${url}: ${cerr}" }
+    _, werr = tcp.write_all(sock, bind_request(dn, pw))
+    if werr != "" { tcp.tcp_close(sock); return -1, werr }
+    buf = ""
+    tries = 0
+    while string.length(buf) < 14 && tries < 50 {
+        chunk, rerr = tcp.read(sock, 512)
+        if rerr != "" && rerr != "timeout" { break }
+        buf = string.concat(buf, chunk)
+        tries = tries + 1
+    }
+    tcp.tcp_close(sock)
+    b = string.bytes(buf)
+    // 30 LL | 02 01 01 | 61 LL | 0A 01 <result> ...
+    if b.len < 12 { return -1, "a short answer (${b.len} bytes)" }
+    if b[0] != 48 || b[2] != 2 || b[5] != 97 || b[7] != 10 { return -1, "not a BindResponse" }
+    return b[9], ""
+}
+
+fn container_env(c: *docker.Container) -> string {
+    doc, err = tc.inspect(c)
+    if err != "" { return "" }
+    cfg, _ = json.object_get(doc, "Config")
+    ev, _ = json.object_get(cfg, "Env")
+    out = ""
+    n = json.json_array_size(ev)
+    i = 0
+    while i < n {
+        v, _ = json.array_get(ev, i)
+        s, _ = json.get_string(v)
+        out = "${out} ${s}"
+        i = i + 1
+    }
+    json.free(doc)
+    return out
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/openldap") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("binds as the default admin, and refuses a wrong password (TestOpenLDAP)") callback {
+            ol, err = openldap.run(IMAGE)
+            if ol != null { testing.cleanup_container(ol.container) }
+            spec.assert_ok(err, "openldap starts")
+            if err == "" {
+                url, uerr = openldap.connection_string(ol)
+                spec.assert_ok(uerr, "connection string")
+                spec.assert_true(string.starts_with(url, "ldap://") == 1, "an ldap:// URL: ${url}")
+                spec.assert_str_eq(ol.admin_username, "admin", "default user")
+                spec.assert_str_eq(openldap.admin_dn(ol), "cn=admin,dc=example,dc=org", "default admin DN")
+
+                rc, berr = ldap_bind(url, openldap.admin_dn(ol), ol.admin_password)
+                spec.assert_ok(berr, "bind")
+                spec.assert_eq(rc, 0, "the admin bind succeeds (resultCode 0)")
+
+                bad, berr2 = ldap_bind(url, openldap.admin_dn(ol), "not-the-password")
+                spec.assert_ok(berr2, "bind with a wrong password")
+                spec.assert_eq(bad, 49, "a wrong password is invalidCredentials (49)")
+            }
+        }
+
+        spec.it("uses the admin username and password given (TestOpenLDAPWithAdminUsernameAndPassword)") callback {
+            ol, err = openldap.run(IMAGE) {
+                admin_username("openldap")
+                admin_password("openldap")
+            }
+            if ol != null { testing.cleanup_container(ol.container) }
+            spec.assert_ok(err, "openldap starts")
+            if err == "" {
+                url, _ = openldap.connection_string(ol)
+                env = container_env(ol.container)
+                spec.assert_contains(env, "LDAP_ADMIN_USERNAME=openldap", "username in the env")
+                spec.assert_contains(env, "LDAP_ADMIN_PASSWORD=openldap", "password in the env")
+                rc, berr = ldap_bind(url, "cn=openldap,dc=example,dc=org", "openldap")
+                spec.assert_ok(berr, "bind")
+                spec.assert_eq(rc, 0, "the new admin binds")
+                old, _ = ldap_bind(url, "cn=admin,dc=example,dc=org", "adminpassword")
+                spec.assert_eq(old, 49, "the default admin no longer does")
+            }
+        }
+
+        spec.it("uses a different root (TestOpenLDAPWithDifferentRoot)") callback {
+            ol, err = openldap.run(IMAGE) {
+                root("dc=mydomain,dc=com")
+            }
+            if ol != null { testing.cleanup_container(ol.container) }
+            spec.assert_ok(err, "openldap starts")
+            if err == "" {
+                url, _ = openldap.connection_string(ol)
+                spec.assert_contains(container_env(ol.container), "LDAP_ROOT=dc=mydomain,dc=com", "root in the env")
+                spec.assert_str_eq(openldap.admin_dn(ol), "cn=admin,dc=mydomain,dc=com", "admin DN under the new root")
+                rc, berr = ldap_bind(url, openldap.admin_dn(ol), ol.admin_password)
+                spec.assert_ok(berr, "bind")
+                spec.assert_eq(rc, 0, "the admin binds under the new root")
+            }
+        }
+
+        spec.it("loads an LDIF (TestOpenLDAPLoadLdif)") callback {
+            ol, err = openldap.run(IMAGE)
+            if ol != null { testing.cleanup_container(ol.container) }
+            spec.assert_ok(err, "openldap starts")
+            if err == "" {
+                lerr = openldap.load_ldif(ol, USER_LDIF)
+                spec.assert_ok(lerr, "load_ldif")
+                url, _ = openldap.connection_string(ol)
+                rc, berr = ldap_bind(url, "uid=test.user,ou=users,dc=example,dc=org", "Password1")
+                spec.assert_ok(berr, "bind as the loaded user")
+                spec.assert_eq(rc, 0, "the loaded user can bind")
+                bad, _ = ldap_bind(url, "uid=test.user,ou=users,dc=example,dc=org", "wrong")
+                spec.assert_eq(bad, 49, "with a wrong password it cannot")
+                // a malformed LDIF is an error, not silence
+                bad_err = openldap.load_ldif(ol, "dn: nonsense\nchangetype: add\n")
+                spec.assert_true(string.length(bad_err) > 0, "a bad LDIF is reported")
+            }
+        }
+
+        spec.it("loads an initial LDIF at start (TestOpenLDAPWithInitialLdif)") callback {
+            ol, err = openldap.run(IMAGE) {
+                initial_ldif("modules/openldap/testdata/users.ldif")
+            }
+            if ol != null { testing.cleanup_container(ol.container) }
+            spec.assert_ok(err, "openldap starts and loads the LDIF")
+            if err == "" {
+                url, _ = openldap.connection_string(ol)
+                rc, berr = ldap_bind(url, "uid=test.user,ou=users,dc=example,dc=org", "Password1")
+                spec.assert_ok(berr, "bind as the loaded user")
+                spec.assert_eq(rc, 0, "the initially loaded user can bind")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

@@ -1,0 +1,59 @@
+// Ported from testcontainers-go modules/dynamodb/dynamodb.go
+//
+// modules.dynamodb: Amazon's DynamoDB Local.
+//
+//     import modules.dynamodb
+//
+//     c, err = dynamodb.run("amazon/dynamodb-local:2.2.1") { shared_db() }
+//     defer tc.terminate(c)
+//     url, _ = dynamodb.connection_string(c)    // "localhost:32771"
+//
+// Like Go, connection_string is "host:port" with no scheme; the API is
+// plain HTTP, so a client uses "http://" + it.
+//
+// Not ported: the reuse-by-name half of Go's WithSharedDB (the core has no
+// container reuse, DESIGN.md section 10); shared_db() here is just the
+// -sharedDb flag. Go's examples use the AWS SDK for Go v2, which has no
+// Aether counterpart.
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, connection_string, shared_db, disable_telemetry,
+    PORT, DEFAULT_IMAGE, dynamodb_request_new, dynamodb_request_free
+)
+
+const PORT = "8000/tcp"
+const DEFAULT_IMAGE = "amazon/dynamodb-local:2.2.1"
+
+dynamodb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.entrypoint(r, ["java", "-Djava.library.path=./DynamoDBLocal_lib"])
+    tc.cmd(r, ["-jar", "DynamoDBLocal.jar"])
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_listening_port(PORT))
+    return r
+}
+
+dynamodb_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithSharedDB: one database file for all credentials and regions.
+shared_db(_ctx: ptr) { tc.cmd_arg(_ctx, "-sharedDb") }
+
+// Go's WithDisableTelemetry.
+disable_telemetry(_ctx: ptr) { tc.cmd_arg(_ctx, "-disableTelemetry") }
+
+builder run(image: string) with dynamodb_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = dynamodb_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run dynamodb: ${err}" }
+    return c, ""
+}
+
+// "host:port" (Go's ConnectionString).
+connection_string(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "")
+}

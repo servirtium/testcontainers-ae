@@ -1,0 +1,105 @@
+// Ported from testcontainers-go modules/kafka/kafka_test.go (TestKafka)
+//
+// A real Kafka in KRaft mode, started through the starter-script dance
+// (the advertised listener is only known after the port is mapped).
+// One wire exchange on the bootstrap address: an ApiVersions v0 request,
+// answered with the same correlation id and error code 0. Also the cluster
+// id set by cluster_id() is read back (Go: WithClusterID("kraftCluster")),
+// and an image older than 7.4.0 is refused.
+
+import std.spec
+import std.string
+import std.tcp
+import std.bytes
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.kafka
+
+const IMAGE = "confluentinc/confluent-local:7.5.0"
+
+// Read exactly n bytes as hex text.
+fn read_hex(sock: ptr, n: int) -> (string, string) {
+    buf = bytes.new(n + 16)
+    got = 0
+    tries = 0
+    out = ""
+    while got < n && tries < 200 {
+        cv = bytes.capacity_view(buf)
+        m, rerr = tcp.read_into(sock, cv[got..n])
+        if rerr != "" && rerr != "timeout" { bytes.free(buf); return "", rerr }
+        got = got + m
+        tries = tries + 1
+    }
+    if got < n { bytes.free(buf); return "", "short read: ${got} of ${n} bytes" }
+    v = bytes.capacity_view(buf)
+    i = 0
+    while i < n {
+        d = v[i] & 255
+        hexd = "0123456789abcdef"
+        out = "${out}${string.substring(hexd, d / 16, d / 16 + 1)}${string.substring(hexd, d % 16, d % 16 + 1)}"
+        i = i + 1
+    }
+    bytes.free(buf)
+    return out, ""
+}
+
+// ApiVersions v0: size, api key 18, version 0, correlation id, client id "tcae".
+fn api_versions_request(corr: int) -> ptr {
+    b = bytes.new(32)
+    bytes.set_be32(b, 0, 14)
+    bytes.set_be16(b, 4, 18)
+    bytes.set_be16(b, 6, 0)
+    bytes.set_be32(b, 8, corr)
+    bytes.set_be16(b, 12, 4)
+    bytes.copy_from_string(b, 14, "tcae", 4)
+    bytes.set_length(b, 18)
+    return b
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/kafka") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("refuses an image before 7.4.0 (TestKafka, KRaft version check)") callback {
+            k, err = kafka.run("confluentinc/confluent-local:6.3.3")
+            spec.assert_true(k == null, "no container")
+            spec.assert_contains(err, "KRaft mode is only available since version 7.4.0", "the error says why")
+        }
+
+        spec.it("answers ApiVersions on the bootstrap address (TestKafka)") callback {
+            k, err = kafka.run(IMAGE) {
+                cluster_id("kraftCluster")
+            }
+            if k != null { testing.cleanup_container(k.container) }
+            spec.assert_ok(err, "kafka starts")
+            if err == "" {
+                spec.assert_str_eq(k.cluster_id, "kraftCluster", "the cluster id is read back")
+                brokers, berr = kafka.brokers(k)
+                spec.assert_ok(berr, "brokers")
+                spec.assert_eq(brokers.len, 1, "one broker address")
+                hostport = brokers[0]
+                i = string.index_of(hostport, ":")
+                port, _ = string.to_int(string.substring(hostport, i + 1, string.length(hostport)))
+                sock, cerr = tcp.connect(string.substring(hostport, 0, i), port)
+                spec.assert_ok(cerr, "connect to ${hostport}")
+                if cerr == "" {
+                    req = api_versions_request(42)
+                    _, werr = tcp.write_all(sock, bytes.view(req))
+                    bytes.free(req)
+                    spec.assert_ok(werr, "write ApiVersions")
+                    // size(4) correlation id(4) error code(2)
+                    hex, rerr = read_hex(sock, 10)
+                    spec.assert_ok(rerr, "read the response")
+                    spec.assert_str_eq(string.substring(hex, 8, 16), "0000002a", "the correlation id is echoed")
+                    spec.assert_str_eq(string.substring(hex, 16, 20), "0000", "error code 0 (NONE)")
+                    tcp.close(sock)
+                }
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

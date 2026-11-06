@@ -1,0 +1,52 @@
+// Ported from testcontainers-go docker_test.go (TestContainerReuse..., one case) and docs/features/creating_container.md "Reusable container"
+//
+// reuse_by_name: a second run with the same name gets the running container
+// (the same id, the file the first run left in it), not a new one. Run with
+// TESTCONTAINERS_REUSE_ENABLE=true, so the container is also kept from the
+// reaper (org.testcontainers.reap=false); the test terminates it itself.
+
+import std.spec
+import std.string
+import std.os
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+
+main() {
+    fw = spec.init()
+    os.setenv("TESTCONTAINERS_REUSE_ENABLE", "true")
+    docker.config_reset()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "container reuse (WithReuseByName)") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("returns the running container for a second run of the same name") callback {
+            nm = "tcae-reuse-${string.substring(tc.session_id(), 0, 8)}"
+            c1, err1 = tc.run("alpine:3") {
+                reuse_by_name(nm)
+                cmd(["sleep", "300"])
+            }
+            testing.cleanup_container(c1)
+            spec.assert_ok(err1, "first run")
+            if err1 != "" { return }
+            spec.assert_ok(tc.copy_to_container(c1, "kept", "/tmp/mark", 420), "leave a file")
+            c2, err2 = tc.run("alpine:3") {
+                reuse_by_name(nm)
+                cmd(["sleep", "300"])
+            }
+            spec.assert_ok(err2, "second run")
+            if err2 != "" { return }
+            spec.assert_str_eq(tc.id(c2), tc.id(c1), "the same container")
+            code, out, _ = tc.exec(c2, ["cat", "/tmp/mark"])
+            spec.assert_eq(code, 0, "the file is there")
+            spec.assert_str_eq(out, "kept", "the first run's file")
+            doc, _ = tc.inspect(c2)
+            text = docker.json_body(doc)
+            spec.assert_contains(text, "\"org.testcontainers.reap\":\"false\"", "kept from the reaper with reuse enabled")
+            _, nerr = tc.run("alpine:3") { reuse_by_name("") }
+            spec.assert_contains(nerr, "name must not be empty", "reuse without a name is refused")
+        }
+    }
+    return spec.run_summary(fw)
+}

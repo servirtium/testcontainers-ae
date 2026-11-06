@@ -1,0 +1,73 @@
+// Ported from testcontainers-go modules/presto/presto.go
+//
+// modules.presto: a Presto coordinator (HTTP on 8080).
+//
+//     import modules.presto
+//
+//     c, err = presto.run("prestodb/presto:0.286")
+//     defer tc.terminate(c)
+//     url, _ = presto.connection_string(c)    // "http://localhost:32771"
+//
+// Ready (within 2 minutes) when GET /v1/info says "starting": false and
+// GET /v1/cluster reports activeWorkers > 0. Nothing is left out.
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+import std.json
+
+exports(run, connection_string, PORT, DEFAULT_IMAGE, presto_request_new, presto_request_free)
+
+const PORT = "8080/tcp"
+const DEFAULT_IMAGE = "prestodb/presto:0.286"
+
+fn info_ready(body: string) -> bool {
+    doc, perr = json.parse(body)
+    if perr != "" { return false }
+    v, _ = json.object_get(doc, "starting")
+    starting = false
+    if v != null { starting = json.json_get_bool(v) == 1 }
+    json.free(doc)
+    return !starting
+}
+
+fn has_workers(body: string) -> bool {
+    doc, perr = json.parse(body)
+    if perr != "" { return false }
+    v, _ = json.object_get(doc, "activeWorkers")
+    n = 0
+    if v != null { n = json.json_get_int(v) }
+    json.free(doc)
+    return n > 0
+}
+
+presto_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_http("/v1/info") {
+            with_port(PORT)
+            with_response_matcher(|body: string| -> info_ready(body))
+        },
+        wait.for_http("/v1/cluster") {
+            with_port(PORT)
+            with_response_matcher(|body: string| -> has_workers(body))
+        }
+    ]) { with_deadline(120s) })
+    return r
+}
+
+presto_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with presto_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = presto_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run presto: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" of the coordinator (Go's ConnectionString).
+connection_string(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "http")
+}

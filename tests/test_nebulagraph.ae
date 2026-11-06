@@ -1,0 +1,76 @@
+// Ported from testcontainers-go modules/nebulagraph/nebulagraph_test.go
+//
+// A real NebulaGraph cluster (metad, graphd, storaged, activator): the
+// connection string is graphd's host:port, graphd and metad answer /status
+// over HTTP (their wait strategies), and the activator registered the
+// storage host (the activator's log).
+
+import std.spec
+import std.string
+import std.http.client
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.nebulagraph
+
+const GRAPHD = "vesoft/nebula-graphd:v3.8.0"
+const STORAGED = "vesoft/nebula-storaged:v3.8.0"
+const METAD = "vesoft/nebula-metad:v3.8.0"
+
+fn http_get(url: string) -> (int, string, string) {
+    req = client.request("GET", url)
+    client.set_timeout(req, 30s)
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    status = client.response_status(r)
+    out = client.response_body(r)
+    client.response_free(r)
+    return status, out, ""
+}
+
+fn cluster_free(cl: *nebulagraph.NebulaCluster) {
+    testing.cleanup_container(cl.graphd)
+    testing.cleanup_container(cl.metad)
+    testing.cleanup_container(cl.storaged)
+    testing.cleanup_container(cl.activator)
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/nebulagraph") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("runs a cluster whose storage is activated (TestNebulaGraph)") callback {
+            cl, err = nebulagraph.run_cluster(GRAPHD, STORAGED, METAD)
+            if cl != null { cluster_free(cl) }
+            spec.assert_ok(err, "the cluster starts")
+            if err == "" {
+                addr, aerr = nebulagraph.connection_string(cl)
+                spec.assert_ok(aerr, "connection string")
+                want, _ = tc.endpoint(cl.graphd, nebulagraph.GRAPHD_PORT, "")
+                spec.assert_str_eq(addr, want, "graphd host:port")
+
+                http, _ = tc.endpoint(cl.graphd, nebulagraph.GRAPHD_HTTP_PORT, "http")
+                st, body, herr = http_get("${http}/status")
+                spec.assert_ok(herr, "GET graphd /status")
+                spec.assert_eq(st, 200, "graphd status is 200")
+                spec.assert_contains(body, "running", "graphd is running: ${body}")
+
+                mhttp, _ = tc.endpoint(cl.metad, nebulagraph.METAD_HTTP_PORT, "http")
+                mst, _, merr = http_get("${mhttp}/status")
+                spec.assert_ok(merr, "GET metad /status")
+                spec.assert_eq(mst, 200, "metad status is 200")
+
+                // the activator (ADD HOSTS through nebula-console) ran to success
+                logs, lerr = tc.logs(cl.activator)
+                spec.assert_ok(lerr, "activator logs")
+                spec.assert_contains(logs, "Storage activated", "storaged was registered: ${logs}")
+                spec.assert_true(tc.is_running(cl.storaged), "storaged is running")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

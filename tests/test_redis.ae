@@ -1,0 +1,174 @@
+// Ported from testcontainers-go modules/redis/redis_test.go
+//
+// The model module's test: a real Redis, spoken to over std.tcp with
+// std.resp at the mapped port (PING, SET, GET, INCR), and the module's
+// options checked in the container's real Cmd.
+
+import std.spec
+import std.string
+import std.tcp
+import std.resp
+import std.json
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.redis
+
+const IMAGE = "redis:7-alpine"
+
+// Send one command and read one reply: (reply as text, error). A bulk or
+// simple string comes back as its text, an integer as digits, nil as "(nil)".
+fn command(sock: ptr, args: string[]) -> (string, string) {
+    req = resp.new_array()
+    for a in args { resp.array_add(req, resp.new_bulk(string.bytes(a))) }
+    wire, eerr = resp.encode_resp2(req)
+    resp.free_value(req)
+    if eerr != "" { return "", eerr }
+    _, werr = tcp.write(sock, wire)
+    if werr != "" { return "", werr }
+    buf = ""
+    tries = 0
+    while tries < 100 {
+        chunk, rerr = tcp.read(sock, 4096)
+        if rerr != "" && rerr != "timeout" { return "", rerr }
+        buf = string.concat(buf, chunk)
+        v, used, perr = resp.parse_prefix(string.bytes(buf))
+        if perr != "" { return "", perr }
+        if used > 0 {
+            t = resp.value_type(v)
+            out = ""
+            if t == resp.RESP_INTEGER { out = "${resp.as_integer(v)}" }
+            else if t == resp.RESP_NULL { out = "(nil)" }
+            else if t == resp.RESP_ERROR { out = "ERR ${resp.str_value(v)}" }
+            else { out = resp.str_value(v) }
+            resp.free_value(v)
+            return out, ""
+        }
+        tries = tries + 1
+    }
+    return "", "no reply"
+}
+
+// Go's assertSetsGets: PING, then SET/GET n keys, then INCR.
+fn sets_gets(c: *docker.Container, keys: int) {
+    url, uerr = redis.connection_string(c)
+    spec.assert_ok(uerr, "connection string")
+    spec.assert_true(string.starts_with(url, "redis://") == 1, "a redis:// URL: ${url}")
+    h, _ = tc.host(c)
+    port, perr = tc.mapped_port(c, redis.PORT)
+    spec.assert_ok(perr, "mapped port")
+    sock, cerr = tcp.connect(h, port)
+    spec.assert_ok(cerr, "connect to ${h}:${port}")
+    if cerr != "" { return }
+    pong, e1 = command(sock, ["PING"])
+    spec.assert_ok(e1, "PING")
+    spec.assert_str_eq(pong, "PONG", "PING answers PONG")
+    i = 0
+    while i < keys {
+        ok, e2 = command(sock, ["SET", "key${i}", "value-${i}"])
+        spec.assert_ok(e2, "SET")
+        spec.assert_str_eq(ok, "OK", "SET key${i}")
+        got, e3 = command(sock, ["GET", "key${i}"])
+        spec.assert_ok(e3, "GET")
+        spec.assert_str_eq(got, "value-${i}", "GET key${i} gives what SET stored")
+        i = i + 1
+    }
+    n, e4 = command(sock, ["INCR", "counter"])
+    spec.assert_ok(e4, "INCR")
+    spec.assert_str_eq(n, "1", "INCR on a new key")
+    missing, _ = command(sock, ["GET", "no-such-key"])
+    spec.assert_str_eq(missing, "(nil)", "GET of a missing key")
+    tcp.tcp_close(sock)
+}
+
+// The container's Config.Cmd, joined with spaces.
+fn container_cmd(c: *docker.Container) -> string {
+    doc, err = tc.inspect(c)
+    if err != "" { return "" }
+    cfg, _ = json.object_get(doc, "Config")
+    cmdv, _ = json.object_get(cfg, "Cmd")
+    out = ""
+    n = json.json_array_size(cmdv)
+    i = 0
+    while i < n {
+        v, _ = json.array_get(cmdv, i)
+        s, _ = json.get_string(v)
+        if string.length(out) > 0 { out = "${out} " }
+        out = "${out}${s}"
+        i = i + 1
+    }
+    json.free(doc)
+    return out
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/redis") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("sets and gets over the mapped port (TestIntegrationSetGet)") callback {
+            c, err = redis.run(IMAGE)
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "redis starts")
+            if err == "" { sets_gets(c, 1) }
+        }
+
+        spec.it("passes --loglevel (TestRedisWithLogLevel)") callback {
+            c, err = redis.run(IMAGE) {
+                log_level(redis.LOG_LEVEL_VERBOSE)
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "redis starts")
+            if err == "" {
+                spec.assert_contains(container_cmd(c), "--loglevel verbose", "the option is in the container's Cmd")
+                sets_gets(c, 10)
+            }
+        }
+
+        spec.it("passes --save (TestRedisWithSnapshotting)") callback {
+            c, err = redis.run(IMAGE) {
+                snapshotting(10, 1)
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "redis starts")
+            if err == "" {
+                spec.assert_contains(container_cmd(c), "--save 10 1", "the option is in the container's Cmd")
+                sets_gets(c, 10)
+            }
+        }
+
+        spec.it("starts from a config file (TestRedisWithConfigFile)") callback {
+            c, err = redis.run(IMAGE) {
+                config_file("modules/redis/testdata/redis7.conf")
+                log_level(redis.LOG_LEVEL_NOTICE)
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "redis starts")
+            if err == "" {
+                spec.assert_true(string.starts_with(container_cmd(c), redis.CONFIG_FILE_PATH) == 1, "the config file is the first argument")
+                conf, cerr = tc.copy_file_from_container(c, redis.CONFIG_FILE_PATH)
+                spec.assert_ok(cerr, "the config file is in the container")
+                spec.assert_contains(conf, "protected-mode no", "it is the file we gave")
+                sets_gets(c, 1)
+            }
+        }
+
+        spec.it("mixes core options into the module's block") callback {
+            c, err = redis.run(IMAGE) {
+                tc.env("TCAE_MARK", "from-the-block")
+                tc.label("test", "redis")
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "redis starts")
+            if err == "" {
+                code, out, eerr = tc.exec(c, ["sh", "-c", "echo $TCAE_MARK"])
+                spec.assert_ok(eerr, "exec")
+                spec.assert_eq(code, 0, "exec exit code")
+                spec.assert_str_eq(string.trim(out), "from-the-block", "the core env setter reached the request")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

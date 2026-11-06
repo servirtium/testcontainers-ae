@@ -1,0 +1,2009 @@
+// Ported from go-sql-driver/mysql v1.9.3 dsn.go, connector.go,
+// connection.go, packets.go (the reading and writing of packets and the
+// command and result flows), auth.go (auth, handleAuthResult and the
+// server public key registry), buffer.go (as a byte buffer over the
+// socket), statement.go, rows.go, result.go, transaction.go and utils.go
+// (RegisterTLSConfig).
+// Copyright 2012 The Go-MySQL-Driver Authors. All rights reserved.
+// (connection.go, packets.go, statement.go, rows.go, result.go,
+// transaction.go and utils.go 2012; buffer.go 2013; dsn.go 2016;
+// connector.go and auth.go 2018.)
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at http://mozilla.org/MPL/2.0/.
+//
+// Modifications: ported to Aether by the testcontainers-ae contributors.
+//
+// sql.mysql.mysqlconn: one MySQL (or MariaDB) connection, below
+// database/sql: parsing a DSN, connecting over TCP or a Unix socket,
+// TLS by the handshake's SSL request, the authentication plugins, and
+// running SQL with COM_QUERY (text protocol) and COM_STMT_PREPARE /
+// COM_STMT_EXECUTE (binary protocol).
+//
+//     c, err = mysqlconn.connect("app:secret@tcp(localhost:3306)/app")
+//     err = mysqlconn.exec(c, "CREATE TABLE t (n int)")
+//     rs, err = mysqlconn.query(c, "SELECT n FROM t")
+//     st, err = mysqlconn.prepare(c, "INSERT INTO t VALUES (?)")
+//     err = mysqlconn.stmt_exec(c, st, [sql.int64(1)])
+//     mysqlconn.close(c)
+//
+// What is ported, and how it differs:
+//
+//  - ParseDSN / FormatDSN and every DSN parameter of v1.9.3; unknown keys
+//    are system variables set after connecting (SET k = v, in DSN order,
+//    where Go's map order is random). Parsed and kept but without effect
+//    here: parseTime and loc (values stay MySQL's text: sql keeps text),
+//    compress (no zlib framing: the flag is never sent), allowAllFiles
+//    (no LOAD DATA LOCAL INFILE), checkConnLiveness (no pool), writeTimeout
+//    (std.tcp has no send deadline), rejectReadOnly (kept: the error
+//    closes the connection, as Go's does).
+//  - timeout bounds the whole connection attempt's reads (std.tcp.connect
+//    has no dial timeout of its own); readTimeout bounds each read of a
+//    plain-text connection (a TLS connection reads with the socket's own
+//    30 s timeout).
+//  - TLS is std.cryptography.tls13_client over the same socket after the
+//    SSL request: TLS 1.3 only, and the server is always verified, chain
+//    and host name (tls13_client.connect_socket has no other mode). So:
+//    tls=true verifies against the system store and the host name, as Go;
+//    a name registered with register_tls_config verifies against its CA
+//    file (and server name); tls=skip-verify is refused at connect (it
+//    asks for no verification); tls=preferred uses verified TLS when the
+//    server offers TLS (and fails, loudly, when the certificate does not
+//    verify, where Go would accept it unverified) and plain text when the
+//    server offers none, as Go does.
+//  - Authentication: mysql_native_password, caching_sha2_password (fast
+//    and full: cleartext over TLS or a Unix socket, else the server's RSA
+//    key, fetched or from serverPubKey, and RSA-OAEP with SHA-1),
+//    sha256_password, mysql_clear_password (allowCleartextPasswords),
+//    mysql_old_password (allowOldPasswords), auth switch requests. Not
+//    MariaDB's client_ed25519 (std.cryptography.ed25519 signs from a
+//    32-byte seed; the plugin needs the scalar of SHA-512(password)).
+//  - Results are read whole before a call returns; a query's first result
+//    set with columns is kept and the rest are read and dropped (Go's
+//    Rows.Close). No context watching, no compression, no LOAD DATA LOCAL
+//    INFILE (the server's request is answered with an empty file and an
+//    error), no CLIENT_DEPRECATE_EOF (not requested, as in v1.9.3).
+//  - For tests, a connection can run over a mock (new_mock_conn) whose
+//    reads come from bytes given to it and whose writes are kept, as the
+//    Go tests' mockConn.
+
+import std.string
+import std.bytes
+import std.os
+import std.tcp
+import std.cryptography.tls13_client
+import sql
+import sql.mysql.mysqlproto
+
+exports(
+    Config, TLSConfig, MyConn, Stmt, ResultSet, AuthResult,
+    // dsn.go
+    new_config, parse_dsn, format_dsn, normalize, param, parse_duration, duration_string,
+    // utils.go / auth.go registries
+    register_tls_config, deregister_tls_config, register_server_pub_key,
+    deregister_server_pub_key,
+    // connecting
+    connect, connect_config, close, is_closed, ping, exec, query, prepare,
+    stmt_exec, stmt_query, stmt_close, begin, commit, rollback,
+    last_affected_rows, last_insert_id, all_rows_affected, all_last_insert_ids,
+    status, server_flags, server_version, auth_path,
+    // packets (exposed for tests over the mock)
+    new_mock_conn, mock_feed, mock_queue, mock_written, mock_clear_written, mock_close, mock_pretend_tls,
+    set_sequence, sequence_of,
+    read_packet, write_packet, read_handshake_packet, auth, write_handshake_response_packet,
+    handle_auth_result, read_auth_result, write_command_packet, write_command_packet_str,
+    encode_connection_attributes
+)
+
+// ===================================================================
+// registries (utils.go RegisterTLSConfig, auth.go RegisterServerPubKey)
+// ===================================================================
+
+// What Go keeps in a *tls.Config, as far as tls13_client can honour it.
+struct TLSConfig {
+    name: string                 // "true", "skip-verify", "preferred" or a registered name
+    server_name: string          // the name verified and sent as SNI ("" the host)
+    root_ca_file: string         // a PEM bundle to trust, "" the system store
+    insecure_skip_verify: bool   // skip-verify and preferred (Go's InsecureSkipVerify)
+    preferred: bool
+}
+
+var tls_names: string[] = []
+var tls_configs: ptr[] = []
+var key_names: string[] = []
+var key_values: ptr[] = []
+
+// RegisterTLSConfig: a named TLS configuration for the DSN's tls=<name>,
+// verifying the server against root_ca_file ("" the system store) and
+// server_name ("" the DSN's host). The reserved names are refused.
+register_tls_config(name: string, root_ca_file: string, server_name: string) -> string {
+    lk = string.to_lower(name)
+    if lk == "true" || lk == "false" || lk == "skip-verify" || lk == "preferred" {
+        return "key '${name}' is reserved"
+    }
+    t = heap.new(TLSConfig)
+    t.name = name
+    t.server_name = server_name
+    t.root_ca_file = root_ca_file
+    t.insecure_skip_verify = false
+    t.preferred = false
+    i = 0
+    while i < tls_names.len {
+        if tls_names[i] == name {
+            tls_configs[i] = t as ptr
+            return ""
+        }
+        i = i + 1
+    }
+    tls_names.push(name)
+    tls_configs.push(t as ptr)
+    return ""
+}
+
+deregister_tls_config(name: string) {
+    string[] ns = []
+    let cs: ptr[] = []
+    i = 0
+    while i < tls_names.len {
+        if tls_names[i] != name {
+            ns.push(tls_names[i])
+            cs.push(tls_configs[i])
+        }
+        i = i + 1
+    }
+    tls_names = ns
+    tls_configs = cs
+}
+
+fn tls_config_clone(name: string) -> *TLSConfig {
+    i = 0
+    while i < tls_names.len {
+        if tls_names[i] == name {
+            src = tls_configs[i] as *TLSConfig
+            t = heap.new(TLSConfig)
+            t.name = src.name
+            t.server_name = src.server_name
+            t.root_ca_file = src.root_ca_file
+            t.insecure_skip_verify = false
+            t.preferred = false
+            return t
+        }
+        i = i + 1
+    }
+    return null
+}
+
+// RegisterServerPubKey: the server's RSA public key (a PEM "PUBLIC KEY"
+// block) under a name for the DSN's serverPubKey=<name>, so that
+// caching_sha2_password and sha256_password need not fetch it.
+register_server_pub_key(name: string, pem_text: string) -> string {
+    k, err = mysqlproto.parse_pkix_public_key(pem_text)
+    if err != "" { return err }
+    i = 0
+    while i < key_names.len {
+        if key_names[i] == name {
+            key_values[i] = k
+            return ""
+        }
+        i = i + 1
+    }
+    key_names.push(name)
+    key_values.push(k)
+    return ""
+}
+
+deregister_server_pub_key(name: string) {
+    string[] ns = []
+    let vs: ptr[] = []
+    i = 0
+    while i < key_names.len {
+        if key_names[i] != name {
+            ns.push(key_names[i])
+            vs.push(key_values[i])
+        }
+        i = i + 1
+    }
+    key_names = ns
+    key_values = vs
+}
+
+fn server_pub_key(name: string) -> ptr {
+    i = 0
+    while i < key_names.len {
+        if key_names[i] == name { return key_values[i] }
+        i = i + 1
+    }
+    return null
+}
+
+// ===================================================================
+// dsn.go
+// ===================================================================
+
+const SECOND = 1000000000
+
+// A configuration parsed from a DSN (Go's Config). Durations are in
+// nanoseconds; Params keep the DSN's order.
+struct Config {
+    user: string
+    passwd: string
+    net: string
+    addr: string
+    db_name: string
+    param_keys: string[]
+    param_vals: string[]
+    connection_attributes: string
+    collation: string
+    loc: string                  // "UTC" (Go's default), or the name given (not checked: no tzdata)
+    max_allowed_packet: int
+    server_pub_key: string
+    tls_config: string
+    tls: *TLSConfig
+    timeout: long
+    read_timeout: long
+    write_timeout: long
+    allow_all_files: bool
+    allow_cleartext_passwords: bool
+    allow_fallback_to_plaintext: bool
+    allow_native_passwords: bool
+    allow_old_passwords: bool
+    check_conn_liveness: bool
+    client_found_rows: bool
+    columns_with_alias: bool
+    interpolate_params: bool
+    multi_statements: bool
+    parse_time: bool
+    reject_read_only: bool
+    compress: bool
+    time_truncate: long
+    charsets: string[]
+    pub_key: ptr
+}
+
+// NewConfig: the defaults.
+new_config() -> *Config {
+    c = heap.new(Config)
+    c.user = ""
+    c.passwd = ""
+    c.net = ""
+    c.addr = ""
+    c.db_name = ""
+    c.connection_attributes = ""
+    c.collation = ""
+    c.loc = "UTC"
+    c.max_allowed_packet = mysqlproto.DEFAULT_MAX_ALLOWED_PACKET
+    c.server_pub_key = ""
+    c.tls_config = ""
+    c.tls = null
+    c.timeout = 0
+    c.read_timeout = 0
+    c.write_timeout = 0
+    c.allow_all_files = false
+    c.allow_cleartext_passwords = false
+    c.allow_fallback_to_plaintext = false
+    c.allow_native_passwords = true
+    c.allow_old_passwords = false
+    c.check_conn_liveness = true
+    c.client_found_rows = false
+    c.columns_with_alias = false
+    c.interpolate_params = false
+    c.multi_statements = false
+    c.parse_time = false
+    c.reject_read_only = false
+    c.compress = false
+    c.time_truncate = 0
+    c.pub_key = null
+    return c
+}
+
+// A DSN parameter that is not one of the driver's (a system variable), or "".
+param(cfg: *Config, k: string) -> string {
+    i = 0
+    while i < cfg.param_keys.len {
+        if cfg.param_keys[i] == k { return cfg.param_vals[i] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn set_param(cfg: *Config, k: string, v: string) {
+    i = 0
+    while i < cfg.param_keys.len {
+        if cfg.param_keys[i] == k {
+            cfg.param_vals[i] = v
+            return
+        }
+        i = i + 1
+    }
+    cfg.param_keys.push(k)
+    cfg.param_vals.push(v)
+}
+
+fn split(s: string, sep: string) -> string[] {
+    string[] out = []
+    rest = s
+    i = string.index_of(rest, sep)
+    while i >= 0 {
+        out.push(string.substring(rest, 0, i))
+        rest = string.substring(rest, i + string.length(sep), string.length(rest))
+        i = string.index_of(rest, sep)
+    }
+    out.push(rest)
+    return out
+}
+
+fn join(xs: string[], sep: string) -> string {
+    out = ""
+    i = 0
+    for x in xs {
+        if i > 0 { out = "${out}${sep}" }
+        out = "${out}${x}"
+        i = i + 1
+    }
+    return out
+}
+
+fn hexval(c: int) -> int {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return -1
+}
+
+// url.PathUnescape (plus_is_space false) and url.QueryUnescape (true).
+fn unescape(s: string, plus_is_space: bool) -> (string, string) {
+    b = string.bytes(s)
+    byte[] out = []
+    i = 0
+    while i < b.len {
+        c = b[i] as int
+        if c == 37 {
+            if i + 2 >= b.len { return "", "invalid URL escape \"${string.substring(s, i, string.length(s))}\"" }
+            hi = hexval(b[i + 1] as int)
+            lo = hexval(b[i + 2] as int)
+            if hi < 0 || lo < 0 { return "", "invalid URL escape \"${string.substring(s, i, i + 3)}\"" }
+            out.push(((hi << 4) | lo) as byte)
+            i = i + 3
+        } else if c == 43 && plus_is_space {
+            out.push(32 as byte)
+            i = i + 1
+        } else {
+            out.push(b[i])
+            i = i + 1
+        }
+    }
+    return bytes.string_from_slice(out), ""
+}
+
+fn is_unreserved(c: int) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 46 || c == 126
+}
+
+fn hex_byte(c: int) -> string {
+    digits = "0123456789ABCDEF"
+    return "%${string.substring(digits, c >> 4, (c >> 4) + 1)}${string.substring(digits, c & 15, (c & 15) + 1)}"
+}
+
+// url.QueryEscape (path false) and url.PathEscape (path true).
+fn escape(s: string, path: bool) -> string {
+    out = ""
+    for x in string.bytes(s) {
+        c = x as int
+        if is_unreserved(c) {
+            out = "${out}${string.from_char(c)}"
+        } else if c == 32 && !path {
+            out = "${out}+"
+        } else if path && (c == 36 || c == 38 || c == 43 || c == 44 || c == 58 || c == 59 || c == 61 || c == 64) {
+            out = "${out}${string.from_char(c)}"
+        } else {
+            out = "${out}${hex_byte(c)}"
+        }
+    }
+    return out
+}
+
+fn last_index_of(s: string, c: string) -> int {
+    i = string.index_of(s, c)
+    last = -1
+    while i >= 0 {
+        last = i
+        i = string.index_of_from(s, c, i + 1)
+    }
+    return last
+}
+
+// net.SplitHostPort: (host, port, "") or an error.
+fn split_host_port(hp: string) -> (string, string, string) {
+    if string.starts_with(hp, "[") == 1 {
+        close_br = string.index_of(hp, "]")
+        if close_br < 0 { return "", "", "address ${hp}: missing ']' in address" }
+        h = string.substring(hp, 1, close_br)
+        rest = string.substring(hp, close_br + 1, string.length(hp))
+        if string.starts_with(rest, ":") == 0 { return "", "", "address ${hp}: missing port in address" }
+        return h, string.substring(rest, 1, string.length(rest)), ""
+    }
+    i = last_index_of(hp, ":")
+    if i < 0 { return "", "", "address ${hp}: missing port in address" }
+    h = string.substring(hp, 0, i)
+    if string.contains(h, ":") == 1 { return "", "", "address ${hp}: too many colons in address" }
+    return h, string.substring(hp, i + 1, string.length(hp)), ""
+}
+
+// ensureHavePort: net.JoinHostPort(addr, "3306") when addr has no port.
+fn ensure_have_port(addr: string) -> string {
+    _, _, err = split_host_port(addr)
+    if err == "" { return addr }
+    if string.contains(addr, ":") == 1 { return "[${addr}]:3306" }
+    return "${addr}:3306"
+}
+
+// time.ParseDuration: (nanoseconds, "") for "30s", "1.5m", "1h30m",
+// "500ms", "10us"; an error otherwise.
+parse_duration(s: string) -> (long, string) {
+    orig = s
+    b = string.bytes(s)
+    i = 0
+    neg = false
+    if b.len > 0 && (b[0] == 45 || b[0] == 43) {
+        neg = b[0] == 45
+        i = 1
+    }
+    if i < b.len && string.substring(s, i, b.len) == "0" { return 0, "" }
+    if i >= b.len { return 0, "time: invalid duration \"${orig}\"" }
+    let total: long = 0
+    while i < b.len {
+        let whole: long = 0
+        let frac: long = 0
+        let scale: long = 1
+        digits = 0
+        while i < b.len && b[i] >= 48 && b[i] <= 57 {
+            whole = whole * 10 + ((b[i] as long) - 48)
+            i = i + 1
+            digits = digits + 1
+        }
+        if i < b.len && b[i] == 46 {
+            i = i + 1
+            while i < b.len && b[i] >= 48 && b[i] <= 57 {
+                if scale < 1000000000000000 {
+                    frac = frac * 10 + ((b[i] as long) - 48)
+                    scale = scale * 10
+                }
+                i = i + 1
+                digits = digits + 1
+            }
+        }
+        if digits == 0 { return 0, "time: invalid duration \"${orig}\"" }
+        us = i
+        while i < b.len && !(b[i] >= 48 && b[i] <= 57) && b[i] != 46 { i = i + 1 }
+        unit = string.substring(s, us, i)
+        let mult: long = 0
+        if unit == "ns" { mult = 1 }
+        else if unit == "us" || unit == "µs" || unit == "μs" { mult = 1000 }
+        else if unit == "ms" { mult = 1000000 }
+        else if unit == "s" { mult = SECOND }
+        else if unit == "m" { mult = 60 * SECOND }
+        else if unit == "h" { mult = 3600 * SECOND }
+        else if unit == "" { return 0, "time: missing unit in duration \"${orig}\"" }
+        else { return 0, "time: unknown unit \"${unit}\" in duration \"${orig}\"" }
+        total = total + whole * mult + (frac * mult) / scale
+    }
+    if neg { return 0 - total, "" }
+    return total, ""
+}
+
+fn frac_text(v: long, unit: long, width: int) -> string {
+    w = string.from_long(v / unit)
+    f = v % unit
+    if f == 0 { return w }
+    fs = string.from_long(f)
+    while string.length(fs) < width { fs = "0${fs}" }
+    while string.ends_with(fs, "0") == 1 { fs = string.substring(fs, 0, string.length(fs) - 1) }
+    return "${w}.${fs}"
+}
+
+// time.Duration.String: "1h0m0s", "1m30s", "30s", "1.5s", "500ms", "10µs", "5ns".
+duration_string(d: long) -> string {
+    if d == 0 { return "0s" }
+    sign = ""
+    u = d
+    if d < 0 {
+        sign = "-"
+        u = 0 - d
+    }
+    if u < 1000 { return "${sign}${u}ns" }
+    if u < 1000000 { return "${sign}${frac_text(u, 1000, 3)}µs" }
+    if u < SECOND { return "${sign}${frac_text(u, 1000000, 6)}ms" }
+    h = u / (3600 * SECOND)
+    rest = u - h * 3600 * SECOND
+    m = rest / (60 * SECOND)
+    rest = rest - m * 60 * SECOND
+    secs = frac_text(rest, SECOND, 9)
+    if h > 0 { return "${sign}${h}h${m}m${secs}s" }
+    if m > 0 { return "${sign}${m}m${secs}s" }
+    return "${sign}${secs}s"
+}
+
+// Config.normalize: defaults for net and addr, the TLS configuration from
+// the tls name, the server public key from its name.
+normalize(cfg: *Config) -> string {
+    if cfg.interpolate_params && string.length(cfg.collation) > 0 && mysqlproto.is_unsafe_collation(cfg.collation) {
+        return "invalid DSN: interpolateParams can not be used with unsafe collations"
+    }
+    if string.length(cfg.net) == 0 { cfg.net = "tcp" }
+    if string.length(cfg.addr) == 0 {
+        if cfg.net == "tcp" {
+            cfg.addr = "127.0.0.1:3306"
+        } else if cfg.net == "unix" {
+            cfg.addr = "/tmp/mysql.sock"
+        } else {
+            return "default addr for network '${cfg.net}' unknown"
+        }
+    } else if cfg.net == "tcp" {
+        cfg.addr = ensure_have_port(cfg.addr)
+    }
+    if cfg.tls == null {
+        n = cfg.tls_config
+        if n == "false" || n == "" {
+            // no TLS
+        } else if n == "true" || n == "skip-verify" || n == "preferred" {
+            t = heap.new(TLSConfig)
+            t.name = n
+            t.server_name = ""
+            t.root_ca_file = ""
+            t.insecure_skip_verify = n != "true"
+            t.preferred = n == "preferred"
+            cfg.tls = t
+            if n == "preferred" { cfg.allow_fallback_to_plaintext = true }
+        } else {
+            cfg.tls = tls_config_clone(n)
+            if cfg.tls == null { return "invalid value / unknown config name: ${n}" }
+        }
+    }
+    if cfg.tls != null && string.length(cfg.tls.server_name) == 0 && !cfg.tls.insecure_skip_verify {
+        host, _, err = split_host_port(cfg.addr)
+        if err == "" { cfg.tls.server_name = host }
+    }
+    if string.length(cfg.server_pub_key) > 0 {
+        cfg.pub_key = server_pub_key(cfg.server_pub_key)
+        if cfg.pub_key == null { return "invalid value / unknown server pub key name: ${cfg.server_pub_key}" }
+    }
+    return ""
+}
+
+fn bool_param(value: string) -> (bool, string) {
+    v, ok = mysqlproto.read_bool(value)
+    if !ok { return false, "invalid bool value: ${value}" }
+    return v, ""
+}
+
+// parseDSNParams.
+fn parse_dsn_params(cfg: *Config, params: string) -> string {
+    for v in split(params, "&") {
+        eq = string.index_of(v, "=")
+        if eq < 0 { continue }
+        key = string.substring(v, 0, eq)
+        value = string.substring(v, eq + 1, string.length(v))
+        err = ""
+        if key == "allowAllFiles" { cfg.allow_all_files, err = bool_param(value) }
+        else if key == "allowCleartextPasswords" { cfg.allow_cleartext_passwords, err = bool_param(value) }
+        else if key == "allowFallbackToPlaintext" { cfg.allow_fallback_to_plaintext, err = bool_param(value) }
+        else if key == "allowNativePasswords" { cfg.allow_native_passwords, err = bool_param(value) }
+        else if key == "allowOldPasswords" { cfg.allow_old_passwords, err = bool_param(value) }
+        else if key == "checkConnLiveness" { cfg.check_conn_liveness, err = bool_param(value) }
+        else if key == "clientFoundRows" { cfg.client_found_rows, err = bool_param(value) }
+        else if key == "charset" { cfg.charsets = split(value, ",") }
+        else if key == "collation" { cfg.collation = value }
+        else if key == "columnsWithAlias" { cfg.columns_with_alias, err = bool_param(value) }
+        else if key == "compress" { cfg.compress, err = bool_param(value) }
+        else if key == "interpolateParams" { cfg.interpolate_params, err = bool_param(value) }
+        else if key == "loc" {
+            l, uerr = unescape(value, true)
+            if uerr != "" { return uerr }
+            cfg.loc = l
+        }
+        else if key == "multiStatements" { cfg.multi_statements, err = bool_param(value) }
+        else if key == "parseTime" { cfg.parse_time, err = bool_param(value) }
+        else if key == "timeTruncate" {
+            d, derr = parse_duration(value)
+            if derr != "" { return "invalid timeTruncate value: ${value}, error: ${derr}" }
+            cfg.time_truncate = d
+        }
+        else if key == "readTimeout" { cfg.read_timeout, err = parse_duration(value) }
+        else if key == "rejectReadOnly" { cfg.reject_read_only, err = bool_param(value) }
+        else if key == "serverPubKey" {
+            name, uerr = unescape(value, true)
+            if uerr != "" { return "invalid value for server pub key name: ${uerr}" }
+            cfg.server_pub_key = name
+        }
+        else if key == "strict" { return "strict mode has been removed. See https://github.com/go-sql-driver/mysql/wiki/strict-mode" }
+        else if key == "timeout" { cfg.timeout, err = parse_duration(value) }
+        else if key == "tls" {
+            bv, is_bool = mysqlproto.read_bool(value)
+            vl = string.to_lower(value)
+            if is_bool {
+                if bv { cfg.tls_config = "true" } else { cfg.tls_config = "false" }
+            } else if vl == "skip-verify" || vl == "preferred" {
+                cfg.tls_config = vl
+            } else {
+                name, uerr = unescape(value, true)
+                if uerr != "" { return "invalid value for TLS config name: ${uerr}" }
+                cfg.tls_config = name
+            }
+        }
+        else if key == "writeTimeout" { cfg.write_timeout, err = parse_duration(value) }
+        else if key == "maxAllowedPacket" {
+            n, nerr = string.to_int(value)
+            if nerr != "" { return "strconv.Atoi: parsing \"${value}\": invalid syntax" }
+            cfg.max_allowed_packet = n
+        }
+        else if key == "connectionAttributes" {
+            ca, uerr = unescape(value, true)
+            if uerr != "" { return "invalid connectionAttributes value: ${uerr}" }
+            cfg.connection_attributes = ca
+        }
+        else {
+            pv, uerr = unescape(value, true)
+            if uerr != "" { return uerr }
+            set_param(cfg, key, pv)
+        }
+        if err != "" { return err }
+    }
+    return ""
+}
+
+// ParseDSN: [user[:password]@][net[(addr)]]/dbname[?param1=value1&paramN=valueN]
+parse_dsn(dsn: string) -> (*Config, string) {
+    cfg = new_config()
+    b = string.bytes(dsn)
+    found_slash = false
+    i = b.len - 1
+    while i >= 0 {
+        if b[i] == 47 {
+            found_slash = true
+            int j = 0
+            int k = 0
+            if i > 0 {
+                // the last '@' in dsn[:i]
+                j = i
+                while j >= 0 {
+                    if b[j] == 64 {
+                        k = 0
+                        while k < j {
+                            if b[k] == 58 {
+                                cfg.passwd = string.substring(dsn, k + 1, j)
+                                break
+                            }
+                            k = k + 1
+                        }
+                        cfg.user = string.substring(dsn, 0, k)
+                        break
+                    }
+                    j = j - 1
+                }
+                // the first '(' in dsn[j+1:i]
+                k = j + 1
+                while k < i {
+                    if b[k] == 40 {
+                        if b[i - 1] != 41 {
+                            if string.contains(string.substring(dsn, k + 1, i), ")") == 1 {
+                                return null, "invalid DSN: did you forget to escape a param value?"
+                            }
+                            return null, "invalid DSN: network address not terminated (missing closing brace)"
+                        }
+                        cfg.addr = string.substring(dsn, k + 1, i - 1)
+                        break
+                    }
+                    k = k + 1
+                }
+                cfg.net = string.substring(dsn, j + 1, k)
+            }
+            // dbname[?params]
+            j = i + 1
+            while j < b.len {
+                if b[j] == 63 {
+                    perr = parse_dsn_params(cfg, string.substring(dsn, j + 1, b.len))
+                    if perr != "" { return null, perr }
+                    break
+                }
+                j = j + 1
+            }
+            dbname = string.substring(dsn, i + 1, j)
+            d, uerr = unescape(dbname, false)
+            if uerr != "" { return null, "invalid dbname \"${dbname}\": ${uerr}" }
+            cfg.db_name = d
+            break
+        }
+        i = i - 1
+    }
+    if !found_slash && b.len > 0 {
+        return null, "invalid DSN: missing the slash separating the database name"
+    }
+    nerr = normalize(cfg)
+    if nerr != "" { return null, nerr }
+    return cfg, ""
+}
+
+fn write_param(out: string, has: bool, name: string, value: string) -> string {
+    sep = "&"
+    if !has { sep = "?" }
+    return "${out}${sep}${name}=${value}"
+}
+
+// FormatDSN: the config as a DSN that parse_dsn reads back to the same.
+format_dsn(cfg: *Config) -> string {
+    out = ""
+    if string.length(cfg.user) > 0 {
+        out = cfg.user
+        if string.length(cfg.passwd) > 0 { out = "${out}:${cfg.passwd}" }
+        out = "${out}@"
+    }
+    if string.length(cfg.net) > 0 {
+        out = "${out}${cfg.net}"
+        if string.length(cfg.addr) > 0 { out = "${out}(${cfg.addr})" }
+    }
+    out = "${out}/${escape(cfg.db_name, true)}"
+    has = false
+    if cfg.allow_all_files { out = write_param(out, has, "allowAllFiles", "true"); has = true }
+    if cfg.allow_cleartext_passwords { out = write_param(out, has, "allowCleartextPasswords", "true"); has = true }
+    if cfg.allow_fallback_to_plaintext { out = write_param(out, has, "allowFallbackToPlaintext", "true"); has = true }
+    if !cfg.allow_native_passwords { out = write_param(out, has, "allowNativePasswords", "false"); has = true }
+    if cfg.allow_old_passwords { out = write_param(out, has, "allowOldPasswords", "true"); has = true }
+    if !cfg.check_conn_liveness { out = write_param(out, has, "checkConnLiveness", "false"); has = true }
+    if cfg.client_found_rows { out = write_param(out, has, "clientFoundRows", "true"); has = true }
+    if cfg.charsets.len > 0 { out = write_param(out, has, "charset", join(cfg.charsets, ",")); has = true }
+    if string.length(cfg.collation) > 0 { out = write_param(out, has, "collation", cfg.collation); has = true }
+    if cfg.columns_with_alias { out = write_param(out, has, "columnsWithAlias", "true"); has = true }
+    if string.length(cfg.connection_attributes) > 0 { out = write_param(out, has, "connectionAttributes", escape(cfg.connection_attributes, false)); has = true }
+    if cfg.compress { out = write_param(out, has, "compress", "true"); has = true }
+    if cfg.interpolate_params { out = write_param(out, has, "interpolateParams", "true"); has = true }
+    if cfg.loc != "UTC" && string.length(cfg.loc) > 0 { out = write_param(out, has, "loc", escape(cfg.loc, false)); has = true }
+    if cfg.multi_statements { out = write_param(out, has, "multiStatements", "true"); has = true }
+    if cfg.parse_time { out = write_param(out, has, "parseTime", "true"); has = true }
+    if cfg.time_truncate > 0 { out = write_param(out, has, "timeTruncate", duration_string(cfg.time_truncate)); has = true }
+    if cfg.read_timeout > 0 { out = write_param(out, has, "readTimeout", duration_string(cfg.read_timeout)); has = true }
+    if cfg.reject_read_only { out = write_param(out, has, "rejectReadOnly", "true"); has = true }
+    if string.length(cfg.server_pub_key) > 0 { out = write_param(out, has, "serverPubKey", escape(cfg.server_pub_key, false)); has = true }
+    if cfg.timeout > 0 { out = write_param(out, has, "timeout", duration_string(cfg.timeout)); has = true }
+    if string.length(cfg.tls_config) > 0 { out = write_param(out, has, "tls", escape(cfg.tls_config, false)); has = true }
+    if cfg.write_timeout > 0 { out = write_param(out, has, "writeTimeout", duration_string(cfg.write_timeout)); has = true }
+    if cfg.max_allowed_packet != mysqlproto.DEFAULT_MAX_ALLOWED_PACKET { out = write_param(out, has, "maxAllowedPacket", string.from_int(cfg.max_allowed_packet)); has = true }
+    // the other params, sorted by name
+    string[] keys = []
+    for k in cfg.param_keys { keys.push(k) }
+    i = 1
+    while i < keys.len {
+        j = i
+        while j > 0 && string.compare(keys[j - 1], keys[j]) > 0 {
+            t = keys[j - 1]
+            keys[j - 1] = keys[j]
+            keys[j] = t
+            j = j - 1
+        }
+        i = i + 1
+    }
+    for k in keys {
+        out = write_param(out, has, k, escape(param(cfg, k), false))
+        has = true
+    }
+    return out
+}
+
+// ===================================================================
+// the connection (connection.go, buffer.go)
+// ===================================================================
+
+struct Chunk {
+    b: byte[]
+}
+
+struct MyConn {
+    cfg: *Config
+    tls_cfg: *TLSConfig       // the TLS in use for this connection (Go mutates cfg.TLS)
+    sock: ptr
+    tls: ptr
+    rbuf: byte[]
+    inbuf: byte[]
+    inpos: int
+    closed: bool
+    sequence: int
+    flags: long
+    status: int
+    max_allowed_packet: int
+    max_write_size: int
+    affected_rows: long[]
+    insert_ids: long[]
+    deadline_ms: long
+    server_version: string
+    auth_path: string         // how authentication went (for tests and logs)
+    encoded_attributes: byte[]
+    // the mock (Go's tests' mockConn)
+    mock: bool
+    mock_data: byte[]
+    mock_out: byte[]
+    mock_replies: ptr[]
+    mock_closed: bool
+}
+
+// A prepared statement (mysqlStmt).
+struct Stmt {
+    id: long
+    param_count: int
+    column_count: int
+}
+
+// A result set, read whole: the columns, the rows (row-major values with
+// null flags), as the driver hands them to sql.
+struct ResultSet {
+    fields: mysqlproto.Field[]
+    names: string[]
+    types: string[]
+    values: string[]
+    nulls: bool[]
+    nrows: int
+}
+
+fn new_result_set() -> *ResultSet {
+    r = heap.new(ResultSet)
+    r.nrows = 0
+    return r
+}
+
+fn now_ms() -> long { return os.now_monotonic_ms() }
+
+fn new_conn(cfg: *Config) -> *MyConn {
+    c = heap.new(MyConn)
+    c.cfg = cfg
+    c.tls_cfg = cfg.tls
+    c.sock = null
+    c.tls = null
+    c.rbuf = make([]byte, 16384)
+    c.inpos = 0
+    c.closed = false
+    c.sequence = 0
+    c.flags = 0
+    c.status = 0
+    c.max_allowed_packet = mysqlproto.MAX_PACKET_SIZE
+    c.max_write_size = mysqlproto.MAX_PACKET_SIZE - 1
+    c.deadline_ms = 0
+    c.server_version = ""
+    c.auth_path = ""
+    c.mock = false
+    c.mock_closed = false
+    return c
+}
+
+// newRWMockConn: a connection whose reads come from mock_feed/mock_queue and
+// whose writes are kept (mock_written), with Go's test defaults
+// (max_allowed_packet 64 MiB).
+new_mock_conn(cfg: *Config, sequence: int) -> *MyConn {
+    c = new_conn(cfg)
+    c.mock = true
+    c.sequence = sequence
+    c.max_allowed_packet = mysqlproto.DEFAULT_MAX_ALLOWED_PACKET
+    c.encoded_attributes = encode_connection_attributes(cfg)
+    return c
+}
+
+// The bytes the next reads return (Go's conn.data).
+mock_feed(c: *MyConn, data: byte[]) {
+    byte[] d = []
+    for x in data { d.push(x) }
+    c.mock_data = d
+}
+
+// A reply that becomes the read data after the next write (Go's
+// conn.queuedReplies).
+mock_queue(c: *MyConn, data: byte[]) {
+    ch = heap.new(Chunk)
+    for x in data { ch.b.push(x) }
+    c.mock_replies.push(ch as ptr)
+}
+
+mock_written(c: *MyConn) -> byte[] { return c.mock_out }
+mock_clear_written(c: *MyConn) {
+    byte[] e = []
+    c.mock_out = e
+}
+mock_close(c: *MyConn) { c.mock_closed = true }
+// The Go tests' "hack to make the caching_sha2_password plugin believe that
+// the connection is secure" (mc.cfg.TLS = &tls.Config{...}) after the
+// handshake response was written.
+mock_pretend_tls(c: *MyConn) {
+    t = heap.new(TLSConfig)
+    t.name = "true"
+    t.server_name = ""
+    t.root_ca_file = ""
+    t.insecure_skip_verify = false
+    t.preferred = false
+    c.tls_cfg = t
+}
+set_sequence(c: *MyConn, s: int) { c.sequence = s & 255 }
+sequence_of(c: *MyConn) -> int { return c.sequence }
+
+status(c: *MyConn) -> int { return c.status }
+server_flags(c: *MyConn) -> long { return c.flags }
+server_version(c: *MyConn) -> string { return c.server_version }
+// How the connection authenticated: the plugin, and for
+// caching_sha2_password "fast" or "full (...)" with how the password went.
+auth_path(c: *MyConn) -> string { return c.auth_path }
+is_closed(c: *MyConn) -> bool { return c == null || c.closed }
+
+// cleanup: close the network connection without COM_QUIT.
+fn cleanup(c: *MyConn) {
+    if c.closed { return }
+    c.closed = true
+    if c.mock { return }
+    if c.tls != null {
+        tls13_client.close_conn(c.tls)
+        c.tls = null
+        c.sock = null
+    } else if c.sock != null {
+        tcp.close(c.sock)
+        c.sock = null
+    }
+}
+
+// One write of the bytes to the connection.
+fn raw_write(c: *MyConn, data: byte[]) -> string {
+    if c.mock {
+        if c.mock_closed { return "connection is closed" }
+        for x in data { c.mock_out.push(x) }
+        if data.len > 0 && c.mock_replies.len > 0 {
+            first = c.mock_replies[0] as *Chunk
+            c.mock_data = first.b
+            let rest: ptr[] = []
+            i = 1
+            while i < c.mock_replies.len {
+                rest.push(c.mock_replies[i])
+                i = i + 1
+            }
+            c.mock_replies = rest
+        }
+        return ""
+    }
+    if c.tls != null { return tls13_client.conn_send(c.tls, data) }
+    _, werr = tcp.write_all(c.sock, data)
+    return werr
+}
+
+fn append_in(c: *MyConn, data: byte[]) {
+    if c.inpos > 0 && c.inpos >= c.inbuf.len {
+        byte[] fresh = []
+        c.inbuf = fresh
+        c.inpos = 0
+    } else if c.inpos > 1048576 {
+        rest = mysqlproto.copy_range(c.inbuf, c.inpos, c.inbuf.len)
+        c.inbuf = rest
+        c.inpos = 0
+    }
+    for x in data { c.inbuf.push(x) }
+}
+
+// One read from the connection into the buffer (buffer.fill's read).
+fn fill(c: *MyConn) -> string {
+    if c.mock {
+        if c.mock_closed { return "connection is closed" }
+        if c.mock_data.len == 0 { return "EOF" }
+        d = c.mock_data
+        byte[] e = []
+        c.mock_data = e
+        append_in(c, d)
+        return ""
+    }
+    if c.closed { return "connection is closed" }
+    if c.tls != null {
+        p, n, err = tls13_client.conn_recv(c.tls)
+        if err != "" { return err }
+        if p == null || n <= 0 { return "EOF" }
+        append_in(c, bytes.view(p)[0..n])
+        bytes.free(p)
+        return ""
+    }
+    let wait: long = 0
+    if c.deadline_ms > 0 {
+        wait = c.deadline_ms - now_ms()
+        if wait <= 0 { return "i/o timeout" }
+    }
+    if c.cfg.read_timeout > 0 {
+        rt = c.cfg.read_timeout / 1000000
+        if rt < 1 { rt = 1 }
+        if wait == 0 || rt < wait { wait = rt }
+    }
+    if wait > 0 {
+        ready, perr = tcp.poll(c.sock, wait as int)
+        if perr != "" { return perr }
+        if !ready { return "i/o timeout" }
+    }
+    n, rerr = tcp.read_into(c.sock, c.rbuf)
+    if rerr != "" {
+        if rerr == "timeout" { return "i/o timeout" }
+        return "EOF"
+    }
+    append_in(c, c.rbuf[0..n])
+    return ""
+}
+
+// readNext: the next n bytes (a copy).
+fn read_next(c: *MyConn, n: int) -> (byte[], string) {
+    while c.inbuf.len - c.inpos < n {
+        err = fill(c)
+        if err != "" {
+            byte[] e = []
+            return e, err
+        }
+    }
+    out = mysqlproto.copy_range(c.inbuf, c.inpos, c.inpos + n)
+    c.inpos = c.inpos + n
+    return out, ""
+}
+
+// readPacket: one logical packet, its payloads joined when it was split
+// at 0xffffff bytes; the sequence id checked.
+read_packet(c: *MyConn) -> (byte[], string) {
+    byte[] prev = []
+    byte[] empty = []
+    have_prev = false
+    invalid_sequence = false
+    while true {
+        hdr, err = read_next(c, 4)
+        if err != "" {
+            cleanup(c)
+            return empty, mysqlproto.ERR_INVALID_CONN
+        }
+        pkt_len = mysqlproto.get_uint24(hdr, 0)
+        seq = hdr[3] as int
+        if seq != c.sequence {
+            if have_prev {
+                cleanup(c)
+                return empty, mysqlproto.ERR_PKT_SYNC_MUL
+            }
+            invalid_sequence = true
+        }
+        c.sequence = (seq + 1) & 255
+        if pkt_len == 0 {
+            if !have_prev {
+                cleanup(c)
+                return empty, mysqlproto.ERR_INVALID_CONN
+            }
+            return prev, ""
+        }
+        data, berr = read_next(c, pkt_len)
+        if berr != "" {
+            cleanup(c)
+            return empty, mysqlproto.ERR_INVALID_CONN
+        }
+        if pkt_len < mysqlproto.MAX_PACKET_SIZE {
+            if have_prev {
+                for x in data { prev.push(x) }
+                data = prev
+            }
+            if invalid_sequence {
+                cleanup(c)
+                if (data[0] as int) != mysqlproto.I_ERR { return empty, mysqlproto.ERR_PKT_SYNC }
+            }
+            return data, ""
+        }
+        for x in data { prev.push(x) }
+        have_prev = true
+    }
+}
+
+// writePacket: `data` is 4 bytes of room for the header and the payload;
+// payloads of 0xffffff bytes or more go as several packets (one write
+// each), with a final empty one when the length is an exact multiple.
+write_packet(c: *MyConn, data: byte[]) -> string {
+    pkt_len = data.len - 4
+    if pkt_len > c.max_allowed_packet { return mysqlproto.ERR_PKT_TOO_LARGE }
+    off = 4
+    first = true
+    while true {
+        size = pkt_len
+        if size > mysqlproto.MAX_PACKET_SIZE { size = mysqlproto.MAX_PACKET_SIZE }
+        frame = make([]byte, 4 + size)
+        mysqlproto.put_uint24(frame, 0, size)
+        frame[3] = (c.sequence & 255) as byte
+        i = 0
+        while i < size {
+            frame[4 + i] = data[off + i]
+            i = i + 1
+        }
+        werr = raw_write(c, frame)
+        if werr != "" {
+            cleanup(c)
+            if first { return mysqlproto.ERR_BAD_CONN_NO_WRITE }
+            return werr
+        }
+        first = false
+        c.sequence = (c.sequence + 1) & 255
+        if size != mysqlproto.MAX_PACKET_SIZE { return "" }
+        pkt_len = pkt_len - size
+        off = off + size
+    }
+}
+
+fn with_header(payload: byte[]) -> byte[] {
+    out = make([]byte, 4 + payload.len)
+    i = 0
+    while i < payload.len {
+        out[4 + i] = payload[i]
+        i = i + 1
+    }
+    return out
+}
+
+fn reset_sequence(c: *MyConn) { c.sequence = 0 }
+
+write_command_packet(c: *MyConn, command: int) -> string {
+    reset_sequence(c)
+    data = make([]byte, 5)
+    data[4] = command as byte
+    return write_packet(c, data)
+}
+
+write_command_packet_str(c: *MyConn, command: int, arg: string) -> string {
+    reset_sequence(c)
+    w = mysqlproto.new_buf()
+    mysqlproto.put_u32(w, 0)
+    mysqlproto.put_u8(w, command)
+    mysqlproto.put_str(w, arg)
+    return write_packet(c, w.b)
+}
+
+fn write_command_packet_uint32(c: *MyConn, command: int, arg: long) -> string {
+    reset_sequence(c)
+    w = mysqlproto.new_buf()
+    mysqlproto.put_u32(w, 0)
+    mysqlproto.put_u8(w, command)
+    mysqlproto.put_u32(w, arg)
+    return write_packet(c, w.b)
+}
+
+// markBadConn: nothing was written, so the caller may retry on a new
+// connection (database/sql's driver.ErrBadConn).
+fn mark_bad_conn(err: string) -> string {
+    if err == mysqlproto.ERR_BAD_CONN_NO_WRITE { return "driver: bad connection" }
+    return err
+}
+
+// ===================================================================
+// handshake (packets.go)
+// ===================================================================
+
+// readHandshakePacket: (the scramble, the plugin, ""); the server's flags
+// kept; TLS dropped when the server has none and the DSN allows plain text.
+read_handshake_packet(c: *MyConn) -> (byte[], string, string) {
+    byte[] empty = []
+    data, err = read_packet(c)
+    if err != "" { return empty, "", err }
+    h, perr = mysqlproto.parse_handshake(data)
+    if perr != "" { return empty, "", perr }
+    c.server_version = h.server_version
+    c.flags = h.flags
+    if (c.flags & mysqlproto.CLIENT_PROTOCOL41) == 0 { return empty, "", mysqlproto.ERR_OLD_PROTOCOL }
+    if (c.flags & mysqlproto.CLIENT_SSL) == 0 && c.tls_cfg != null {
+        if c.cfg.allow_fallback_to_plaintext {
+            c.tls_cfg = null
+        } else {
+            return empty, "", mysqlproto.ERR_NO_TLS
+        }
+    }
+    return h.auth_data, h.plugin, ""
+}
+
+// encodeConnectionAttributes: the default attributes (client name, OS,
+// platform, pid, server host) and the DSN's connectionAttributes.
+encode_connection_attributes(cfg: *Config) -> byte[] {
+    w = mysqlproto.new_buf()
+    mysqlproto.append_length_encoded_string(w, "_client_name")
+    mysqlproto.append_length_encoded_string(w, "Go-MySQL-Driver (Aether port, testcontainers-ae sql/mysql)")
+    mysqlproto.append_length_encoded_string(w, "_os")
+    mysqlproto.append_length_encoded_string(w, os.platform())
+    mysqlproto.append_length_encoded_string(w, "_platform")
+    mysqlproto.append_length_encoded_string(w, os.arch())
+    mysqlproto.append_length_encoded_string(w, "_pid")
+    mysqlproto.append_length_encoded_string(w, string.from_int(os.getpid()))
+    host, _, err = split_host_port(cfg.addr)
+    if err == "" && string.length(host) > 0 {
+        mysqlproto.append_length_encoded_string(w, "_server_host")
+        mysqlproto.append_length_encoded_string(w, host)
+    }
+    for attr in split(cfg.connection_attributes, ",") {
+        ci = string.index_of(attr, ":")
+        if ci < 0 { continue }
+        mysqlproto.append_length_encoded_string(w, string.substring(attr, 0, ci))
+        mysqlproto.append_length_encoded_string(w, string.substring(attr, ci + 1, string.length(attr)))
+    }
+    return w.b
+}
+
+fn start_tls(c: *MyConn) -> string {
+    t = c.tls_cfg
+    name = t.server_name
+    if string.length(name) == 0 {
+        h, _, _ = split_host_port(c.cfg.addr)
+        name = h
+    }
+    conn, err = tls13_client.connect_socket(c.sock, name, t.root_ca_file)
+    if err != "" {
+        c.sock = null
+        c.closed = true
+        if t.preferred {
+            return "tls=preferred: the server offers TLS and its certificate did not verify (${err}); Go would accept it unverified, but std.cryptography.tls13_client.connect_socket always verifies: use tls=false, or register_tls_config with the server's CA"
+        }
+        return err
+    }
+    c.tls = conn
+    return ""
+}
+
+// writeHandshakeResponsePacket: the capability flags Go sets, the
+// collation, the user, the auth response, the database, the plugin and the
+// connection attributes; with TLS, first the SSL request and the TLS
+// handshake.
+write_handshake_response_packet(c: *MyConn, auth_resp: byte[], plugin: string) -> string {
+    cfg = c.cfg
+    let client_flags: long = mysqlproto.CLIENT_PROTOCOL41 | mysqlproto.CLIENT_SECURE_CONN |
+        mysqlproto.CLIENT_LONG_PASSWORD | mysqlproto.CLIENT_TRANSACTIONS |
+        mysqlproto.CLIENT_LOCAL_FILES | mysqlproto.CLIENT_PLUGIN_AUTH |
+        mysqlproto.CLIENT_MULTI_RESULTS |
+        (c.flags & mysqlproto.CLIENT_CONNECT_ATTRS) | (c.flags & mysqlproto.CLIENT_LONG_FLAG)
+    send_attrs = (c.flags & mysqlproto.CLIENT_CONNECT_ATTRS) != 0
+    if cfg.client_found_rows { client_flags = client_flags | mysqlproto.CLIENT_FOUND_ROWS }
+    if c.tls_cfg != null { client_flags = client_flags | mysqlproto.CLIENT_SSL }
+    if cfg.multi_statements { client_flags = client_flags | mysqlproto.CLIENT_MULTI_STATEMENTS }
+    lei = mysqlproto.new_buf()
+    mysqlproto.append_length_encoded_integer(lei, auth_resp.len as long)
+    if lei.b.len > 1 { client_flags = client_flags | mysqlproto.CLIENT_PLUGIN_AUTH_LEN_ENC_CLIENT_DATA }
+    if string.length(cfg.db_name) > 0 { client_flags = client_flags | mysqlproto.CLIENT_CONNECT_WITH_DB }
+
+    collation = mysqlproto.DEFAULT_COLLATION_ID
+    if string.length(cfg.collation) > 0 {
+        id = mysqlproto.collation_id(cfg.collation)
+        if id >= 0 {
+            collation = id
+        } else if cfg.charsets.len > 0 {
+            return "unknown collation: \"${cfg.collation}\""
+        }
+    }
+
+    head = mysqlproto.new_buf()
+    mysqlproto.put_u32(head, 0)                 // the header's room
+    mysqlproto.put_u32(head, client_flags)
+    mysqlproto.put_u32(head, 0)                 // max packet size: none
+    mysqlproto.put_u8(head, collation)
+    i = 0
+    while i < 23 {
+        mysqlproto.put_u8(head, 0)
+        i = i + 1
+    }
+    if c.tls_cfg != null {
+        if c.tls_cfg.insecure_skip_verify && !c.tls_cfg.preferred {
+            cleanup(c)
+            return "tls=skip-verify asks for TLS without certificate verification, which std.cryptography.tls13_client.connect_socket cannot do (it always verifies); use tls=true, or register_tls_config with the server's CA"
+        }
+        werr = write_packet(c, head.b)
+        if werr != "" { return werr }
+        terr = start_tls(c)
+        if terr != "" { return terr }
+    }
+    w = mysqlproto.new_buf()
+    mysqlproto.put_raw(w, head.b)
+    mysqlproto.put_str(w, cfg.user)
+    mysqlproto.put_u8(w, 0)
+    mysqlproto.put_raw(w, lei.b)
+    mysqlproto.put_raw(w, auth_resp)
+    if string.length(cfg.db_name) > 0 {
+        mysqlproto.put_str(w, cfg.db_name)
+        mysqlproto.put_u8(w, 0)
+    }
+    mysqlproto.put_str(w, plugin)
+    mysqlproto.put_u8(w, 0)
+    if send_attrs {
+        attrs = c.encoded_attributes
+        mysqlproto.append_length_encoded_integer(w, attrs.len as long)
+        mysqlproto.put_raw(w, attrs)
+    }
+    return write_packet(c, w.b)
+}
+
+// writeAuthSwitchPacket.
+fn write_auth_switch_packet(c: *MyConn, auth_data: byte[]) -> string {
+    return write_packet(c, with_header(auth_data))
+}
+
+// ===================================================================
+// auth.go
+// ===================================================================
+
+fn str_bytes(s: string) -> byte[] {
+    byte[] out = []
+    for b in string.bytes(s) { out.push(b as byte) }
+    return out
+}
+
+fn first_n(b: byte[], n: int) -> byte[] {
+    if b.len <= n { return b }
+    return mysqlproto.copy_range(b, 0, n)
+}
+
+// mysqlConn.auth: the first auth response for the plugin.
+auth(c: *MyConn, auth_data: byte[], plugin: string) -> (byte[], string) {
+    byte[] empty = []
+    cfg = c.cfg
+    if plugin == "caching_sha2_password" {
+        return mysqlproto.scramble_sha256_password(auth_data, cfg.passwd), ""
+    }
+    if plugin == "mysql_old_password" {
+        if !cfg.allow_old_passwords { return empty, mysqlproto.ERR_OLD_PASSWORD }
+        if string.length(cfg.passwd) == 0 { return empty, "" }
+        r = mysqlproto.scramble_old_password(first_n(auth_data, 8), cfg.passwd)
+        r.push(0 as byte)
+        return r, ""
+    }
+    if plugin == "mysql_clear_password" {
+        if !cfg.allow_cleartext_passwords { return empty, mysqlproto.ERR_CLEARTEXT_PASSWORD }
+        r = str_bytes(cfg.passwd)
+        r.push(0 as byte)
+        return r, ""
+    }
+    if plugin == "mysql_native_password" {
+        if !cfg.allow_native_passwords { return empty, mysqlproto.ERR_NATIVE_PASSWORD }
+        return mysqlproto.scramble_password(first_n(auth_data, 20), cfg.passwd), ""
+    }
+    if plugin == "sha256_password" {
+        if string.length(cfg.passwd) == 0 {
+            byte[] z = []
+            z.push(0 as byte)
+            return z, ""
+        }
+        if c.tls_cfg != null {
+            r = str_bytes(cfg.passwd)
+            r.push(0 as byte)
+            return r, ""
+        }
+        if cfg.pub_key == null {
+            byte[] one = []
+            one.push(1 as byte)
+            return one, ""
+        }
+        return mysqlproto.encrypt_password(cfg.passwd, auth_data, cfg.pub_key)
+    }
+    if plugin == "client_ed25519" {
+        return empty, "client_ed25519 is not supported by this port (std.cryptography.ed25519 signs from a 32-byte seed; MariaDB's plugin needs the scalar of SHA-512(password))"
+    }
+    return empty, mysqlproto.ERR_UNKNOWN_PLUGIN
+}
+
+// What readAuthResult read: more auth data, an auth switch request (a new
+// plugin, with or without data), or OK.
+struct AuthResult {
+    data: byte[]
+    has_data: bool
+    plugin: string
+}
+
+// readAuthResult.
+read_auth_result(c: *MyConn) -> (*AuthResult, string) {
+    r = heap.new(AuthResult)
+    r.has_data = false
+    r.plugin = ""
+    data, err = read_packet(c)
+    if err != "" { return r, err }
+    k = data[0] as int
+    if k == mysqlproto.I_OK {
+        return r, handle_ok_packet(c, data)
+    }
+    if k == mysqlproto.I_AUTH_MORE_DATA {
+        r.data = mysqlproto.copy_range(data, 1, data.len)
+        r.has_data = true
+        return r, ""
+    }
+    if k == mysqlproto.I_EOF {
+        if data.len == 1 {
+            r.plugin = "mysql_old_password"
+            return r, ""
+        }
+        end = mysqlproto.index_byte(data, 0, 0)
+        if end < 0 { return r, mysqlproto.ERR_MALFORM_PKT }
+        r.plugin = bytes.string_from_slice(data[1..end])
+        ad = mysqlproto.copy_range(data, end + 1, data.len)
+        if ad.len > 0 && (ad[ad.len - 1] as int) == 0 {
+            ad = mysqlproto.copy_range(ad, 0, ad.len - 1)
+        }
+        r.data = ad
+        r.has_data = true
+        return r, ""
+    }
+    return r, handle_error_packet(c, data)
+}
+
+fn write_cleartext(c: *MyConn) -> string {
+    p = str_bytes(c.cfg.passwd)
+    p.push(0 as byte)
+    return write_auth_switch_packet(c, p)
+}
+
+fn send_encrypted_password(c: *MyConn, seed: byte[], key: ptr) -> string {
+    enc, err = mysqlproto.encrypt_password(c.cfg.passwd, seed, key)
+    if err != "" { return err }
+    return write_auth_switch_packet(c, enc)
+}
+
+// handleAuthResult: an auth switch (once), then the plugin's own exchange.
+handle_auth_result(c: *MyConn, old_auth_data: byte[], plugin: string) -> string {
+    old = mysqlproto.copy_range(old_auth_data, 0, old_auth_data.len)
+    r, err = read_auth_result(c)
+    if err != "" { return err }
+    auth_data = r.data
+    if string.length(r.plugin) > 0 {
+        if !r.has_data {
+            auth_data = old
+        } else {
+            // copy(oldAuthData, authData)
+            i = 0
+            while i < old.len && i < auth_data.len {
+                old[i] = auth_data[i]
+                i = i + 1
+            }
+        }
+        plugin = r.plugin
+        resp, aerr = auth(c, auth_data, plugin)
+        if aerr != "" { return aerr }
+        werr = write_auth_switch_packet(c, resp)
+        if werr != "" { return werr }
+        r2, rerr = read_auth_result(c)
+        if rerr != "" { return rerr }
+        if string.length(r2.plugin) > 0 { return mysqlproto.ERR_MALFORM_PKT }
+        auth_data = r2.data
+    }
+    c.auth_path = plugin
+    if plugin == "caching_sha2_password" {
+        if auth_data.len == 0 { return "" }
+        if auth_data.len != 1 { return mysqlproto.ERR_MALFORM_PKT }
+        k = auth_data[0] as int
+        if k == mysqlproto.CACHING_SHA2_FAST_AUTH_SUCCESS {
+            c.auth_path = "caching_sha2_password fast"
+            return read_result_ok(c)
+        }
+        if k == mysqlproto.CACHING_SHA2_PERFORM_FULL_AUTHENTICATION {
+            if c.tls_cfg != null || c.cfg.net == "unix" {
+                c.auth_path = "caching_sha2_password full (cleartext over TLS or a Unix socket)"
+                werr = write_cleartext(c)
+                if werr != "" { return werr }
+            } else {
+                key = c.cfg.pub_key
+                c.auth_path = "caching_sha2_password full (RSA, serverPubKey)"
+                if key == null {
+                    c.auth_path = "caching_sha2_password full (RSA, key fetched from the server)"
+                    req = make([]byte, 5)
+                    req[4] = mysqlproto.CACHING_SHA2_REQUEST_PUBLIC_KEY as byte
+                    werr = write_packet(c, req)
+                    if werr != "" { return werr }
+                    data, perr = read_packet(c)
+                    if perr != "" { return perr }
+                    if (data[0] as int) != mysqlproto.I_AUTH_MORE_DATA {
+                        return "unexpected resp from server for caching_sha2_password, perform full authentication"
+                    }
+                    k2, kerr = mysqlproto.parse_pkix_public_key(bytes.string_from_slice(data[1..data.len]))
+                    if kerr != "" { return kerr }
+                    key = k2
+                }
+                serr = send_encrypted_password(c, old, key)
+                if serr != "" { return serr }
+            }
+            return read_result_ok(c)
+        }
+        return mysqlproto.ERR_MALFORM_PKT
+    }
+    if plugin == "sha256_password" {
+        if auth_data.len == 0 { return "" }
+        c.auth_path = "sha256_password (RSA)"
+        key, kerr = mysqlproto.parse_pkix_public_key(bytes.string_from_slice(auth_data))
+        if kerr != "" { return kerr }
+        serr = send_encrypted_password(c, old, key)
+        if serr != "" { return serr }
+        return read_result_ok(c)
+    }
+    return ""
+}
+
+// ===================================================================
+// results (packets.go, result.go)
+// ===================================================================
+
+fn clear_result(c: *MyConn) {
+    let a: long[] = []
+    let b: long[] = []
+    c.affected_rows = a
+    c.insert_ids = b
+}
+
+// handleOkPacket: the affected rows and insert id of the current statement
+// (when one is being read) and the status.
+fn handle_ok_packet(c: *MyConn, data: byte[]) -> string {
+    ok, err = mysqlproto.parse_ok_packet(data)
+    if err != "" { return err }
+    if c.affected_rows.len > 0 { c.affected_rows[c.affected_rows.len - 1] = ok.affected_rows }
+    if c.insert_ids.len > 0 { c.insert_ids[c.insert_ids.len - 1] = ok.insert_id }
+    c.status = ok.status
+    return ""
+}
+
+// handleErrorPacket: the server's error as text; with rejectReadOnly, a
+// read-only error closes the connection (Go returns driver.ErrBadConn).
+fn handle_error_packet(c: *MyConn, data: byte[]) -> string {
+    if (data[0] as int) != mysqlproto.I_ERR { return mysqlproto.ERR_MALFORM_PKT }
+    e = mysqlproto.parse_error_packet(data)
+    if (e.number == 1792 || e.number == 1290 || e.number == 1836) && c.cfg.reject_read_only {
+        close(c)
+        return "driver: bad connection"
+    }
+    return mysqlproto.mysql_error_string(e)
+}
+
+// readResultOK.
+fn read_result_ok(c: *MyConn) -> string {
+    data, err = read_packet(c)
+    if err != "" { return err }
+    if (data[0] as int) == mysqlproto.I_OK { return handle_ok_packet(c, data) }
+    return handle_error_packet(c, data)
+}
+
+// The affected rows / insert id of the last statement (Go's mysqlResult).
+last_affected_rows(c: *MyConn) -> long {
+    if c.affected_rows.len == 0 { return 0 }
+    return c.affected_rows[c.affected_rows.len - 1]
+}
+last_insert_id(c: *MyConn) -> long {
+    if c.insert_ids.len == 0 { return 0 }
+    return c.insert_ids[c.insert_ids.len - 1]
+}
+all_rows_affected(c: *MyConn) -> long[] {
+    let out: long[] = []
+    for x in c.affected_rows { out.push(x) }
+    return out
+}
+all_last_insert_ids(c: *MyConn) -> long[] {
+    let out: long[] = []
+    for x in c.insert_ids { out.push(x) }
+    return out
+}
+
+// LOAD DATA LOCAL INFILE is not ported: answer with an empty file (the
+// termination packet), read the server's answer, and say so.
+fn refuse_infile(c: *MyConn, name: string) -> string {
+    term = make([]byte, 4)
+    werr = write_packet(c, term)
+    if werr != "" { return werr }
+    rerr = read_result_ok(c)
+    msg = "LOAD DATA LOCAL INFILE '${name}' is not supported by this port"
+    if rerr != "" { return "${msg}; the server said: ${rerr}" }
+    return msg
+}
+
+// readResultSetHeaderPacket: the column count (0 for an OK).
+fn read_result_set_header_packet(c: *MyConn) -> (int, string) {
+    c.affected_rows.push(0)
+    c.insert_ids.push(0)
+    data, err = read_packet(c)
+    if err != "" { return 0, err }
+    k = data[0] as int
+    if k == mysqlproto.I_OK { return 0, handle_ok_packet(c, data) }
+    if k == mysqlproto.I_ERR { return 0, handle_error_packet(c, data) }
+    if k == mysqlproto.I_LOCAL_INFILE {
+        return 0, refuse_infile(c, bytes.string_from_slice(data[1..data.len]))
+    }
+    num, _, _ = mysqlproto.read_length_encoded_integer(data, 0)
+    return num as int, ""
+}
+
+// readUntilEOF.
+fn read_until_eof(c: *MyConn) -> string {
+    while true {
+        data, err = read_packet(c)
+        if err != "" { return err }
+        k = data[0] as int
+        if k == mysqlproto.I_ERR { return handle_error_packet(c, data) }
+        if k == mysqlproto.I_EOF {
+            if data.len == 5 { c.status = mysqlproto.read_status(data, 3) }
+            return ""
+        }
+    }
+}
+
+// readColumns.
+fn read_columns(c: *MyConn, count: int) -> (mysqlproto.Field[], string) {
+    let cols: mysqlproto.Field[] = []
+    i = 0
+    while true {
+        data, err = read_packet(c)
+        if err != "" { return cols, err }
+        if mysqlproto.is_eof_packet(data) {
+            if i == count { return cols, "" }
+            got = cols.len
+            return cols, "column count mismatch n:${count} len:${got}"
+        }
+        f, perr = mysqlproto.parse_column(data, c.cfg.columns_with_alias)
+        if perr != "" { return cols, perr }
+        cols.push(f)
+        i = i + 1
+    }
+}
+
+// discardResults: read and drop the result sets after this one.
+fn discard_results(c: *MyConn) -> string {
+    while (c.status & mysqlproto.STATUS_MORE_RESULTS_EXISTS) != 0 {
+        n, err = read_result_set_header_packet(c)
+        if err != "" { return err }
+        if n > 0 {
+            e1 = read_until_eof(c)
+            if e1 != "" { return e1 }
+            e2 = read_until_eof(c)
+            if e2 != "" { return e2 }
+        }
+    }
+    return ""
+}
+
+fn set_columns(c: *MyConn, rs: *ResultSet, cols: mysqlproto.Field[]) {
+    rs.fields = cols
+    string[] names = []
+    string[] types = []
+    for f in cols {
+        if c.cfg.columns_with_alias && string.length(f.table_name) > 0 {
+            names.push("${f.table_name}.${f.name}")
+        } else {
+            names.push(f.name)
+        }
+        types.push(mysqlproto.type_database_name(f))
+    }
+    rs.names = names
+    rs.types = types
+}
+
+// The rows of a result set up to its EOF (textRows/binaryRows.readRow in a
+// loop), then the result sets after it dropped (Rows.Close).
+fn read_rows(c: *MyConn, rs: *ResultSet, binary: bool) -> string {
+    ncols = rs.fields.len
+    while true {
+        data, err = read_packet(c)
+        if err != "" { return err }
+        k = data[0] as int
+        if k == mysqlproto.I_EOF && data.len == 5 {
+            c.status = mysqlproto.read_status(data, 3)
+            break
+        }
+        if k == mysqlproto.I_ERR { return handle_error_packet(c, data) }
+        row = mysqlproto.new_row()
+        derr = ""
+        if binary {
+            derr = mysqlproto.decode_binary_row(data, rs.fields, row)
+        } else {
+            derr = mysqlproto.decode_text_row(data, ncols, row)
+        }
+        if derr != "" { return derr }
+        for v in row.values { rs.values.push(v) }
+        for n in row.nulls { rs.nulls.push(n) }
+        rs.nrows = rs.nrows + 1
+    }
+    return discard_results(c)
+}
+
+// ===================================================================
+// connecting (connector.go)
+// ===================================================================
+
+fn dial(c: *MyConn) -> string {
+    cfg = c.cfg
+    if cfg.net == "unix" {
+        s, err = tcp.connect_unix(cfg.addr)
+        if err != "" { return "dial unix ${err}" }
+        c.sock = s
+        return ""
+    }
+    if cfg.net != "tcp" && cfg.net != "tcp4" && cfg.net != "tcp6" {
+        return "dial ${cfg.net}: unknown network ${cfg.net}"
+    }
+    host, port_s, err = split_host_port(cfg.addr)
+    if err != "" { return "dial tcp ${err}" }
+    port, perr = string.to_int(port_s)
+    if perr != "" { return "dial tcp: address ${cfg.addr}: invalid port" }
+    s, cerr = tcp.connect(host, port)
+    if cerr != "" { return "dial tcp ${cfg.addr}: ${cerr}" }
+    c.sock = s
+    return ""
+}
+
+// Connect with a DSN.
+connect(dsn: string) -> (*MyConn, string) {
+    cfg, err = parse_dsn(dsn)
+    if err != "" { return null, err }
+    return connect_config(cfg)
+}
+
+// connector.Connect: dial, the handshake, authentication, then
+// max_allowed_packet, SET NAMES and the DSN's system variables.
+connect_config(cfg: *Config) -> (*MyConn, string) {
+    c = new_conn(cfg)
+    c.encoded_attributes = encode_connection_attributes(cfg)
+    if cfg.tls != null && cfg.tls.insecure_skip_verify && !cfg.tls.preferred {
+        return null, "tls=skip-verify asks for TLS without certificate verification, which std.cryptography.tls13_client.connect_socket cannot do (it always verifies); use tls=true, or register_tls_config with the server's CA"
+    }
+    if cfg.timeout > 0 {
+        ms = cfg.timeout / 1000000
+        if ms < 1 { ms = 1 }
+        c.deadline_ms = now_ms() + ms
+    }
+    derr = dial(c)
+    if derr != "" { return null, derr }
+    auth_data, plugin, herr = read_handshake_packet(c)
+    if herr != "" {
+        cleanup(c)
+        return null, herr
+    }
+    if string.length(plugin) == 0 { plugin = mysqlproto.DEFAULT_AUTH_PLUGIN }
+    resp, aerr = auth(c, auth_data, plugin)
+    if aerr != "" {
+        plugin = mysqlproto.DEFAULT_AUTH_PLUGIN
+        resp2, aerr2 = auth(c, auth_data, plugin)
+        if aerr2 != "" {
+            cleanup(c)
+            return null, aerr2
+        }
+        resp = resp2
+    }
+    werr = write_handshake_response_packet(c, resp, plugin)
+    if werr != "" {
+        cleanup(c)
+        return null, werr
+    }
+    rerr = handle_auth_result(c, auth_data, plugin)
+    if rerr != "" {
+        cleanup(c)
+        return null, rerr
+    }
+    c.deadline_ms = 0
+    if cfg.max_allowed_packet > 0 {
+        c.max_allowed_packet = cfg.max_allowed_packet
+    } else {
+        rs, qerr = query(c, "SELECT @@max_allowed_packet")
+        if qerr != "" {
+            close(c)
+            return null, qerr
+        }
+        if rs.nrows < 1 {
+            close(c)
+            return null, "invalid max_allowed_packet value (\"\")"
+        }
+        n, nerr = string.to_int(rs.values[0])
+        if nerr != "" {
+            close(c)
+            return null, "invalid max_allowed_packet value (\"${rs.values[0]}\")"
+        }
+        c.max_allowed_packet = n - 1
+    }
+    if c.max_allowed_packet < mysqlproto.MAX_PACKET_SIZE { c.max_write_size = c.max_allowed_packet }
+    if cfg.charsets.len > 0 {
+        serr = ""
+        for cs in cfg.charsets {
+            if string.length(cfg.collation) > 0 {
+                serr = exec(c, "SET NAMES ${cs} COLLATE ${cfg.collation}")
+            } else {
+                serr = exec(c, "SET NAMES ${cs}")
+            }
+            if serr == "" { break }
+        }
+        if serr != "" {
+            close(c)
+            return null, serr
+        }
+    }
+    if cfg.param_keys.len > 0 {
+        set = "SET "
+        i = 0
+        while i < cfg.param_keys.len {
+            if i > 0 { set = "${set}, " }
+            set = "${set}${cfg.param_keys[i]} = ${cfg.param_vals[i]}"
+            i = i + 1
+        }
+        perr = exec(c, set)
+        if perr != "" {
+            close(c)
+            return null, perr
+        }
+    }
+    return c, ""
+}
+
+// ===================================================================
+// commands (connection.go, statement.go, transaction.go)
+// ===================================================================
+
+// Close: COM_QUIT, then the socket (idempotent). Null-safe.
+close(c: *MyConn) -> string {
+    if c == null { return "" }
+    err = ""
+    if !c.closed { err = write_command_packet(c, mysqlproto.COM_QUIT) }
+    cleanup(c)
+    return err
+}
+
+// Ping: COM_PING and its OK.
+ping(c: *MyConn) -> string {
+    if c.closed { return "driver: bad connection" }
+    clear_result(c)
+    werr = write_command_packet(c, mysqlproto.COM_PING)
+    if werr != "" { return mark_bad_conn(werr) }
+    return read_result_ok(c)
+}
+
+// exec: COM_QUERY whose results are read and dropped (several statements
+// with multiStatements); the affected rows and insert ids are kept.
+exec(c: *MyConn, q: string) -> string {
+    if c.closed { return "driver: bad connection" }
+    clear_result(c)
+    werr = write_command_packet_str(c, mysqlproto.COM_QUERY, q)
+    if werr != "" { return mark_bad_conn(werr) }
+    n, err = read_result_set_header_packet(c)
+    if err != "" { return err }
+    if n > 0 {
+        e1 = read_until_eof(c)
+        if e1 != "" { return e1 }
+        e2 = read_until_eof(c)
+        if e2 != "" { return e2 }
+    }
+    return discard_results(c)
+}
+
+// query: COM_QUERY and its first result set with columns (empty when none
+// has columns), text protocol.
+query(c: *MyConn, q: string) -> (*ResultSet, string) {
+    rs = new_result_set()
+    if c.closed { return rs, "driver: bad connection" }
+    clear_result(c)
+    werr = write_command_packet_str(c, mysqlproto.COM_QUERY, q)
+    if werr != "" { return rs, mark_bad_conn(werr) }
+    n, err = read_result_set_header_packet(c)
+    if err != "" { return rs, err }
+    while n == 0 {
+        if (c.status & mysqlproto.STATUS_MORE_RESULTS_EXISTS) == 0 { return rs, "" }
+        n2, err2 = read_result_set_header_packet(c)
+        if err2 != "" { return rs, err2 }
+        n = n2
+    }
+    cols, cerr = read_columns(c, n)
+    if cerr != "" { return rs, cerr }
+    set_columns(c, rs, cols)
+    return rs, read_rows(c, rs, false)
+}
+
+// Prepare: COM_STMT_PREPARE, the statement's id and counts, its parameter
+// and column definitions read and dropped.
+prepare(c: *MyConn, q: string) -> (*Stmt, string) {
+    if c.closed { return null, "driver: bad connection" }
+    werr = write_command_packet_str(c, mysqlproto.COM_STMT_PREPARE, q)
+    if werr != "" { return null, "driver: bad connection" }
+    data, err = read_packet(c)
+    if err != "" { return null, err }
+    if (data[0] as int) != mysqlproto.I_OK { return null, handle_error_packet(c, data) }
+    id, ncols, nparams, perr = mysqlproto.prepare_ok(data)
+    if perr != "" { return null, perr }
+    st = heap.new(Stmt)
+    st.id = id
+    st.param_count = nparams
+    st.column_count = ncols
+    if nparams > 0 {
+        e1 = read_until_eof(c)
+        if e1 != "" { return null, e1 }
+    }
+    if ncols > 0 {
+        e2 = read_until_eof(c)
+        if e2 != "" { return null, e2 }
+    }
+    return st, ""
+}
+
+// writeCommandLongData: a string or blob argument too big for the
+// execute packet, in COM_STMT_SEND_LONG_DATA chunks.
+fn write_long_data(c: *MyConn, st: *Stmt, param_id: int, arg: string) -> string {
+    b = string.bytes(arg)
+    max_len = c.max_allowed_packet - 1
+    chunk_max = max_len - 7
+    off = 0
+    while off < b.len {
+        end = off + chunk_max
+        if end > b.len { end = b.len }
+        byte[] chunk = []
+        i = off
+        while i < end {
+            chunk.push(b[i] as byte)
+            i = i + 1
+        }
+        reset_sequence(c)
+        werr = write_packet(c, with_header(mysqlproto.long_data_packet(st.id, param_id, chunk)))
+        if werr != "" { return werr }
+        off = end
+    }
+    reset_sequence(c)
+    return ""
+}
+
+// writeExecutePacket.
+fn write_execute_packet(c: *MyConn, st: *Stmt, args: sql.Value[]) -> string {
+    if args.len != st.param_count {
+        return "argument count mismatch (got: ${args.len}; has: ${st.param_count})"
+    }
+    long_size = c.max_allowed_packet / (st.param_count + 1)
+    if long_size < 64 { long_size = 64 }
+    bool[] long_data = []
+    i = 0
+    while i < args.len {
+        a = args[i]
+        ld = false
+        if (a.kind == sql.KIND_TEXT || a.kind == sql.KIND_BYTES) && string.length(a.s) >= long_size {
+            lerr = write_long_data(c, st, i, a.s)
+            if lerr != "" { return lerr }
+            ld = true
+        }
+        long_data.push(ld)
+        i = i + 1
+    }
+    reset_sequence(c)
+    body, berr = mysqlproto.execute_packet(st.id, args, long_data)
+    if berr != "" { return berr }
+    return write_packet(c, with_header(body))
+}
+
+// mysqlStmt.Exec: the result's affected rows and insert id kept.
+stmt_exec(c: *MyConn, st: *Stmt, args: sql.Value[]) -> string {
+    if c.closed { return "driver: bad connection" }
+    werr = write_execute_packet(c, st, args)
+    if werr != "" { return mark_bad_conn(werr) }
+    clear_result(c)
+    n, err = read_result_set_header_packet(c)
+    if err != "" { return err }
+    if n > 0 {
+        e1 = read_until_eof(c)
+        if e1 != "" { return e1 }
+        e2 = read_until_eof(c)
+        if e2 != "" { return e2 }
+    }
+    return discard_results(c)
+}
+
+// mysqlStmt.Query: the binary-protocol rows.
+stmt_query(c: *MyConn, st: *Stmt, args: sql.Value[]) -> (*ResultSet, string) {
+    rs = new_result_set()
+    if c.closed { return rs, "driver: bad connection" }
+    werr = write_execute_packet(c, st, args)
+    if werr != "" { return rs, mark_bad_conn(werr) }
+    clear_result(c)
+    n, err = read_result_set_header_packet(c)
+    if err != "" { return rs, err }
+    if n == 0 { return rs, discard_results(c) }
+    cols, cerr = read_columns(c, n)
+    if cerr != "" { return rs, cerr }
+    set_columns(c, rs, cols)
+    return rs, read_rows(c, rs, true)
+}
+
+// mysqlStmt.Close: COM_STMT_CLOSE (the server does not answer).
+stmt_close(c: *MyConn, st: *Stmt) -> string {
+    if c == null || c.closed || st == null { return "" }
+    return write_command_packet_uint32(c, mysqlproto.COM_STMT_CLOSE, st.id)
+}
+
+// mysqlConn.Begin / mysqlTx.Commit / Rollback.
+begin(c: *MyConn) -> string {
+    if c.closed { return "driver: bad connection" }
+    return mark_bad_conn(exec(c, "START TRANSACTION"))
+}
+commit(c: *MyConn) -> string {
+    if c.closed { return mysqlproto.ERR_INVALID_CONN }
+    return exec(c, "COMMIT")
+}
+rollback(c: *MyConn) -> string {
+    if c.closed { return mysqlproto.ERR_INVALID_CONN }
+    return exec(c, "ROLLBACK")
+}

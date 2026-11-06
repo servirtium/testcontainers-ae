@@ -1,0 +1,441 @@
+// Ported from testcontainers-go modules/compose/compose_local_examples_test.go, compose_examples_test.go, compose_test.go, compose_api_test.go (TestDockerComposeAPIWithProfiles), compose_builder_test.go (the testdata renderers)
+//
+// Engine-free, run for real: the command lines up and down assemble from
+// their options, CLI discovery's precedence against a fake PATH of shell
+// scripts, the project-name rules, services() across files and profiles,
+// content() (Go's WithStackReaders), env(), and the session-label override.
+//
+// Engine cases (the Go examples and the TestLocalDockerCompose* gist) are
+// compile-checked only: they run when TCAE_LIVE_COMPOSE=1 and an engine
+// answers, and are skipped otherwise without touching the engine.
+
+import std.spec
+import std.string
+import std.fs
+import std.os
+import std.tcp
+import std.json
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+import testcontainers.miniyaml as yaml
+import testcontainers.testing
+import modules.compose
+
+const TESTDATA = "modules/compose/testdata"
+
+// Go's ExampleNewDockerComposeWith compose content.
+const EXAMPLE_COMPOSE = <<YML
+services:
+  nginx:
+    image: nginx:stable-alpine
+    environment:
+      bar: ${bar}
+      foo: ${foo}
+    ports:
+      - "8081:80"
+  mysql:
+    image: mysql:8.0.36
+    environment:
+      - MYSQL_DATABASE=db
+      - MYSQL_ROOT_PASSWORD=my-secret-pw
+    ports:
+     - "3307:3306"
+
+YML
+
+const EXAMPLE_COMPOSE_NGINX = <<YML
+services:
+  nginx:
+    image: nginx:stable-alpine
+    environment:
+      bar: ${bar}
+      foo: ${foo}
+    ports:
+      - "8081:80"
+
+YML
+
+const FAKE_OK = "#!/bin/sh\nif [ \"$1\" = compose ] && [ \"$2\" = version ]; then exit 0; fi\nexit 1\n"
+const FAKE_FAIL = "#!/bin/sh\nexit 1\n"
+
+fn join(xs: string[]) -> string {
+    t = ""
+    for x in xs {
+        if string.length(t) > 0 { t = "${t} " }
+        t = "${t}${x}"
+    }
+    return t
+}
+
+// A free local port (Go's getFreePort).
+fn free_port() -> int {
+    srv, err = tcp.listen_on("127.0.0.1", 0)
+    if err != "" { return 0 }
+    p = tcp.server_port(srv)
+    tcp.server_close(srv)
+    return p
+}
+
+// Go's writeTemplateWithSrvType: the testdata file with {{ .ServiceType }}
+// and {{ .Port_N }} filled in, written to a temporary directory.
+fn render(name: string, srv_type: string, ports: int[]) -> string {
+    text, err = fs.read("${TESTDATA}/${name}")
+    if err != "" { return "" }
+    text = string.replace_all(text, "{{ .ServiceType }}", srv_type)
+    i = 0
+    while i < ports.len {
+        text = string.replace_all(text, "{{ .Port_${i} }}", "${ports[i]}")
+        i = i + 1
+    }
+    dir, derr = fs.make_temp_dir("", "tcae-compose-test-")
+    if derr != "" { return "" }
+    p = "${dir}/${name}"
+    _ = fs.write(p, text)
+    return p
+}
+
+fn render_simple() -> string { return render("docker-compose-simple.yml", "local", [free_port()]) }
+fn render_complex() -> string { return render("docker-compose-complex.yml", "local", [free_port(), free_port()]) }
+
+fn fake_bin(dir: string, name: string, script: string) {
+    p = "${dir}/${name}"
+    _ = fs.write(p, script)
+    _, _, _ = fs.chmod(p, 493)
+}
+
+fn fake_path() -> string {
+    dir, _ = fs.make_temp_dir("", "tcae-compose-path-")
+    return dir
+}
+
+fn contains(xs: string[], x: string) -> bool {
+    for y in xs {
+        if y == x { return true }
+    }
+    return false
+}
+
+fn engine_free(fw: @keep ptr) {
+    spec.describe(fw, "modules/compose (engine-free)") {
+        spec.it("refuses a stack with no files (ErrNoStackConfigured)") callback {
+            _, err = compose.new_stack() { profile("dev") }
+            spec.assert_str_eq(err, compose.ERR_NO_STACK_CONFIGURED, "no files")
+            string[] none_given = []
+            _, err2 = compose.from_files(none_given)
+            spec.assert_str_eq(err2, compose.ERR_NO_STACK_CONFIGURED, "from_files with none")
+        }
+
+        spec.it("names the project with a random lower-case uuid by default, as Go") callback {
+            a, aerr = compose.new_stack() { file("/path/to/docker-compose.yml") }
+            b, _ = compose.new_stack() { file("/path/to/docker-compose.yml") }
+            spec.assert_ok(aerr, "new stack")
+            pa = compose.project_name(a)
+            spec.assert_eq(string.length(pa), 36, "a uuid: ${pa}")
+            spec.assert_str_eq(pa, string.to_lower(pa), "lower case")
+            spec.assert_true(pa != compose.project_name(b), "two stacks, two names")
+            n, nerr = compose.normalize_project_name(pa)
+            spec.assert_ok(nerr, "a valid compose project name")
+            spec.assert_str_eq(n, pa, "unchanged")
+        }
+
+        spec.it("lower-cases an identifier and refuses an invalid one (NewLocalDockerCompose, StackIdentifier)") callback {
+            s, err = compose.new_stack() {
+                file("/path/to/docker-compose.yml")
+                identifier("My_Project-1")
+            }
+            spec.assert_ok(err, "valid")
+            spec.assert_str_eq(compose.project_name(s), "my_project-1", "lower-cased")
+            _, e1 = compose.new_stack() {
+                file("/path/to/docker-compose.yml")
+                identifier("my project")
+            }
+            spec.assert_err_contains(e1, "invalid project name", "a space")
+            _, e2 = compose.normalize_project_name("-leading")
+            spec.assert_err(e2, "a leading dash")
+            _, e3 = compose.normalize_project_name("")
+            spec.assert_err(e3, "empty")
+        }
+
+        spec.it("assembles up and down from their options (ExampleLocalDockerCompose_Invoke, _Down)") callback {
+            s, _ = compose.new_stack() {
+                file("/path/to/docker-compose.yml")
+                file("/path/to/docker-compose-1.yml")
+                identifier("my_project")
+                profile("dev")
+                cli(["docker", "compose"])
+            }
+            up = compose.up_options_new()
+            spec.assert_str_eq(join(compose.command_line(s, compose.up_args(up))),
+                "docker compose -p my_project -f /path/to/docker-compose.yml -f /path/to/docker-compose-1.yml --profile dev up -d",
+                "plain up is up -d (Go's WithCommand([up -d]))")
+            compose.remove_orphans(up)
+            compose.wait_running(up)
+            compose.recreate(up, compose.RECREATE_FORCE)
+            compose.recreate_dependencies(up, compose.RECREATE_FORCE)
+            compose.run_services(up, ["web", "db"])
+            spec.assert_str_eq(join(compose.up_args(up)),
+                "up -d --remove-orphans --wait --force-recreate --always-recreate-deps db web",
+                "every up option; services sorted, as Go sorts RunServices")
+            u2 = compose.up_options_new()
+            compose.recreate(u2, compose.RECREATE_NEVER)
+            spec.assert_str_eq(join(compose.up_args(u2)), "up -d --no-recreate", "recreate never")
+            spec.assert_str_eq(compose.validate_recreate("sometimes"), compose.RECREATE_FORCE, "an unknown recreate is force (validateRecreate)")
+            spec.assert_str_eq(compose.validate_recreate(compose.RECREATE_DIVERGED), compose.RECREATE_DIVERGED, "diverged kept")
+
+            down = compose.down_options_new()
+            spec.assert_str_eq(join(compose.down_args(down)), "down", "plain down")
+            compose.remove_orphans(down)
+            compose.remove_volumes(down)
+            compose.remove_images(down, compose.REMOVE_IMAGES_LOCAL)
+            spec.assert_str_eq(join(compose.command_line(s, compose.down_args(down))),
+                "docker compose -p my_project -f /path/to/docker-compose.yml -f /path/to/docker-compose-1.yml --profile dev down --remove-orphans --volumes --rmi local",
+                "LocalDockerCompose.Down is down --remove-orphans --volumes")
+            compose.options_free(up)
+            compose.options_free(u2)
+            compose.options_free(down)
+        }
+
+        spec.it("makes relative compose files absolute (filepath.Abs)") callback {
+            s, _ = compose.new_stack() { file("modules/compose/testdata/docker-compose-simple.yml") }
+            fs0 = compose.stack_files(s)
+            spec.assert_eq(fs0.len, 1, "one file")
+            spec.assert_true(string.starts_with(fs0[0], "/") == 1, "absolute: ${fs0[0]}")
+            spec.assert_true(string.ends_with(fs0[0], "/modules/compose/testdata/docker-compose-simple.yml") == 1, "same file: ${fs0[0]}")
+        }
+
+        spec.it("discovers the compose CLI in order: docker compose, docker-compose, podman compose, podman-compose") callback {
+            all = fake_path()
+            fake_bin(all, "docker", FAKE_OK)
+            fake_bin(all, "docker-compose", FAKE_OK)
+            fake_bin(all, "podman", FAKE_OK)
+            fake_bin(all, "podman-compose", FAKE_OK)
+            c1, e1 = compose.discover_in("/nonexistent:${all}", "")
+            spec.assert_ok(e1, "found")
+            spec.assert_str_eq(join(c1), "${all}/docker compose", "docker compose first")
+
+            noplugin = fake_path()
+            fake_bin(noplugin, "docker", FAKE_FAIL)
+            fake_bin(noplugin, "docker-compose", FAKE_OK)
+            fake_bin(noplugin, "podman", FAKE_OK)
+            c2, _ = compose.discover_in(noplugin, "")
+            spec.assert_str_eq(join(c2), "${noplugin}/docker-compose", "docker without the plugin: docker-compose")
+
+            pod = fake_path()
+            fake_bin(pod, "podman", FAKE_OK)
+            fake_bin(pod, "podman-compose", FAKE_OK)
+            c3, _ = compose.discover_in(pod, "")
+            spec.assert_str_eq(join(c3), "${pod}/podman compose", "podman compose before podman-compose")
+
+            pc = fake_path()
+            fake_bin(pc, "podman", FAKE_FAIL)
+            fake_bin(pc, "podman-compose", FAKE_OK)
+            c4, _ = compose.discover_in(pc, "")
+            spec.assert_str_eq(join(c4), "${pc}/podman-compose", "podman-compose last")
+
+            empty = fake_path()
+            _, e5 = compose.discover_in(empty, "")
+            spec.assert_err_contains(e5, compose.COMMAND_ENV, "none found: the error names the override")
+
+            c6, e6 = compose.discover_in(all, "  podman   compose ")
+            spec.assert_ok(e6, "override")
+            spec.assert_str_eq(join(c6), "podman compose", "TESTCONTAINERS_COMPOSE_COMMAND wins, split on spaces")
+        }
+
+        spec.it("lists services across files (TestLocalDockerComposeWithMultipleComposeFiles)") callback {
+            s, err = compose.new_stack() {
+                file(render_simple())
+                file(render("docker-compose-postgres.yml", "local", [free_port()]))
+                file(render("docker-compose-override.yml", "local", [free_port()]))
+            }
+            spec.assert_ok(err, "stack")
+            spec.assert_str_eq(join(compose.services(s)), "local-mysql local-nginx local-postgres", "three services, sorted")
+        }
+
+        spec.it("filters services by profile (TestDockerComposeAPIWithProfiles)") callback {
+            p = "${TESTDATA}/docker-compose-profiles.yml"
+            s0, _ = compose.new_stack() { file(p) }
+            spec.assert_str_eq(join(compose.services(s0)), "starts-always", "no profile")
+            s1, _ = compose.new_stack() { file(p); profile("dev") }
+            spec.assert_str_eq(join(compose.services(s1)), "dev-or-test only-dev starts-always", "dev")
+            s2, _ = compose.new_stack() { file(p); profile("test") }
+            spec.assert_str_eq(join(compose.services(s2)), "dev-or-test starts-always", "test")
+            s3, _ = compose.new_stack() { file(p); profile("*") }
+            spec.assert_str_eq(join(compose.services(s3)), "dev-or-test only-dev only-prod starts-always", "wildcard")
+            s4, _ = compose.new_stack() { file(p); profile("undefined-profile") }
+            spec.assert_str_eq(join(compose.services(s4)), "starts-always", "undefined profile")
+            spec.assert_str_eq(join(compose.command_line(s1, ["config"])),
+                "docker compose -p ${compose.project_name(s1)} -f ${compose.stack_files(s1)[0]} --profile dev config",
+                "--profile on the command line")
+        }
+
+        spec.it("takes compose content as text (WithStackReaders, ExampleNewDockerComposeWith)") callback {
+            s, err = compose.new_stack() {
+                identifier("test")
+                content(EXAMPLE_COMPOSE)
+            }
+            spec.assert_ok(err, "stack")
+            files = compose.stack_files(s)
+            spec.assert_eq(files.len, 1, "one temporary file")
+            spec.assert_true(string.ends_with(files[0], "/docker-compose-0.yml") == 1, "Go's docker-compose-%d.yml: ${files[0]}")
+            names = compose.services(s)
+            spec.assert_eq(names.len, 2, "both services")
+            spec.assert_true(contains(names, "nginx"), "nginx")
+            spec.assert_true(contains(names, "mysql"), "mysql")
+        }
+
+        spec.it("passes env to the CLI, a later value replacing an earlier one (WithEnv)") callback {
+            s, _ = compose.new_stack() {
+                file("/path/to/docker-compose.yml")
+                cli(["podman-compose"])
+                env("FOO", "foo")
+                env("BAR", "bar")
+                env("FOO", "FOO")
+            }
+            spec.assert_str_eq(join(compose.environment(s)), "BAR=bar FOO=FOO", "env for a non-docker CLI, no DOCKER_HOST added")
+        }
+
+        spec.it("labels every service, network and volume with the session for the reaper") callback {
+            s, _ = compose.new_stack() {
+                file(render("docker-compose-volume.yml", "local", [free_port()]))
+                file(render_complex())
+            }
+            text, err = compose.labels_override(s, true)
+            spec.assert_ok(err, "override")
+            doc, perr = yaml.parse(text)
+            spec.assert_ok(perr, "the override is YAML")
+            if perr == "" {
+                root = yaml.root(doc)
+                svcs = yaml.lookup(doc, root, "services")
+                spec.assert_eq(yaml.size(doc, svcs), 2, "nginx and mysql")
+                nginx = yaml.lookup(doc, svcs, "local-nginx")
+                labels = yaml.lookup(doc, nginx, "labels")
+                sid = yaml.scalar(doc, yaml.lookup(doc, labels, docker.LABEL_SESSION_ID))
+                spec.assert_str_eq(sid, docker.session_id(), "the session id")
+                reap = yaml.scalar(doc, yaml.lookup(doc, labels, docker.LABEL_REAP))
+                spec.assert_str_eq(reap, "true", "reap=true while the reaper runs")
+                nets = yaml.lookup(doc, root, "networks")
+                spec.assert_true(yaml.lookup(doc, nets, "default") >= 0, "the default network")
+                vols = yaml.lookup(doc, root, "volumes")
+                spec.assert_true(yaml.lookup(doc, vols, "mydata") >= 0, "the declared volume")
+                yaml.free(doc)
+            }
+            off, _ = compose.labels_override(s, false)
+            spec.assert_true(string.contains(off, docker.LABEL_REAP) == 0, "no reap label with the reaper off")
+        }
+    }
+}
+
+fn live(fw: @keep ptr) {
+    spec.describe(fw, "modules/compose (live)") {
+        spec.it("starts a stack with env and a wait, and finds its containers (ExampleNewDockerComposeWith)") callback {
+            stack, err = compose.new_stack() {
+                identifier("test")
+                content(EXAMPLE_COMPOSE)
+                env("bar", "BAR")
+                env("foo", "FOO")
+                wait_for_service("nginx", wait.for_listening_port("80/tcp"))
+            }
+            spec.assert_ok(err, "stack")
+            uerr = compose.up(stack) { wait_running() }
+            spec.assert_ok(uerr, "up")
+            names = compose.services(stack)
+            spec.assert_eq(names.len, 2, "both services are started")
+            nginx, cerr = compose.service_container(stack, "nginx")
+            spec.assert_ok(cerr, "the nginx container")
+            if cerr == "" {
+                code, out, xerr = tc.exec(nginx, ["env"])
+                spec.assert_ok(xerr, "exec")
+                spec.assert_eq(code, 0, "env runs")
+                spec.assert_contains(out, "bar=BAR", "bar")
+                spec.assert_contains(out, "foo=FOO", "foo")
+                ep, eerr = tc.endpoint(nginx, "80/tcp", "")
+                spec.assert_ok(eerr, "endpoint")
+                spec.assert_true(string.ends_with(ep, ":8081") == 1, "the published port: ${ep}")
+            }
+            derr = compose.down(stack) {
+                remove_orphans()
+                remove_volumes()
+                remove_images(compose.REMOVE_IMAGES_LOCAL)
+            }
+            spec.assert_ok(derr, "down")
+        }
+
+        spec.it("waits for a service over HTTP (ExampleNewDockerComposeWith_waitForService)") callback {
+            stack, _ = compose.new_stack() {
+                content(EXAMPLE_COMPOSE_NGINX)
+                env("bar", "BAR")
+                wait_for_service("nginx", wait.for_http("/") { with_port("80/tcp"); with_startup_timeout(10s) })
+            }
+            uerr = compose.up(stack) { wait_running() }
+            spec.assert_ok(uerr, "up")
+            spec.assert_str_eq(join(compose.services(stack)), "nginx", "[nginx]")
+            _ = compose.down(stack) { remove_orphans(); remove_volumes() }
+        }
+
+        spec.it("waits for short-lived services to exit (TestLocalDockerComposeWithWaitForShortLifespanService)") callback {
+            stack, _ = compose.new_stack() {
+                file("${TESTDATA}/docker-compose-short-lifespan.yml")
+                wait_for_service("tzatziki", wait.for_exit() { with_startup_timeout(10s) })
+                wait_for_service("falafel", wait.for_exit() { with_startup_timeout(10s) })
+            }
+            uerr = compose.up(stack)
+            spec.assert_ok(uerr, "up")
+            spec.assert_str_eq(join(compose.services(stack)), "falafel tzatziki", "both")
+            _ = compose.down(stack) { remove_orphans(); remove_volumes() }
+        }
+
+        spec.it("fails a wrong wait strategy (TestLocalDockerComposeWithFailedStrategy)") callback {
+            stack, _ = compose.new_stack() {
+                file(render_simple())
+                env("bar", "BAR")
+                wait_for_service("local-nginx", wait.for_http("/") { with_port("8080/tcp"); with_startup_timeout(5s) })
+            }
+            uerr = compose.up(stack)
+            spec.assert_err(uerr, "port 8080 is not served")
+            _ = compose.down(stack) { remove_orphans(); remove_volumes() }
+        }
+
+        spec.it("fails a wait on a service that does not exist (TestLocalDockerComposeStrategyForInvalidService)") callback {
+            stack, _ = compose.new_stack() {
+                file(render_simple())
+                wait_for_service("non-existent-srv", wait.for_log("started") { with_startup_timeout(10s) })
+            }
+            uerr = compose.up(stack)
+            spec.assert_err_contains(uerr, "no container found", "no such service")
+            spec.assert_str_eq(join(compose.services(stack)), "local-nginx", "one service")
+            _ = compose.down(stack) { remove_orphans(); remove_volumes() }
+        }
+
+        spec.it("removes the project's volume on down (TestLocalDockerComposeWithVolume)") callback {
+            stack, _ = compose.new_stack() { file(render("docker-compose-volume.yml", "local", [free_port()])) }
+            uerr = compose.up(stack)
+            spec.assert_ok(uerr, "up")
+            derr = compose.down(stack) { remove_orphans(); remove_volumes() }
+            spec.assert_ok(derr, "down")
+            cl, _ = docker.client()
+            st, _, _ = docker.api(cl, "GET", "/volumes/${compose.project_name(stack)}_mydata", "")
+            spec.assert_eq(st, 404, "the volume is gone")
+        }
+
+        spec.it("runs any subcommand (ExampleLocalDockerCompose_Invoke)") callback {
+            stack, _ = compose.new_stack() { file(render_simple()); env("bar", "BAR") }
+            r, ierr = compose.invoke(stack, ["config", "--services"])
+            spec.assert_ok(ierr, "config")
+            if r != null { spec.assert_contains(r.stdout, "local-nginx", "the service") }
+        }
+    }
+}
+
+main() {
+    fw = spec.init()
+    engine_free(fw)
+    if string.length(os.getenv("TCAE_LIVE_COMPOSE")) == 0 {
+        println("SKIP modules/compose live cases: compile-checked only (set TCAE_LIVE_COMPOSE=1 to run them)")
+    } else if testing.engine_ok() == 0 {
+        println("SKIP modules/compose live cases: no container engine")
+    } else {
+        live(fw)
+    }
+    return spec.run_summary(fw)
+}

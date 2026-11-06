@@ -1,0 +1,271 @@
+// Ported from testcontainers-go modules/cockroachdb/cockroachdb.go, modules/cockroachdb/options.go,
+// modules/cockroachdb/data/cluster_defaults.sql
+//
+// modules.cockroachdb: a single-node CockroachDB container with an in-memory
+// store (SQL 26257, admin UI/HTTP 8080), secure (TLS, a client certificate
+// for the user) unless insecure() is given.
+//
+//     import modules.cockroachdb
+//
+//     c, err = cockroachdb.run("cockroachdb/cockroach:latest-v23.1") {
+//         database("app"); user("app"); password("secret")
+//         store_size("50%")
+//         init_script("testdata/__init.sql")
+//     }
+//     defer tc.terminate(c.container)
+//     dsn, _ = cockroachdb.connection_string(c)    // "postgres://app:secret@localhost:32771/app?sslmode=require"
+//
+// Go's wait strategies are: the init_success file, GET /health on the admin
+// port, the client certificate files with the CA (wait.ForTLSCert), and a
+// SQL ping with pgx (wait.ForSQL). Here the first three are the same
+// strategies (a secure container's /health over HTTPS, verified against the
+// CA read by wait.for_tls_cert), and the SQL ping is wait.for_sql through
+// this repository's `sql` and its pgx port (sql.postgres, registered by
+// run): sslmode=disable when insecure, and when secure with a password,
+// sslmode=verify-full against the CA the TLS strategy read, dialling
+// 127.0.0.1 for localhost (the node certificate names 127.0.0.1, Go's
+// WithServerName("127.0.0.1")). A secure container without a password
+// (root, the default) authenticates with the client certificate in Go;
+// std.cryptography.tls13_client.connect_socket presents no client
+// certificate (and its mTLS presents ECDSA-P256 keys only, where cockroach
+// makes RSA ones), so that one case keeps a probe run in the container:
+// `cockroach sql -e "SELECT 1"` with the user's client certificate.
+
+// Differences from Go:
+//
+//  - connection_string is a postgres:// URL. Go's ConnectionString registers
+//    a pgx config and returns a handle for database/sql, and its config
+//    verifies the server with the generated CA (verify-full). A URL has no
+//    CA, so a secure container gets sslmode=require; ca_cert, client_cert and
+//    client_key return the PEM files from the container for a client that
+//    wants to verify (Go's TLSConfig, deprecated, is the same data).
+//  - password() after insecure() (or the other way) is an error from run, not
+//    from the option, with Go's message; so is any other order of the two.
+//  - admin_endpoint is added (Go has no accessor for the admin port).
+//
+// Not ported: ConnectionConfig / MustConnectionString (pgx types), the
+// deprecated RunContainer and TLSConfig.
+
+import std.string
+import std.url
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+import sql.postgres as pgsql
+
+exports(
+    CockroachDBContainer, run, connection_string, admin_endpoint, ca_cert,
+    client_cert, client_key, database, user, password, store_size,
+    no_cluster_defaults, init_script, insecure, SQL_PORT, ADMIN_PORT,
+    DEFAULT_IMAGE, cockroachdb_request_new, cockroachdb_request_free
+)
+
+const SQL_PORT = "26257/tcp"
+const ADMIN_PORT = "8080/tcp"
+const DEFAULT_IMAGE = "cockroachdb/cockroach:latest-v23.1"
+const DEFAULT_USER = "root"
+const DEFAULT_DATABASE = "defaultdb"
+const INIT_DB_PATH = "/docker-entrypoint-initdb.d"
+const COCKROACH_DIR = "/cockroach"
+const CLUSTER_DEFAULTS_FILE = "/docker-entrypoint-initdb.d/__cluster_defaults.sql"
+const MEM_STORAGE_FLAG = "--store=type=mem,size="
+const INSECURE_FLAG = "--insecure"
+const CERTS_DIR = "/cockroach/certs"
+const SET_NO_DEFAULTS = "cockroachdb.no_cluster_defaults"
+const SET_ERROR = "cockroachdb.error"
+const ERR_INSECURE_PASSWORD = "insecure mode cannot be used with a password"
+
+const CLUSTER_DEFAULTS = <<SQL
+SET CLUSTER SETTING kv.range_merge.queue_interval = '50ms';
+SET CLUSTER SETTING jobs.registry.interval.gc = '30s';
+SET CLUSTER SETTING jobs.registry.interval.cancel = '180s';
+SET CLUSTER SETTING jobs.retention_time = '15s';
+SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false;
+SET CLUSTER SETTING kv.range_split.by_load_merge_delay = '5s';
+ALTER RANGE default CONFIGURE ZONE USING "gc.ttlseconds" = 600;
+ALTER DATABASE system CONFIGURE ZONE USING "gc.ttlseconds" = 600;
+SET CLUSTER SETTING jobs.registry.interval.gc = '50s';
+
+SQL
+
+struct CockroachDBContainer {
+    container: *docker.Container
+    database: string
+    user: string
+    password: string
+    insecure: bool
+}
+
+cockroachdb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.cmd(r, ["start-single-node", "${MEM_STORAGE_FLAG}100%"])
+    tc.expose(r, SQL_PORT)
+    tc.expose(r, ADMIN_PORT)
+    tc.env(r, "COCKROACH_DATABASE", DEFAULT_DATABASE)
+    tc.env(r, "COCKROACH_USER", DEFAULT_USER)
+    tc.env(r, "COCKROACH_PASSWORD", "")
+    return r
+}
+
+cockroachdb_request_free(p: ptr) { tc.request_free(p) }
+
+fn fail(_ctx: ptr, msg: string) {
+    if !tc.req_has_setting(_ctx, SET_ERROR) { tc.set_setting(_ctx, SET_ERROR, msg) }
+}
+
+fn base_name(p: string) -> string {
+    rest = p
+    i = string.index_of(rest, "/")
+    while i >= 0 {
+        rest = string.substring(rest, i + 1, string.length(rest))
+        i = string.index_of(rest, "/")
+    }
+    return rest
+}
+
+// ---- options ----
+
+// Go's WithDatabase (lower-cased: CockroachDB forces it).
+database(_ctx: ptr, name: string) { tc.env(_ctx, "COCKROACH_DATABASE", string.to_lower(name)) }
+// Go's WithUser (lower-cased).
+user(_ctx: ptr, name: string) { tc.env(_ctx, "COCKROACH_USER", string.to_lower(name)) }
+
+// Go's WithPassword; an error from run if insecure() was given before.
+password(_ctx: ptr, pw: string) {
+    if tc.req_has_cmd_arg(_ctx, INSECURE_FLAG) { fail(_ctx, ERR_INSECURE_PASSWORD); return }
+    tc.env(_ctx, "COCKROACH_PASSWORD", pw)
+}
+
+// Go's WithStoreSize: the in-memory store's size ("50%", "1GiB").
+store_size(_ctx: ptr, size: string) {
+    args = tc.req_cmd(_ctx)
+    string[] out = []
+    found = false
+    for a in args {
+        if string.starts_with(a, MEM_STORAGE_FLAG) == 1 {
+            out.push("${MEM_STORAGE_FLAG}${size}")
+            found = true
+        } else {
+            out.push(a)
+        }
+    }
+    if !found { out.push("${MEM_STORAGE_FLAG}${size}") }
+    tc.cmd(_ctx, out)
+}
+
+// Go's WithNoClusterDefaults: do not run the recommended local-testing settings.
+no_cluster_defaults(_ctx: ptr) { tc.set_setting(_ctx, SET_NO_DEFAULTS, "1") }
+
+// Go's WithInitScripts, one script a call: /docker-entrypoint-initdb.d.
+init_script(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, "${INIT_DB_PATH}/${base_name(host_path)}", 420)
+}
+
+// Go's WithInsecure: --insecure (no TLS); an error from run if a password is set.
+insecure(_ctx: ptr) {
+    if string.length(tc.req_env(_ctx, "COCKROACH_PASSWORD")) > 0 { fail(_ctx, ERR_INSECURE_PASSWORD); return }
+    tc.cmd_arg(_ctx, INSECURE_FLAG)
+}
+
+// Run a CockroachDB container (Go's cockroachdb.Run).
+builder run(image: string) with cockroachdb_request_new -> (*CockroachDBContainer, string) {
+    r = _builder
+    if r == null { r = cockroachdb_request_new() }
+    if tc.req_has_setting(r, SET_ERROR) {
+        msg = tc.req_setting(r, SET_ERROR)
+        tc.request_free(r)
+        return null, "run cockroachdb: ${msg}"
+    }
+    if !tc.req_has_setting(r, SET_NO_DEFAULTS) {
+        tc.file_content(r, CLUSTER_DEFAULTS, CLUSTER_DEFAULTS_FILE, 420)
+    }
+    u = tc.req_env(r, "COCKROACH_USER")
+    pw = tc.req_env(r, "COCKROACH_PASSWORD")
+    db = tc.req_env(r, "COCKROACH_DATABASE")
+    ins = tc.req_has_cmd_arg(r, INSECURE_FLAG)
+
+    tc.wait_for(r, wait.for_file("${COCKROACH_DIR}/init_success"))
+    pgsql.register()   // Go's module imports pgx's stdlib, which registers "pgx/v5"
+    if ins {
+        tc.additional_wait(r, wait.for_http("/health") { with_port(ADMIN_PORT) })
+        tc.additional_wait(r, wait.for_sql(SQL_PORT, "pgx/v5", |host: string, port: int| -> sql_dsn(host, port, u, pw, db, "")))
+    } else {
+        // Go's ForTLSCert(client cert, key).WithRootCAs(ca.crt) and the
+        // admin /health over HTTPS verified against that CA
+        t = wait.for_tls_cert("${CERTS_DIR}/client.${u}.crt", "${CERTS_DIR}/client.${u}.key") {
+            with_root_cas(["${CERTS_DIR}/ca.crt"])
+            with_server_name("127.0.0.1")
+        }
+        tc.additional_wait(r, t)
+        h = wait.for_http("/health") { with_port(ADMIN_PORT) }
+        tc.additional_wait(r, wait.with_tls_config_from(h, t))
+        if string.length(pw) > 0 {
+            tc.additional_wait(r, wait.for_sql(SQL_PORT, "pgx/v5", |host: string, port: int| -> sql_dsn(host, port, u, pw, db, wait.tls_ca_file(t))))
+        } else {
+            // no client certificates in the TLS client yet: see the header
+            tc.additional_wait(r, wait.for_exec(["/cockroach/cockroach", "sql", "--certs-dir=${CERTS_DIR}", "--host=127.0.0.1", "--user=${u}", "-e", "SELECT 1"]))
+        }
+    }
+
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run cockroachdb: ${err}" }
+    cr = heap.new(CockroachDBContainer)
+    cr.container = c
+    cr.user = u
+    cr.password = pw
+    cr.database = db
+    cr.insecure = ins
+    if err != "" { return cr, "run cockroachdb: ${err}" }
+    return cr, ""
+}
+
+// The DSN wait.for_sql connects with (Go's connString): sslmode=disable
+// without a CA, else verify-full against the CA file, over 127.0.0.1 when
+// the host is localhost (the name the node certificate carries).
+fn sql_dsn(host: string, port: int, user: string, password: string, database: string, ca_file: string) -> string {
+    cred = url.encode(user)
+    if string.length(password) > 0 { cred = "${cred}:${url.encode(password)}" }
+    if string.length(ca_file) == 0 {
+        return "postgres://${cred}@${host}:${port}/${database}?sslmode=disable"
+    }
+    h = host
+    if h == "localhost" { h = "127.0.0.1" }
+    return "postgres://${cred}@${h}:${port}/${database}?sslmode=verify-full&sslrootcert=${url.encode(ca_file)}"
+}
+
+// "postgres://user[:password]@host:port/database?sslmode=disable|require"
+// (see the header: Go's returns a pgx handle).
+connection_string(cr: *CockroachDBContainer) -> (string, string) {
+    ep, err = tc.endpoint(cr.container, SQL_PORT, "")
+    if err != "" { return "", "connection string: ${err}" }
+    cred = cr.user
+    if string.length(cr.password) > 0 { cred = "${cr.user}:${cr.password}" }
+    mode = "require"
+    if cr.insecure { mode = "disable" }
+    return "postgres://${cred}@${ep}/${cr.database}?sslmode=${mode}", ""
+}
+
+// "http://host:port" (https:// when secure) of the admin UI.
+admin_endpoint(cr: *CockroachDBContainer) -> (string, string) {
+    scheme = "https"
+    if cr.insecure { scheme = "http" }
+    return tc.endpoint(cr.container, ADMIN_PORT, scheme)
+}
+
+// The CA certificate (PEM) of a secure container.
+ca_cert(cr: *CockroachDBContainer) -> (string, string) {
+    if cr.insecure { return "", "tls not enabled" }
+    return tc.copy_file_from_container(cr.container, "${CERTS_DIR}/ca.crt")
+}
+
+// The module user's client certificate (PEM) of a secure container.
+client_cert(cr: *CockroachDBContainer) -> (string, string) {
+    if cr.insecure { return "", "tls not enabled" }
+    return tc.copy_file_from_container(cr.container, "${CERTS_DIR}/client.${cr.user}.crt")
+}
+
+// The module user's client private key (PEM) of a secure container.
+client_key(cr: *CockroachDBContainer) -> (string, string) {
+    if cr.insecure { return "", "tls not enabled" }
+    return tc.copy_file_from_container(cr.container, "${CERTS_DIR}/client.${cr.user}.key")
+}

@@ -1,0 +1,75 @@
+// Ported from testcontainers-go modules/typesense/typesense.go
+//
+// modules.typesense: a Typesense container. The API key travels with the
+// container in a struct.
+//
+//     import modules.typesense
+//
+//     t, err = typesense.run("typesense/typesense:26.0") { api_key("custom-key") }
+//     defer tc.terminate(t.container)
+//     addr, _ = typesense.address(t)    // "http://localhost:32771"
+//     key = typesense.api_key_of(t)     // "custom-key"
+//
+// Go reads the effective key back from the container's environment so that
+// tc.env("TYPESENSE_API_KEY", ...) in the block counts too; so does run.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    TypesenseContainer, run, address, api_key_of, api_key, data_dir,
+    PORT, DEFAULT_API_KEY, DEFAULT_DATA_DIR, typesense_request_new, typesense_request_free
+)
+
+const PORT = "8108/tcp"
+const DEFAULT_API_KEY = "test-api-key"
+const DEFAULT_DATA_DIR = "/tmp"
+const API_KEY_ENV = "TYPESENSE_API_KEY"
+const DATA_DIR_ENV = "TYPESENSE_DATA_DIR"
+
+struct TypesenseContainer {
+    container: *docker.Container
+    api_key: string
+}
+
+// Go's moduleOpts: the port, the data dir and API key env, and a wait for
+// GET /health = 200.
+typesense_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.env(r, DATA_DIR_ENV, DEFAULT_DATA_DIR)
+    tc.env(r, API_KEY_ENV, DEFAULT_API_KEY)
+    tc.wait_for(r, wait.for_http("/health") { with_port(PORT); with_status(200) })
+    return r
+}
+
+typesense_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithAPIKey.
+api_key(_ctx: ptr, key: string) { tc.env(_ctx, API_KEY_ENV, key) }
+
+// Go's WithDataDir.
+data_dir(_ctx: ptr, dir: string) { tc.env(_ctx, DATA_DIR_ENV, dir) }
+
+builder run(image: string) with typesense_request_new -> (*TypesenseContainer, string) {
+    r = _builder
+    if r == null { r = typesense_request_new() }
+    key = tc.req_env(r, API_KEY_ENV)
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run typesense: ${err}" }
+    t = heap.new(TypesenseContainer)
+    t.container = c
+    t.api_key = key
+    if err != "" { return t, "run typesense: ${err}" }
+    return t, ""
+}
+
+// The API key every Typesense call needs (Go's APIKey).
+api_key_of(t: *TypesenseContainer) -> string { return t.api_key }
+
+// "http://host:port" (Go's Address).
+address(t: *TypesenseContainer) -> (string, string) {
+    return tc.endpoint(t.container, PORT, "http")
+}

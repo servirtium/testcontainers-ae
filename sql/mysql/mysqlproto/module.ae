@@ -1,0 +1,1500 @@
+// Ported from go-sql-driver/mysql v1.9.3 const.go, errors.go, fields.go,
+// utils.go, collations.go (the default collation, a few common ones and the
+// unsafe list), packets.go (the encodings and decodings of the packets, not
+// their I/O) and auth.go (the password scrambles and the RSA encryption of
+// the password).
+// Copyright 2012 The Go-MySQL-Driver Authors. All rights reserved.
+// (const.go, packets.go and utils.go 2012; errors.go 2013; collations.go
+// 2014; fields.go 2017; auth.go 2018.)
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at http://mozilla.org/MPL/2.0/.
+//
+// Modifications: ported to Aether by the testcontainers-ae contributors.
+//
+// sql.mysql.mysqlproto: the MySQL client/server protocol's bytes, as pure
+// functions over byte[] with no I/O: the constants, the 3-byte packet
+// header, length-encoded integers and strings, the handshake v10 packet,
+// OK/ERR/EOF packets, column definitions, text and binary result rows,
+// COM_STMT_EXECUTE's body, the password scrambles of mysql_native_password,
+// caching_sha2_password and mysql_old_password, and the RSA-OAEP (SHA-1)
+// encryption of the password for caching_sha2_password / sha256_password.
+// sql.mysql.mysqlconn does the I/O.
+//
+// Go returns driver.Values of several types from a row; here every value is
+// the text database/sql would convert it to (sql keeps text, DESIGN.md
+// section 14): integers in decimal, FLOAT and DOUBLE as strconv's shortest
+// 'g' form, DATE/DATETIME/TIMESTAMP/TIME as MySQL's text (Go's default
+// without parseTime), DECIMAL and strings as sent, blobs as their bytes.
+//
+// RSA: std.cryptography.rsa has OAEP with SHA-256 only, and MySQL (like Go's
+// rsa.EncryptOAEP(sha1.New(), ...)) uses OAEP with SHA-1 and MGF1-SHA-1, so
+// encrypt_password builds the OAEP block here (RFC 8017 section 7.1.1) and
+// uses rsa.raw_encrypt for m^e mod n. The server's key arrives as a PEM
+// "PUBLIC KEY" (SubjectPublicKeyInfo), read with std.cryptography.pem and
+// asn1.
+
+import std.string
+import std.bytes
+import std.mem
+import std.cryptography
+import std.cryptography.sha1
+import std.cryptography.sha2
+import std.cryptography.rsa
+import std.cryptography.pem
+import std.cryptography.asn1
+import sql
+
+exports(
+    Buf, Field, MySQLError, OkPacket, Handshake, Row,
+    // const.go
+    DEFAULT_AUTH_PLUGIN, DEFAULT_MAX_ALLOWED_PACKET, MIN_PROTOCOL_VERSION, MAX_PACKET_SIZE,
+    I_OK, I_AUTH_MORE_DATA, I_LOCAL_INFILE, I_EOF, I_ERR,
+    CLIENT_LONG_PASSWORD, CLIENT_FOUND_ROWS, CLIENT_LONG_FLAG, CLIENT_CONNECT_WITH_DB,
+    CLIENT_NO_SCHEMA, CLIENT_COMPRESS, CLIENT_ODBC, CLIENT_LOCAL_FILES, CLIENT_IGNORE_SPACE,
+    CLIENT_PROTOCOL41, CLIENT_INTERACTIVE, CLIENT_SSL, CLIENT_IGNORE_SIGPIPE,
+    CLIENT_TRANSACTIONS, CLIENT_RESERVED, CLIENT_SECURE_CONN, CLIENT_MULTI_STATEMENTS,
+    CLIENT_MULTI_RESULTS, CLIENT_PS_MULTI_RESULTS, CLIENT_PLUGIN_AUTH, CLIENT_CONNECT_ATTRS,
+    CLIENT_PLUGIN_AUTH_LEN_ENC_CLIENT_DATA, CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS,
+    CLIENT_SESSION_TRACK, CLIENT_DEPRECATE_EOF,
+    COM_QUIT, COM_INIT_DB, COM_QUERY, COM_PING, COM_STMT_PREPARE, COM_STMT_EXECUTE,
+    COM_STMT_SEND_LONG_DATA, COM_STMT_CLOSE, COM_STMT_RESET,
+    FIELD_TYPE_DECIMAL, FIELD_TYPE_TINY, FIELD_TYPE_SHORT, FIELD_TYPE_LONG, FIELD_TYPE_FLOAT,
+    FIELD_TYPE_DOUBLE, FIELD_TYPE_NULL, FIELD_TYPE_TIMESTAMP, FIELD_TYPE_LONGLONG,
+    FIELD_TYPE_INT24, FIELD_TYPE_DATE, FIELD_TYPE_TIME, FIELD_TYPE_DATETIME, FIELD_TYPE_YEAR,
+    FIELD_TYPE_NEWDATE, FIELD_TYPE_VARCHAR, FIELD_TYPE_BIT, FIELD_TYPE_VECTOR,
+    FIELD_TYPE_JSON, FIELD_TYPE_NEWDECIMAL, FIELD_TYPE_ENUM, FIELD_TYPE_SET,
+    FIELD_TYPE_TINY_BLOB, FIELD_TYPE_MEDIUM_BLOB, FIELD_TYPE_LONG_BLOB, FIELD_TYPE_BLOB,
+    FIELD_TYPE_VAR_STRING, FIELD_TYPE_STRING, FIELD_TYPE_GEOMETRY,
+    FLAG_NOT_NULL, FLAG_PRI_KEY, FLAG_UNIQUE_KEY, FLAG_BLOB, FLAG_UNSIGNED, FLAG_BINARY,
+    FLAG_ENUM, FLAG_AUTO_INCREMENT, FLAG_SET,
+    STATUS_IN_TRANS, STATUS_IN_AUTOCOMMIT, STATUS_MORE_RESULTS_EXISTS,
+    STATUS_NO_BACKSLASH_ESCAPES,
+    CACHING_SHA2_REQUEST_PUBLIC_KEY, CACHING_SHA2_FAST_AUTH_SUCCESS,
+    CACHING_SHA2_PERFORM_FULL_AUTHENTICATION,
+    DEFAULT_COLLATION_ID, BINARY_COLLATION_ID,
+    // errors.go
+    ERR_INVALID_CONN, ERR_MALFORM_PKT, ERR_NO_TLS, ERR_CLEARTEXT_PASSWORD,
+    ERR_NATIVE_PASSWORD, ERR_OLD_PASSWORD, ERR_UNKNOWN_PLUGIN, ERR_OLD_PROTOCOL,
+    ERR_PKT_SYNC, ERR_PKT_SYNC_MUL, ERR_PKT_TOO_LARGE, ERR_BAD_CONN_NO_WRITE, ERR_SKIP,
+    mysql_error_string, error_number,
+    // collations.go
+    collation_id, is_unsafe_collation,
+    // byte helpers (utils.go)
+    new_buf, buf_bytes, put_u8, put_u16, put_u32, put_u64, put_raw, put_str,
+    get_uint24, put_uint24, get_u16, get_u32, get_u64, index_byte, copy_range,
+    read_length_encoded_integer, read_length_encoded_string, skip_length_encoded_string,
+    append_length_encoded_integer, append_length_encoded_string, read_bool,
+    uint64_to_string, format_binary_datetime, format_binary_time, format_float,
+    float32_from_bits, escape_backslash, escape_quotes, interpolate_params,
+    // packets.go (decoding)
+    parse_handshake, parse_error_packet, parse_ok_packet, read_status, is_eof_packet,
+    parse_column, decode_text_row, decode_binary_row, new_row, prepare_ok,
+    execute_packet, long_data_packet,
+    // fields.go
+    type_database_name,
+    // auth.go
+    scramble_password, scramble_sha256_password, scramble_old_password,
+    encrypt_password, parse_pkix_public_key, oaep_sha1_pad
+)
+
+// ===================================================================
+// const.go
+// ===================================================================
+
+const DEFAULT_AUTH_PLUGIN = "mysql_native_password"
+const DEFAULT_MAX_ALLOWED_PACKET = 67108864     // 64 << 20
+const MIN_PROTOCOL_VERSION = 10
+const MAX_PACKET_SIZE = 16777215                // 1<<24 - 1
+
+const I_OK = 0
+const I_AUTH_MORE_DATA = 1
+const I_LOCAL_INFILE = 251
+const I_EOF = 254
+const I_ERR = 255
+
+// clientFlag (1 << iota)
+const CLIENT_LONG_PASSWORD = 1
+const CLIENT_FOUND_ROWS = 2
+const CLIENT_LONG_FLAG = 4
+const CLIENT_CONNECT_WITH_DB = 8
+const CLIENT_NO_SCHEMA = 16
+const CLIENT_COMPRESS = 32
+const CLIENT_ODBC = 64
+const CLIENT_LOCAL_FILES = 128
+const CLIENT_IGNORE_SPACE = 256
+const CLIENT_PROTOCOL41 = 512
+const CLIENT_INTERACTIVE = 1024
+const CLIENT_SSL = 2048
+const CLIENT_IGNORE_SIGPIPE = 4096
+const CLIENT_TRANSACTIONS = 8192
+const CLIENT_RESERVED = 16384
+const CLIENT_SECURE_CONN = 32768
+const CLIENT_MULTI_STATEMENTS = 65536
+const CLIENT_MULTI_RESULTS = 131072
+const CLIENT_PS_MULTI_RESULTS = 262144
+const CLIENT_PLUGIN_AUTH = 524288
+const CLIENT_CONNECT_ATTRS = 1048576
+const CLIENT_PLUGIN_AUTH_LEN_ENC_CLIENT_DATA = 2097152
+const CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS = 4194304
+const CLIENT_SESSION_TRACK = 8388608
+const CLIENT_DEPRECATE_EOF = 16777216
+
+const COM_QUIT = 1
+const COM_INIT_DB = 2
+const COM_QUERY = 3
+const COM_PING = 14
+const COM_STMT_PREPARE = 22
+const COM_STMT_EXECUTE = 23
+const COM_STMT_SEND_LONG_DATA = 24
+const COM_STMT_CLOSE = 25
+const COM_STMT_RESET = 26
+
+const FIELD_TYPE_DECIMAL = 0
+const FIELD_TYPE_TINY = 1
+const FIELD_TYPE_SHORT = 2
+const FIELD_TYPE_LONG = 3
+const FIELD_TYPE_FLOAT = 4
+const FIELD_TYPE_DOUBLE = 5
+const FIELD_TYPE_NULL = 6
+const FIELD_TYPE_TIMESTAMP = 7
+const FIELD_TYPE_LONGLONG = 8
+const FIELD_TYPE_INT24 = 9
+const FIELD_TYPE_DATE = 10
+const FIELD_TYPE_TIME = 11
+const FIELD_TYPE_DATETIME = 12
+const FIELD_TYPE_YEAR = 13
+const FIELD_TYPE_NEWDATE = 14
+const FIELD_TYPE_VARCHAR = 15
+const FIELD_TYPE_BIT = 16
+const FIELD_TYPE_VECTOR = 242
+const FIELD_TYPE_INVALID = 243
+const FIELD_TYPE_BOOL = 244
+const FIELD_TYPE_JSON = 245
+const FIELD_TYPE_NEWDECIMAL = 246
+const FIELD_TYPE_ENUM = 247
+const FIELD_TYPE_SET = 248
+const FIELD_TYPE_TINY_BLOB = 249
+const FIELD_TYPE_MEDIUM_BLOB = 250
+const FIELD_TYPE_LONG_BLOB = 251
+const FIELD_TYPE_BLOB = 252
+const FIELD_TYPE_VAR_STRING = 253
+const FIELD_TYPE_STRING = 254
+const FIELD_TYPE_GEOMETRY = 255
+
+const FLAG_NOT_NULL = 1
+const FLAG_PRI_KEY = 2
+const FLAG_UNIQUE_KEY = 4
+const FLAG_BLOB = 16
+const FLAG_UNSIGNED = 32
+const FLAG_BINARY = 128
+const FLAG_ENUM = 256
+const FLAG_AUTO_INCREMENT = 512
+const FLAG_SET = 2048
+
+const STATUS_IN_TRANS = 1
+const STATUS_IN_AUTOCOMMIT = 2
+const STATUS_MORE_RESULTS_EXISTS = 8
+const STATUS_NO_BACKSLASH_ESCAPES = 512
+
+const CACHING_SHA2_REQUEST_PUBLIC_KEY = 2
+const CACHING_SHA2_FAST_AUTH_SUCCESS = 3
+const CACHING_SHA2_PERFORM_FULL_AUTHENTICATION = 4
+
+// collations.go
+const DEFAULT_COLLATION_ID = 45     // utf8mb4_general_ci
+const BINARY_COLLATION_ID = 63
+
+// ===================================================================
+// errors.go
+// ===================================================================
+
+const ERR_INVALID_CONN = "invalid connection"
+const ERR_MALFORM_PKT = "malformed packet"
+const ERR_NO_TLS = "TLS requested but server does not support TLS"
+const ERR_CLEARTEXT_PASSWORD = "this user requires clear text authentication. If you still want to use it, please add 'allowCleartextPasswords=1' to your DSN"
+const ERR_NATIVE_PASSWORD = "this user requires mysql native password authentication"
+const ERR_OLD_PASSWORD = "this user requires old password authentication. If you still want to use it, please add 'allowOldPasswords=1' to your DSN. See also https://github.com/go-sql-driver/mysql/wiki/old_passwords"
+const ERR_UNKNOWN_PLUGIN = "this authentication plugin is not supported"
+const ERR_OLD_PROTOCOL = "MySQL server does not support required protocol 41+"
+const ERR_PKT_SYNC = "commands out of sync. You can't run this command now"
+const ERR_PKT_SYNC_MUL = "commands out of sync. Did you run multiple statements at once?"
+const ERR_PKT_TOO_LARGE = "packet for query is too large. Try adjusting the `Config.MaxAllowedPacket`"
+// errBadConnNoWrite: nothing was sent yet, so the caller may say "bad
+// connection" (driver.ErrBadConn) and be retried.
+const ERR_BAD_CONN_NO_WRITE = "bad connection"
+// driver.ErrSkip: interpolate_params could not, use a prepared statement.
+const ERR_SKIP = "driver: skip fast-path; continue as if unimplemented"
+
+// MySQLError: the server's error number, SQLSTATE ("" when the packet had
+// empty) and message.
+struct MySQLError {
+    number: int
+    sqlstate: string
+    msg: string
+}
+
+// MySQLError.Error(): "Error 1045 (28000): Access denied ..." (sql.sqlstate
+// finds the SQLSTATE in it).
+mysql_error_string(e: *MySQLError) -> string {
+    if string.length(e.sqlstate) > 0 {
+        return "Error ${e.number} (${e.sqlstate}): ${e.msg}"
+    }
+    return "Error ${e.number}: ${e.msg}"
+}
+
+// The MySQL error number in an error string from this driver ("Error 1045
+// (28000): ..."), or 0 (Go's errors.As(err, &mysqlErr); mysqlErr.Number).
+error_number(err: string) -> int {
+    if string.starts_with(err, "Error ") == 0 { return 0 }
+    b = string.bytes(err)
+    i = 6
+    int n = 0
+    found = false
+    while i < b.len && b[i] >= 48 && b[i] <= 57 {
+        n = n * 10 + ((b[i] as int) - 48)
+        found = true
+        i = i + 1
+    }
+    if !found { return 0 }
+    if i < b.len && (b[i] == 58 || b[i] == 32) { return n }
+    return 0
+}
+
+// ===================================================================
+// collations.go: the default and a few common collations (not the table)
+// ===================================================================
+
+// The collation's id, or -1 when it is not one this port knows.
+collation_id(name: string) -> int {
+    if name == "utf8mb4_general_ci" { return 45 }
+    if name == "utf8mb4_bin" { return 46 }
+    if name == "utf8mb4_unicode_ci" { return 224 }
+    if name == "utf8mb4_0900_ai_ci" { return 255 }
+    if name == "utf8_general_ci" { return 33 }
+    if name == "utf8_bin" { return 83 }
+    if name == "utf8_unicode_ci" { return 192 }
+    if name == "latin1_swedish_ci" { return 8 }
+    if name == "latin1_bin" { return 47 }
+    if name == "ascii_general_ci" { return 11 }
+    if name == "binary" { return 63 }
+    return -1
+}
+
+// unsafeCollations: a multi-byte character can end in a backslash, so
+// interpolateParams may not be used with them.
+is_unsafe_collation(name: string) -> bool {
+    for c in ["big5_chinese_ci", "sjis_japanese_ci", "gbk_chinese_ci", "big5_bin",
+              "gb2312_bin", "gbk_bin", "sjis_bin", "cp932_japanese_ci", "cp932_bin",
+              "gb18030_chinese_ci", "gb18030_bin", "gb18030_unicode_520_ci"] {
+        if c == name { return true }
+    }
+    return false
+}
+
+// ===================================================================
+// byte helpers (utils.go, encoding/binary)
+// ===================================================================
+
+// A growing byte buffer (Go's append to a []byte).
+struct Buf {
+    b: byte[]
+}
+
+new_buf() -> *Buf { return heap.new(Buf) }
+buf_bytes(w: *Buf) -> byte[] { return w.b }
+put_u8(w: *Buf, v: int) { w.b.push((v & 255) as byte) }
+put_u16(w: *Buf, v: int) {
+    w.b.push((v & 255) as byte)
+    w.b.push(((v >> 8) & 255) as byte)
+}
+put_u32(w: *Buf, v: long) {
+    w.b.push((v & 255) as byte)
+    w.b.push(((v >> 8) & 255) as byte)
+    w.b.push(((v >> 16) & 255) as byte)
+    w.b.push(((v >> 24) & 255) as byte)
+}
+put_u64(w: *Buf, v: long) {
+    i = 0
+    while i < 8 {
+        w.b.push(((v >> (i * 8)) & 255) as byte)
+        i = i + 1
+    }
+}
+put_raw(w: *Buf, data: byte[]) {
+    for c in data { w.b.push(c) }
+}
+put_str(w: *Buf, s: string) {
+    for c in string.bytes(s) { w.b.push(c as byte) }
+}
+
+// 24-bit little-endian integers: the packet header's length.
+get_uint24(b: byte[], at: int) -> int {
+    return ((b[at + 2] as int) << 16) | ((b[at + 1] as int) << 8) | (b[at] as int)
+}
+put_uint24(b: byte[], at: int, n: int) {
+    b[at + 2] = ((n >> 16) & 255) as byte
+    b[at + 1] = ((n >> 8) & 255) as byte
+    b[at] = (n & 255) as byte
+}
+get_u16(b: byte[], at: int) -> int {
+    return ((b[at + 1] as int) << 8) | (b[at] as int)
+}
+get_u32(b: byte[], at: int) -> long {
+    return ((b[at + 3] as long) << 24) | ((b[at + 2] as long) << 16) | ((b[at + 1] as long) << 8) | (b[at] as long)
+}
+get_u64(b: byte[], at: int) -> long {
+    let v: long = 0
+    i = 7
+    while i >= 0 {
+        v = (v << 8) | (b[at + i] as long)
+        i = i - 1
+    }
+    return v
+}
+
+// bytes.IndexByte(b[from:], c) + from, or -1.
+index_byte(b: byte[], from: int, c: int) -> int {
+    i = from
+    while i < b.len {
+        if (b[i] as int) == c { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// A copy of b[from:to].
+copy_range(b: byte[], from: int, to: int) -> byte[] {
+    byte[] out = []
+    i = from
+    while i < to {
+        out.push(b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn str_range(b: byte[], from: int, to: int) -> string {
+    if to <= from { return "" }
+    return bytes.string_from_slice(b[from..to])
+}
+
+// readLengthEncodedInteger at b[at:]: (the number, whether it is NULL (0xfb,
+// or nothing left), the bytes read). A 64-bit number above MaxInt64 comes
+// back negative (the bits are the uint64's).
+read_length_encoded_integer(b: byte[], at: int) -> (long, bool, int) {
+    if at >= b.len { return 0, true, 1 }
+    c = b[at] as int
+    if c == 251 { return 0, true, 1 }
+    if c == 252 {
+        if at + 3 > b.len { return 0, false, 3 }
+        return (get_u16(b, at + 1) as long), false, 3
+    }
+    if c == 253 {
+        if at + 4 > b.len { return 0, false, 4 }
+        return (get_uint24(b, at + 1) as long), false, 4
+    }
+    if c == 254 {
+        if at + 9 > b.len { return 0, false, 9 }
+        return get_u64(b, at + 1), false, 9
+    }
+    return (c as long), false, 1
+}
+
+// readLengthEncodedString at b[at:]: (the string, NULL, bytes read); bytes
+// read is -1 when the string runs past the end of b (Go's io.EOF).
+read_length_encoded_string(b: byte[], at: int) -> (string, bool, int) {
+    num, is_null, n = read_length_encoded_integer(b, at)
+    if num < 1 { return "", is_null, n }
+    if num > 2147483647 { return "", false, -1 }
+    end = at + n + (num as int)
+    if end > b.len { return "", false, -1 }
+    return str_range(b, at + n, end), false, n + (num as int)
+}
+
+// skipLengthEncodedString: the bytes it takes, -1 past the end.
+skip_length_encoded_string(b: byte[], at: int) -> int {
+    num, _, n = read_length_encoded_integer(b, at)
+    if num < 1 { return n }
+    if num > 2147483647 { return -1 }
+    if at + n + (num as int) > b.len { return -1 }
+    return n + (num as int)
+}
+
+// appendLengthEncodedInteger (n as an unsigned 64-bit number).
+append_length_encoded_integer(w: *Buf, n: long) {
+    if n >= 0 && n <= 250 {
+        put_u8(w, n as int)
+    } else if n >= 0 && n <= 65535 {
+        put_u8(w, 252)
+        put_u16(w, n as int)
+    } else if n >= 0 && n <= 16777215 {
+        put_u8(w, 253)
+        put_u8(w, (n & 255) as int)
+        put_u8(w, ((n >> 8) & 255) as int)
+        put_u8(w, ((n >> 16) & 255) as int)
+    } else {
+        put_u8(w, 254)
+        put_u64(w, n)
+    }
+}
+
+append_length_encoded_string(w: *Buf, s: string) {
+    append_length_encoded_integer(w, string.length(s) as long)
+    put_str(w, s)
+}
+
+// readBool: (value, valid) for 1 true TRUE True 0 false FALSE False.
+read_bool(input: string) -> (bool, bool) {
+    if input == "1" || input == "true" || input == "TRUE" || input == "True" { return true, true }
+    if input == "0" || input == "false" || input == "FALSE" || input == "False" { return false, true }
+    return false, false
+}
+
+// uint64ToString: n's bits as an unsigned decimal.
+uint64_to_string(n: long) -> string {
+    if n >= 0 { return string.from_long(n) }
+    // n / 10 as unsigned: (n >>> 1) / 5
+    let q: long = ((n >> 1) & 9223372036854775807) / 5
+    let r: long = n - q * 10
+    return "${string.from_long(q)}${string.from_long(r)}"
+}
+
+fn two(v: long) -> string {
+    if v < 10 { return "0${v}" }
+    return "${v}"
+}
+
+// appendMicrosecs: `decimals` digits of the microseconds in src[0:4].
+fn microsecs(src: byte[], at: int, decimals: int) -> string {
+    if decimals <= 0 { return "" }
+    if at >= src.len {
+        return string.substring(".000000", 0, decimals + 1)
+    }
+    us = get_u32(src, at)
+    digits = string.from_long(us)
+    while string.length(digits) < 6 { digits = "0${digits}" }
+    d = decimals
+    if d > 6 { d = 6 }
+    return ".${string.substring(digits, 0, d)}"
+}
+
+fn zero_datetime(length: int) -> string {
+    return string.substring("0000-00-00 00:00:00.000000", 0, length)
+}
+
+// formatBinaryDateTime: a binary DATE/DATETIME/TIMESTAMP (0, 4, 7 or 11
+// bytes) as text of `length` (10 a date, 19 a datetime, 21-26 with that
+// many fractional digits).
+format_binary_datetime(src: byte[], length: int) -> (string, string) {
+    if src.len == 0 { return zero_datetime(length), "" }
+    t = "DATE"
+    if length > 10 { t = "DATETIME" }
+    if !(length == 10 || length == 19 || (length >= 21 && length <= 26)) {
+        return "", "illegal ${t} length ${length}"
+    }
+    if !(src.len == 4 || src.len == 7 || src.len == 11) {
+        return "", "illegal ${t} packet length ${src.len}"
+    }
+    year = get_u16(src, 0)
+    y = string.from_long(year as long)
+    while string.length(y) < 4 { y = "0${y}" }
+    dst = "${y}-${two(src[2] as long)}-${two(src[3] as long)}"
+    if length == 10 { return dst, "" }
+    if src.len == 4 {
+        return "${dst}${string.substring("0000-00-00 00:00:00.000000", 10, length)}", ""
+    }
+    dst = "${dst} ${two(src[4] as long)}:${two(src[5] as long)}:${two(src[6] as long)}"
+    return "${dst}${microsecs(src, 7, length - 20)}", ""
+}
+
+// formatBinaryTime: a binary TIME (0, 8 or 12 bytes: sign, days, hours,
+// minutes, seconds, microseconds) as text of `length` (8, or 10-15 with
+// fractional digits); negative and 100+ hours lengthen it.
+format_binary_time(src: byte[], length: int) -> (string, string) {
+    if src.len == 0 {
+        return string.substring("0000-00-00 00:00:00.000000", 11, 11 + length), ""
+    }
+    if !(length == 8 || (length >= 10 && length <= 15)) {
+        return "", "illegal TIME length ${length}"
+    }
+    if !(src.len == 8 || src.len == 12) {
+        return "", "invalid TIME packet length ${src.len}"
+    }
+    dst = ""
+    if src[0] == 1 { dst = "-" }
+    days = get_u32(src, 1)
+    hours = days * 24 + (src[5] as long)
+    if hours >= 100 {
+        dst = "${dst}${hours}"
+    } else {
+        dst = "${dst}${two(hours)}"
+    }
+    dst = "${dst}:${two(src[6] as long)}:${two(src[7] as long)}"
+    return "${dst}${microsecs(src, 8, length - 9)}", ""
+}
+
+// ---- floats as Go's strconv.FormatFloat(f, 'g', -1, bitSize) ----
+
+var fscratch: ptr = null
+
+fn scratch() -> ptr {
+    if fscratch == null { fscratch = bytes.new(8) }
+    return bytes.data(fscratch)
+}
+
+// The float32 with these IEEE-754 bits, widened to a double.
+float32_from_bits(bits: long) -> float {
+    p = scratch()
+    mem.set_uint32(p, 0, bits)
+    return mem.get_float32(p, 0)
+}
+
+// d rounded to float32 and widened back (C's (double)(float)d).
+fn round32(d: float) -> float {
+    p = scratch()
+    mem.set_float32(p, 0, d)
+    return mem.get_float32(p, 0)
+}
+
+// The decimal digits and exponent of %.17g's text: ("31415926535897931", 0)
+// for 3.1415926535897931, the exponent being the power of ten of the first
+// digit.
+fn digits_of(s: string) -> (string, int) {
+    b = string.bytes(s)
+    digs = ""
+    int exp10 = 0
+    int dot = -1
+    int i = 0
+    int first = -1
+    int count = 0
+    while i < b.len {
+        c = b[i] as int
+        if c == 46 {
+            dot = count
+        } else if c == 101 || c == 69 {
+            e, _ = string.to_int(string.substring(s, i + 1, b.len))
+            exp10 = e
+            break
+        } else if c >= 48 && c <= 57 {
+            if first < 0 && c == 48 {
+                // a leading zero: shifts the point, no digit
+                if dot >= 0 { exp10 = exp10 - 1 }
+            } else {
+                if first < 0 { first = count }
+                digs = "${digs}${string.from_char(c)}"
+            }
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if string.length(digs) == 0 { return "0", 0 }
+    // the position of the decimal point relative to the first digit
+    int point = dot
+    if point < 0 { point = count }
+    // with leading zeros counted in `count` before `first`
+    return digs, exp10 + point - first - 1
+}
+
+// digits rounded (half up) to n significant digits: (digits, carry into a
+// new leading digit).
+fn round_digits(d: string, n: int) -> (string, bool) {
+    if string.length(d) <= n { return d, false }
+    b = string.bytes(d)
+    byte[] out = []
+    i = 0
+    while i < n {
+        out.push(b[i])
+        i = i + 1
+    }
+    if (b[n] as int) >= 53 {
+        j = n - 1
+        while j >= 0 {
+            if (out[j] as int) == 57 {
+                out[j] = 48 as byte
+                j = j - 1
+            } else {
+                out[j] = ((out[j] as int) + 1) as byte
+                break
+            }
+        }
+        if j < 0 {
+            return "1${bytes.string_from_slice(out[0..n - 1])}", true
+        }
+    }
+    return bytes.string_from_slice(out), false
+}
+
+fn strip_zeros(d: string) -> string {
+    t = d
+    while string.length(t) > 1 && string.ends_with(t, "0") == 1 {
+        t = string.substring(t, 0, string.length(t) - 1)
+    }
+    return t
+}
+
+fn layout_e(sign: string, d: string, exp: int) -> string {
+    mant = string.substring(d, 0, 1)
+    if string.length(d) > 1 { mant = "${mant}.${string.substring(d, 1, string.length(d))}" }
+    es = "+"
+    e = exp
+    if e < 0 {
+        es = "-"
+        e = 0 - e
+    }
+    ed = string.from_int(e)
+    if e < 10 { ed = "0${ed}" }
+    return "${sign}${mant}e${es}${ed}"
+}
+
+fn layout_f(sign: string, d: string, exp: int) -> string {
+    nd = string.length(d)
+    if exp < 0 {
+        z = ""
+        i = 0
+        while i < (0 - exp) - 1 {
+            z = "${z}0"
+            i = i + 1
+        }
+        return "${sign}0.${z}${d}"
+    }
+    if exp + 1 >= nd {
+        z = ""
+        i = 0
+        while i < exp + 1 - nd {
+            z = "${z}0"
+            i = i + 1
+        }
+        return "${sign}${d}${z}"
+    }
+    return "${sign}${string.substring(d, 0, exp + 1)}.${string.substring(d, exp + 1, nd)}"
+}
+
+// strconv.FormatFloat(f, 'g', -1, 64 or 32), which database/sql's
+// asString uses for a float64 or float32 value: the fewest digits that read
+// back as the same float64 (or float32), in %e form when the decimal
+// exponent is below -4 or at least 6 (the 'g' precision for the shortest
+// form), else %f form. NaN, +Inf, -Inf as Go writes them.
+format_float(f: float, is32: bool) -> string {
+    if f != f { return "NaN" }
+    if f > 1.7976931348623157e308 { return "+Inf" }
+    if f < -1.7976931348623157e308 { return "-Inf" }
+    if f == 0.0 {
+        if mem.bits_of_float(f) < 0 { return "-0" }
+        return "0"
+    }
+    neg = f < 0.0
+    a = f
+    if neg { a = 0.0 - f }
+    full, exp = digits_of(string.from_double(a))
+    maxd = 17
+    if is32 { maxd = 9 }
+    n = 1
+    while n <= maxd {
+        d, carry = round_digits(full, n)
+        e = exp
+        if carry { e = e + 1 }
+        d = strip_zeros(d)
+        cand = layout_e("", d, e)
+        back, perr = string.to_double(cand)
+        ok = false
+        if perr == "" {
+            if is32 { ok = round32(back) == a } else { ok = back == a }
+        }
+        if ok { return choose_layout(neg, d, e) }
+        n = n + 1
+    }
+    d = strip_zeros(full)
+    return choose_layout(neg, d, exp)
+}
+
+// Go's %g layout for the shortest form (ftoa.go: eprec = 6).
+fn choose_layout(neg: bool, d: string, exp: int) -> string {
+    sign = ""
+    if neg { sign = "-" }
+    if exp < -4 || exp >= 6 { return layout_e(sign, d, exp) }
+    return layout_f(sign, d, exp)
+}
+
+// ---- escaping and interpolateParams (connection.go, utils.go) ----
+
+// escapeStringBackslash: \0 \n \r \Z \' \" \\ escaped with a backslash.
+escape_backslash(v: string) -> string {
+    b = string.bytes(v)
+    w = new_buf()
+    for x in b {
+        c = x as int
+        if c == 0 { put_str(w, "\\0") }
+        else if c == 10 { put_str(w, "\\n") }
+        else if c == 13 { put_str(w, "\\r") }
+        else if c == 26 { put_str(w, "\\Z") }
+        else if c == 39 { put_str(w, "\\'") }
+        else if c == 34 { put_str(w, "\\\"") }
+        else if c == 92 { put_str(w, "\\\\") }
+        else { put_u8(w, c) }
+    }
+    return bytes.string_from_slice(w.b)
+}
+
+// escapeStringQuotes: apostrophes doubled (NO_BACKSLASH_ESCAPES).
+escape_quotes(v: string) -> string {
+    w = new_buf()
+    for x in string.bytes(v) {
+        c = x as int
+        if c == 39 { put_str(w, "''") } else { put_u8(w, c) }
+    }
+    return bytes.string_from_slice(w.b)
+}
+
+fn count_q(q: string) -> int {
+    n = 0
+    for x in string.bytes(q) {
+        if (x as int) == 63 { n = n + 1 }
+    }
+    return n
+}
+
+// mysqlConn.interpolateParams: the `?` placeholders replaced by the
+// arguments as SQL literals. ERR_SKIP when it cannot (the count differs, or
+// the result would not fit max_allowed_packet): the caller prepares instead.
+interpolate_params(query: string, args: sql.Value[], no_backslash_escapes: bool, max_allowed_packet: int) -> (string, string) {
+    if count_q(query) != args.len { return "", ERR_SKIP }
+    w = new_buf()
+    qb = string.bytes(query)
+    arg_pos = 0
+    i = 0
+    while i < qb.len {
+        c = qb[i] as int
+        if c != 63 {
+            put_u8(w, c)
+            i = i + 1
+            continue
+        }
+        a = args[arg_pos]
+        arg_pos = arg_pos + 1
+        k = a.kind
+        if k == sql.KIND_NULL {
+            put_str(w, "NULL")
+        } else if k == sql.KIND_INT {
+            put_str(w, string.from_long(a.i))
+        } else if k == sql.KIND_FLOAT {
+            put_str(w, format_float(a.f, false))
+        } else if k == sql.KIND_BOOL {
+            if a.b { put_str(w, "1") } else { put_str(w, "0") }
+        } else if k == sql.KIND_BYTES {
+            put_str(w, "_binary'")
+            if no_backslash_escapes { put_str(w, escape_quotes(a.s)) } else { put_str(w, escape_backslash(a.s)) }
+            put_str(w, "'")
+        } else {
+            put_str(w, "'")
+            if no_backslash_escapes { put_str(w, escape_quotes(a.s)) } else { put_str(w, escape_backslash(a.s)) }
+            put_str(w, "'")
+        }
+        if w.b.len + 4 > max_allowed_packet { return "", ERR_SKIP }
+        i = i + 1
+    }
+    if arg_pos != args.len { return "", ERR_SKIP }
+    return bytes.string_from_slice(w.b), ""
+}
+
+// ===================================================================
+// packets.go: decoding
+// ===================================================================
+
+// The handshake v10 packet's fields (readHandshakePacket).
+struct Handshake {
+    protocol: int
+    server_version: string
+    connection_id: long
+    auth_data: byte[]       // the scramble, 8 or 20 bytes
+    flags: long             // the server's capability flags
+    charset: int
+    status: int
+    plugin: string          // "" when the server named none
+}
+
+// readHandshakePacket's parsing: (handshake, "") or (null, error); an ERR
+// packet is (null, its MySQLError text).
+parse_handshake(data: byte[]) -> (*Handshake, string) {
+    if data.len < 1 { return null, ERR_MALFORM_PKT }
+    if (data[0] as int) == I_ERR {
+        e = parse_error_packet(data)
+        return null, mysql_error_string(e)
+    }
+    if (data[0] as int) < MIN_PROTOCOL_VERSION {
+        return null, "unsupported protocol version ${data[0] as int}. Version ${MIN_PROTOCOL_VERSION} or higher is required"
+    }
+    h = heap.new(Handshake)
+    h.protocol = data[0] as int
+    nul = index_byte(data, 1, 0)
+    if nul < 0 { return null, ERR_MALFORM_PKT }
+    h.server_version = str_range(data, 1, nul)
+    pos = nul + 1
+    if pos + 4 + 8 + 1 + 2 > data.len { return null, ERR_MALFORM_PKT }
+    h.connection_id = get_u32(data, pos)
+    pos = pos + 4
+    byte[] auth = []
+    i = 0
+    while i < 8 {
+        auth.push(data[pos + i])
+        i = i + 1
+    }
+    pos = pos + 8 + 1
+    h.flags = get_u16(data, pos) as long
+    pos = pos + 2
+    h.plugin = ""
+    h.charset = 0
+    h.status = 0
+    if data.len > pos {
+        if pos + 3 + 2 + 11 + 12 > data.len { return null, ERR_MALFORM_PKT }
+        h.charset = data[pos] as int
+        h.status = get_u16(data, pos + 1)
+        pos = pos + 3
+        h.flags = h.flags | ((get_u16(data, pos) as long) << 16)
+        pos = pos + 2
+        pos = pos + 11
+        // the second part of the scramble: 12 bytes and a NUL
+        i = 0
+        while i < 12 {
+            auth.push(data[pos + i])
+            i = i + 1
+        }
+        pos = pos + 13
+        if pos < data.len {
+            end = index_byte(data, pos, 0)
+            if end >= 0 {
+                h.plugin = str_range(data, pos, end)
+            } else {
+                h.plugin = str_range(data, pos, data.len)
+            }
+        }
+    }
+    h.auth_data = auth
+    return h, ""
+}
+
+// handleErrorPacket's parsing (the ERR packet, 0xff first).
+parse_error_packet(data: byte[]) -> *MySQLError {
+    e = heap.new(MySQLError)
+    e.sqlstate = ""
+    e.msg = ""
+    e.number = 0
+    if data.len < 3 {
+        e.msg = ERR_MALFORM_PKT
+        return e
+    }
+    e.number = get_u16(data, 1)
+    pos = 3
+    if data.len >= 9 && (data[3] as int) == 35 {
+        e.sqlstate = str_range(data, 4, 9)
+        pos = 9
+    }
+    e.msg = str_range(data, pos, data.len)
+    return e
+}
+
+// The OK packet's fields (handleOkPacket).
+struct OkPacket {
+    affected_rows: long
+    insert_id: long
+    status: int
+    warnings: int
+}
+
+parse_ok_packet(data: byte[]) -> (OkPacket, string) {
+    ok = OkPacket { affected_rows: 0, insert_id: 0, status: 0, warnings: 0 }
+    ar, _, n = read_length_encoded_integer(data, 1)
+    id, _, m = read_length_encoded_integer(data, 1 + n)
+    ok.affected_rows = ar
+    ok.insert_id = id
+    at = 1 + n + m
+    if at + 2 > data.len { return ok, ERR_MALFORM_PKT }
+    ok.status = get_u16(data, at)
+    if at + 4 <= data.len { ok.warnings = get_u16(data, at + 2) }
+    return ok, ""
+}
+
+// readStatus: the 2-byte status flags at b[at:].
+read_status(b: byte[], at: int) -> int { return get_u16(b, at) }
+
+// An EOF packet: 0xfe and 5 bytes (protocol 4.1) or 1 (older); with
+// CLIENT_DEPRECATE_EOF the end of rows is an OK packet with 0xfe first,
+// shorter than 0xffffff (a row cannot start 0xfe and be that short... a row
+// whose first value is 8+ bytes long can; this port does not request
+// CLIENT_DEPRECATE_EOF, as Go's v1.9.3 does not).
+is_eof_packet(data: byte[]) -> bool {
+    return data.len > 0 && (data[0] as int) == I_EOF && (data.len == 5 || data.len == 1)
+}
+
+// mysqlField.
+struct Field {
+    table_name: string
+    name: string
+    length: long
+    flags: int
+    field_type: int
+    decimals: int
+    charset: int
+}
+
+// One column definition packet (readColumns' loop body).
+parse_column(data: byte[], with_alias: bool) -> (Field, string) {
+    f = Field { table_name: "", name: "", length: 0, flags: 0, field_type: 0, decimals: 0, charset: 0 }
+    pos = skip_length_encoded_string(data, 0)           // catalog
+    if pos < 0 { return f, "unexpected EOF" }
+    n = skip_length_encoded_string(data, pos)           // database
+    if n < 0 { return f, "unexpected EOF" }
+    pos = pos + n
+    if with_alias {
+        t, _, tn = read_length_encoded_string(data, pos) // table
+        if tn < 0 { return f, "unexpected EOF" }
+        f.table_name = t
+        pos = pos + tn
+    } else {
+        n = skip_length_encoded_string(data, pos)
+        if n < 0 { return f, "unexpected EOF" }
+        pos = pos + n
+    }
+    n = skip_length_encoded_string(data, pos)           // original table
+    if n < 0 { return f, "unexpected EOF" }
+    pos = pos + n
+    name, _, nn = read_length_encoded_string(data, pos) // name
+    if nn < 0 { return f, "unexpected EOF" }
+    f.name = name
+    pos = pos + nn
+    n = skip_length_encoded_string(data, pos)           // original name
+    if n < 0 { return f, "unexpected EOF" }
+    pos = pos + n
+    pos = pos + 1                                       // filler (length of fixed fields)
+    if pos + 2 + 4 + 1 + 2 + 1 > data.len { return f, ERR_MALFORM_PKT }
+    f.charset = data[pos] as int
+    pos = pos + 2
+    f.length = get_u32(data, pos)
+    pos = pos + 4
+    f.field_type = data[pos] as int
+    pos = pos + 1
+    f.flags = get_u16(data, pos)
+    pos = pos + 2
+    f.decimals = data[pos] as int
+    return f, ""
+}
+
+// One decoded row: a value and a NULL flag per column.
+struct Row {
+    values: string[]
+    nulls: bool[]
+}
+
+new_row() -> *Row { return heap.new(Row) }
+
+// textRows.readRow: a text-protocol row (each value a length-encoded
+// string, 0xfb NULL). Values stay text (Go parses ints and floats into
+// int64/float64, which database/sql turns back into this text).
+decode_text_row(data: byte[], ncols: int, row: *Row) -> string {
+    string[] vals = []
+    bool[] nulls = []
+    pos = 0
+    i = 0
+    while i < ncols {
+        s, is_null, n = read_length_encoded_string(data, pos)
+        if n < 0 { return "unexpected EOF" }
+        pos = pos + n
+        vals.push(s)
+        nulls.push(is_null)
+        i = i + 1
+    }
+    row.values = vals
+    row.nulls = nulls
+    return ""
+}
+
+fn signed8(v: int) -> long {
+    if v >= 128 { return (v - 256) as long }
+    return v as long
+}
+fn signed16(v: int) -> long {
+    if v >= 32768 { return (v - 65536) as long }
+    return v as long
+}
+fn signed32(v: long) -> long {
+    if v >= 2147483648 { return v - 4294967296 }
+    return v
+}
+
+// binaryRows.readRow: a binary-protocol row (0x00, the NULL bitmap offset
+// by 2, then each non-NULL value in its type's binary form), as text.
+decode_binary_row(data: byte[], fields: Field[], row: *Row) -> string {
+    string[] vals = []
+    bool[] nulls = []
+    ncols = fields.len
+    if data.len < 1 || (data[0] as int) != I_OK { return ERR_MALFORM_PKT }
+    pos = 1 + ((ncols + 7 + 2) >> 3)
+    if pos > data.len { return ERR_MALFORM_PKT }
+    i = 0
+    while i < ncols {
+        f = fields[i]
+        bit = ((data[1 + ((i + 2) >> 3)] as int) >> ((i + 2) & 7)) & 1
+        if bit == 1 || f.field_type == FIELD_TYPE_NULL {
+            vals.push("")
+            nulls.push(true)
+            i = i + 1
+            continue
+        }
+        t = f.field_type
+        unsigned = (f.flags & FLAG_UNSIGNED) != 0
+        v = ""
+        if t == FIELD_TYPE_TINY {
+            if pos + 1 > data.len { return "unexpected EOF" }
+            if unsigned { v = string.from_long(data[pos] as long) } else { v = string.from_long(signed8(data[pos] as int)) }
+            pos = pos + 1
+        } else if t == FIELD_TYPE_SHORT || t == FIELD_TYPE_YEAR {
+            if pos + 2 > data.len { return "unexpected EOF" }
+            u = get_u16(data, pos)
+            if unsigned { v = string.from_long(u as long) } else { v = string.from_long(signed16(u)) }
+            pos = pos + 2
+        } else if t == FIELD_TYPE_INT24 || t == FIELD_TYPE_LONG {
+            if pos + 4 > data.len { return "unexpected EOF" }
+            u = get_u32(data, pos)
+            if unsigned { v = string.from_long(u) } else { v = string.from_long(signed32(u)) }
+            pos = pos + 4
+        } else if t == FIELD_TYPE_LONGLONG {
+            if pos + 8 > data.len { return "unexpected EOF" }
+            u = get_u64(data, pos)
+            if unsigned { v = uint64_to_string(u) } else { v = string.from_long(u) }
+            pos = pos + 8
+        } else if t == FIELD_TYPE_FLOAT {
+            if pos + 4 > data.len { return "unexpected EOF" }
+            v = format_float(float32_from_bits(get_u32(data, pos)), true)
+            pos = pos + 4
+        } else if t == FIELD_TYPE_DOUBLE {
+            if pos + 8 > data.len { return "unexpected EOF" }
+            v = format_float(mem.float_from_bits(get_u64(data, pos)), false)
+            pos = pos + 8
+        } else if t == FIELD_TYPE_DECIMAL || t == FIELD_TYPE_NEWDECIMAL || t == FIELD_TYPE_VARCHAR ||
+                  t == FIELD_TYPE_BIT || t == FIELD_TYPE_ENUM || t == FIELD_TYPE_SET ||
+                  t == FIELD_TYPE_TINY_BLOB || t == FIELD_TYPE_MEDIUM_BLOB || t == FIELD_TYPE_LONG_BLOB ||
+                  t == FIELD_TYPE_BLOB || t == FIELD_TYPE_VAR_STRING || t == FIELD_TYPE_STRING ||
+                  t == FIELD_TYPE_GEOMETRY || t == FIELD_TYPE_JSON || t == FIELD_TYPE_VECTOR {
+            s, is_null, n = read_length_encoded_string(data, pos)
+            if n < 0 { return "unexpected EOF" }
+            pos = pos + n
+            if is_null {
+                vals.push("")
+                nulls.push(true)
+                i = i + 1
+                continue
+            }
+            v = s
+        } else if t == FIELD_TYPE_DATE || t == FIELD_TYPE_NEWDATE || t == FIELD_TYPE_TIME ||
+                  t == FIELD_TYPE_TIMESTAMP || t == FIELD_TYPE_DATETIME {
+            num, is_null, n = read_length_encoded_integer(data, pos)
+            pos = pos + n
+            if is_null {
+                vals.push("")
+                nulls.push(true)
+                i = i + 1
+                continue
+            }
+            k = num as int
+            if pos + k > data.len { return "unexpected EOF" }
+            src = copy_range(data, pos, pos + k)
+            int dstlen = 0
+            ferr = ""
+            if t == FIELD_TYPE_TIME {
+                d = f.decimals
+                if d == 0 || d == 31 { dstlen = 8 }
+                else if d >= 1 && d <= 6 { dstlen = 8 + 1 + d }
+                else { return "protocol error, illegal decimals value ${d}" }
+                v, ferr = format_binary_time(src, dstlen)
+            } else {
+                if t == FIELD_TYPE_DATE {
+                    dstlen = 10
+                } else {
+                    d = f.decimals
+                    if d == 0 || d == 31 { dstlen = 19 }
+                    else if d >= 1 && d <= 6 { dstlen = 19 + 1 + d }
+                    else { return "protocol error, illegal decimals value ${d}" }
+                }
+                v, ferr = format_binary_datetime(src, dstlen)
+            }
+            if ferr != "" { return ferr }
+            pos = pos + k
+        } else {
+            return "unknown field type ${t}"
+        }
+        vals.push(v)
+        nulls.push(false)
+        i = i + 1
+    }
+    row.values = vals
+    row.nulls = nulls
+    return ""
+}
+
+// readPrepareResultPacket: (statement id, column count, param count, "").
+prepare_ok(data: byte[]) -> (long, int, int, string) {
+    if data.len < 9 { return 0, 0, 0, ERR_MALFORM_PKT }
+    return get_u32(data, 1), get_u16(data, 5), get_u16(data, 7), ""
+}
+
+// writeExecutePacket's body (without the 4-byte header): COM_STMT_EXECUTE,
+// the statement id, no cursor, one iteration, the NULL bitmap, new-params-
+// bound, each parameter's type and its value. `long_data[i]` true: that
+// argument went ahead in COM_STMT_SEND_LONG_DATA packets, so only its type
+// is here.
+execute_packet(stmt_id: long, args: sql.Value[], long_data: bool[]) -> (byte[], string) {
+    w = new_buf()
+    put_u8(w, COM_STMT_EXECUTE)
+    put_u32(w, stmt_id)
+    put_u8(w, 0)
+    put_u32(w, 1)
+    if args.len == 0 { return w.b, "" }
+    mask_len = (args.len + 7) / 8
+    mask_at = w.b.len
+    i = 0
+    while i < mask_len {
+        put_u8(w, 0)
+        i = i + 1
+    }
+    put_u8(w, 1)
+    types = new_buf()
+    values = new_buf()
+    i = 0
+    while i < args.len {
+        a = args[i]
+        k = a.kind
+        if k == sql.KIND_NULL {
+            w.b[mask_at + i / 8] = ((w.b[mask_at + i / 8] as int) | (1 << (i & 7))) as byte
+            put_u8(types, FIELD_TYPE_NULL)
+            put_u8(types, 0)
+        } else if k == sql.KIND_INT {
+            put_u8(types, FIELD_TYPE_LONGLONG)
+            put_u8(types, 0)
+            put_u64(values, a.i)
+        } else if k == sql.KIND_FLOAT {
+            put_u8(types, FIELD_TYPE_DOUBLE)
+            put_u8(types, 0)
+            put_u64(values, mem.bits_of_float(a.f))
+        } else if k == sql.KIND_BOOL {
+            put_u8(types, FIELD_TYPE_TINY)
+            put_u8(types, 0)
+            if a.b { put_u8(values, 1) } else { put_u8(values, 0) }
+        } else {
+            // string and []byte: MYSQL_TYPE_STRING, length-encoded
+            put_u8(types, FIELD_TYPE_STRING)
+            put_u8(types, 0)
+            ld = i < long_data.len && long_data[i]
+            if !ld { append_length_encoded_string(values, a.s) }
+        }
+        i = i + 1
+    }
+    put_raw(w, types.b)
+    put_raw(w, values.b)
+    return w.b, ""
+}
+
+// One COM_STMT_SEND_LONG_DATA body: the command, statement id, parameter
+// index and a chunk of the value.
+long_data_packet(stmt_id: long, param_id: int, chunk: byte[]) -> byte[] {
+    w = new_buf()
+    put_u8(w, COM_STMT_SEND_LONG_DATA)
+    put_u32(w, stmt_id)
+    put_u16(w, param_id)
+    put_raw(w, chunk)
+    return w.b
+}
+
+// ===================================================================
+// fields.go
+// ===================================================================
+
+// mysqlField.typeDatabaseName (Go's ColumnTypeDatabaseTypeName).
+type_database_name(f: Field) -> string {
+    t = f.field_type
+    unsigned = (f.flags & FLAG_UNSIGNED) != 0
+    binary = f.charset == BINARY_COLLATION_ID
+    if t == FIELD_TYPE_BIT { return "BIT" }
+    if t == FIELD_TYPE_BLOB { if !binary { return "TEXT" } return "BLOB" }
+    if t == FIELD_TYPE_DATE { return "DATE" }
+    if t == FIELD_TYPE_DATETIME { return "DATETIME" }
+    if t == FIELD_TYPE_DECIMAL { return "DECIMAL" }
+    if t == FIELD_TYPE_DOUBLE { return "DOUBLE" }
+    if t == FIELD_TYPE_ENUM { return "ENUM" }
+    if t == FIELD_TYPE_FLOAT { return "FLOAT" }
+    if t == FIELD_TYPE_GEOMETRY { return "GEOMETRY" }
+    if t == FIELD_TYPE_INT24 { if unsigned { return "UNSIGNED MEDIUMINT" } return "MEDIUMINT" }
+    if t == FIELD_TYPE_JSON { return "JSON" }
+    if t == FIELD_TYPE_LONG { if unsigned { return "UNSIGNED INT" } return "INT" }
+    if t == FIELD_TYPE_LONG_BLOB { if !binary { return "LONGTEXT" } return "LONGBLOB" }
+    if t == FIELD_TYPE_LONGLONG { if unsigned { return "UNSIGNED BIGINT" } return "BIGINT" }
+    if t == FIELD_TYPE_MEDIUM_BLOB { if !binary { return "MEDIUMTEXT" } return "MEDIUMBLOB" }
+    if t == FIELD_TYPE_NEWDATE { return "DATE" }
+    if t == FIELD_TYPE_NEWDECIMAL { return "DECIMAL" }
+    if t == FIELD_TYPE_NULL { return "NULL" }
+    if t == FIELD_TYPE_SET { return "SET" }
+    if t == FIELD_TYPE_SHORT { if unsigned { return "UNSIGNED SMALLINT" } return "SMALLINT" }
+    if t == FIELD_TYPE_STRING {
+        if (f.flags & FLAG_ENUM) != 0 { return "ENUM" }
+        if (f.flags & FLAG_SET) != 0 { return "SET" }
+        if binary { return "BINARY" }
+        return "CHAR"
+    }
+    if t == FIELD_TYPE_TIME { return "TIME" }
+    if t == FIELD_TYPE_TIMESTAMP { return "TIMESTAMP" }
+    if t == FIELD_TYPE_TINY { if unsigned { return "UNSIGNED TINYINT" } return "TINYINT" }
+    if t == FIELD_TYPE_TINY_BLOB { if !binary { return "TINYTEXT" } return "TINYBLOB" }
+    if t == FIELD_TYPE_VARCHAR || t == FIELD_TYPE_VAR_STRING { if binary { return "VARBINARY" } return "VARCHAR" }
+    if t == FIELD_TYPE_YEAR { return "YEAR" }
+    if t == FIELD_TYPE_VECTOR { return "VECTOR" }
+    return ""
+}
+
+// ===================================================================
+// auth.go: scrambles and the RSA path
+// ===================================================================
+
+fn handle_bytes(h: ptr) -> byte[] {
+    byte[] out = []
+    if h == null { return out }
+    for b in bytes.view(h) { out.push(b) }
+    bytes.free(h)
+    return out
+}
+
+fn str_bytes(s: string) -> byte[] {
+    byte[] out = []
+    for b in string.bytes(s) { out.push(b as byte) }
+    return out
+}
+
+fn cat(a: byte[], b: byte[]) -> byte[] {
+    byte[] out = []
+    for x in a { out.push(x) }
+    for x in b { out.push(x) }
+    return out
+}
+
+fn sha1_of(b: byte[]) -> byte[] { return handle_bytes(sha1.bytes(b)) }
+fn sha256_of(b: byte[]) -> byte[] { return handle_bytes(sha2.sha256_bytes(b)) }
+
+// scramblePassword (mysql_native_password): SHA1(password) XOR
+// SHA1(scramble + SHA1(SHA1(password))); empty for an empty password.
+scramble_password(scramble: byte[], password: string) -> byte[] {
+    byte[] out = []
+    if string.length(password) == 0 { return out }
+    stage1 = sha1_of(str_bytes(password))
+    hash = sha1_of(stage1)
+    outer = sha1_of(cat(scramble, hash))
+    i = 0
+    while i < outer.len {
+        out.push(((outer[i] as int) ^ (stage1[i] as int)) as byte)
+        i = i + 1
+    }
+    return out
+}
+
+// scrambleSHA256Password (caching_sha2_password): SHA256(password) XOR
+// SHA256(SHA256(SHA256(password)) + scramble).
+scramble_sha256_password(scramble: byte[], password: string) -> byte[] {
+    byte[] out = []
+    if string.length(password) == 0 { return out }
+    m1 = sha256_of(str_bytes(password))
+    m1h = sha256_of(m1)
+    m2 = sha256_of(cat(m1h, scramble))
+    i = 0
+    while i < m1.len {
+        out.push(((m1[i] as int) ^ (m2[i] as int)) as byte)
+        i = i + 1
+    }
+    return out
+}
+
+const MY_RND_MAX_VAL = 1073741823   // 0x3FFFFFFF
+const M32 = 4294967295
+
+// pwHash: the pre-4.1 password hash (two 31-bit words).
+fn pw_hash(password: byte[]) -> (long, long) {
+    let add: long = 7
+    let r0: long = 1345345333
+    let r1: long = 305419889            // 0x12345671
+    for x in password {
+        c = x as long
+        if c == 32 || c == 9 { continue }
+        r0 = (r0 ^ (((((r0 & 63) + add) * c) + (r0 << 8)) & M32)) & M32
+        r1 = (r1 + (((r1 << 8) & M32) ^ r0)) & M32
+        add = (add + c) & M32
+    }
+    return r0 & 2147483647, r1 & 2147483647
+}
+
+// scrambleOldPassword (mysql_old_password, insecure, pre 4.1): 8 bytes.
+scramble_old_password(scramble: byte[], password: string) -> byte[] {
+    sc = copy_range(scramble, 0, 8)
+    p0, p1 = pw_hash(str_bytes(password))
+    s0, s1 = pw_hash(sc)
+    let seed1: long = (p0 ^ s0) % MY_RND_MAX_VAL
+    let seed2: long = (p1 ^ s1) % MY_RND_MAX_VAL
+    byte[] out = []
+    i = 0
+    while i < 8 {
+        seed1 = (seed1 * 3 + seed2) % MY_RND_MAX_VAL
+        seed2 = (seed1 + seed2 + 33) % MY_RND_MAX_VAL
+        out.push(((seed1 * 31 / MY_RND_MAX_VAL) + 64) as byte)
+        i = i + 1
+    }
+    seed1 = (seed1 * 3 + seed2) % MY_RND_MAX_VAL
+    seed2 = (seed1 + seed2 + 33) % MY_RND_MAX_VAL
+    mask = (seed1 * 31 / MY_RND_MAX_VAL) as int
+    i = 0
+    while i < 8 {
+        out[i] = (((out[i] as int) ^ mask) & 255) as byte
+        i = i + 1
+    }
+    return out
+}
+
+// x509.ParsePKIXPublicKey for an RSA key in a PEM "PUBLIC KEY" block
+// (SubjectPublicKeyInfo: SEQUENCE { SEQUENCE { rsaEncryption, NULL }, BIT
+// STRING { SEQUENCE { n, e } } }); a PKCS#1 "RSA PUBLIC KEY" block is read
+// too. (an rsa key for rsa.raw_encrypt, "") or (null, why).
+parse_pkix_public_key(pem_text: string) -> (ptr, string) {
+    der, label, perr = pem.parse(pem_text)
+    if perr != "" { return null, "no pem data found, data: ${pem_text}" }
+    seq = der
+    owned_seq = false
+    if label == "PUBLIC KEY" {
+        r = asn1.reader_new(der)
+        outer, outer_body, oerr = asn1.read_sequence(r)
+        if oerr != "" { asn1.reader_free(r); bytes.free(der); return null, "x509: malformed public key: ${oerr}" }
+        alg, alg_body, aerr = asn1.read_sequence(outer)
+        if aerr != "" { return null, "x509: malformed algorithm identifier: ${aerr}" }
+        oid, ierr = asn1.read_tlv(alg)
+        if ierr != "" { return null, "x509: malformed algorithm identifier: ${ierr}" }
+        // 1.2.840.113549.1.1.1 rsaEncryption
+        ob = bytes.view(oid)
+        rsa_oid = [42, 134, 72, 134, 247, 13, 1, 1, 1]
+        same = ob.len == rsa_oid.len
+        if same {
+            j = 0
+            while j < ob.len {
+                if (ob[j] as int) != rsa_oid[j] { same = false }
+                j = j + 1
+            }
+        }
+        bytes.free(oid)
+        if !same { return null, "not an RSA public key" }
+        bits, unused, berr = asn1.read_bit_string(outer)
+        if berr != "" || unused != 0 { return null, "x509: malformed subject public key" }
+        seq = bits
+        owned_seq = true
+        asn1.reader_free(alg)
+        bytes.free(alg_body)
+        asn1.reader_free(outer)
+        bytes.free(outer_body)
+        asn1.reader_free(r)
+    } else if label != "RSA PUBLIC KEY" {
+        bytes.free(der)
+        return null, "x509: unknown public key type \"${label}\""
+    }
+    r2 = asn1.reader_new(seq)
+    keyseq, keybody, kerr = asn1.read_sequence(r2)
+    if kerr != "" { return null, "x509: malformed RSA public key: ${kerr}" }
+    n, nerr = asn1.read_tlv(keyseq)
+    if nerr != "" || asn1.last_tag(keyseq) != 2 { return null, "x509: malformed RSA modulus" }
+    e, eerr = asn1.read_tlv(keyseq)
+    if eerr != "" || asn1.last_tag(keyseq) != 2 { return null, "x509: malformed RSA exponent" }
+    nb = bytes.view(n)
+    // drop the sign byte
+    start = 0
+    while start < nb.len - 1 && (nb[start] as int) == 0 { start = start + 1 }
+    nbytes = copy_range(nb, start, nb.len)
+    ebytes = handle_bytes(e)
+    bytes.free(n)
+    asn1.reader_free(keyseq)
+    bytes.free(keybody)
+    asn1.reader_free(r2)
+    if owned_seq { bytes.free(seq) }
+    bytes.free(der)
+    byte[] empty = []
+    k = rsa.key_from_bytes(nbytes, ebytes, empty)
+    if k == null { return null, "x509: invalid RSA public key" }
+    return k, ""
+}
+
+// MGF1 with SHA-1 (RFC 8017 B.2.1).
+fn mgf1_sha1(seed: byte[], mask_len: int) -> byte[] {
+    byte[] out = []
+    let counter: long = 0
+    while out.len < mask_len {
+        w = new_buf()
+        put_raw(w, seed)
+        put_u8(w, ((counter >> 24) & 255) as int)
+        put_u8(w, ((counter >> 16) & 255) as int)
+        put_u8(w, ((counter >> 8) & 255) as int)
+        put_u8(w, (counter & 255) as int)
+        for x in sha1_of(w.b) {
+            if out.len < mask_len { out.push(x) }
+        }
+        counter = counter + 1
+    }
+    return out
+}
+
+// EME-OAEP encoding with SHA-1 and an empty label (RFC 8017 7.1.1 step 2):
+// the k-byte block 0x00 || maskedSeed || maskedDB for message m and a
+// 20-byte seed. (block, "") or ([], "message too long").
+oaep_sha1_pad(m: byte[], seed: byte[], k: int) -> (byte[], string) {
+    byte[] empty = []
+    hlen = 20
+    if m.len > k - 2 * hlen - 2 { return empty, "crypto/rsa: message too long for RSA key size" }
+    lhash = sha1_of(empty)
+    dblen = k - hlen - 1
+    byte[] db = []
+    for x in lhash { db.push(x) }
+    while db.len < dblen - m.len - 1 { db.push(0 as byte) }
+    db.push(1 as byte)
+    for x in m { db.push(x) }
+    dbmask = mgf1_sha1(seed, dblen)
+    i = 0
+    while i < dblen {
+        db[i] = ((db[i] as int) ^ (dbmask[i] as int)) as byte
+        i = i + 1
+    }
+    seedmask = mgf1_sha1(db, hlen)
+    byte[] em = []
+    em.push(0 as byte)
+    i = 0
+    while i < hlen {
+        em.push(((seed[i] as int) ^ (seedmask[i] as int)) as byte)
+        i = i + 1
+    }
+    for x in db { em.push(x) }
+    return em, ""
+}
+
+// encryptPassword: (password + NUL) XOR the scramble (repeated), encrypted
+// with RSA-OAEP (SHA-1, MGF1-SHA-1, empty label) under the server's key.
+encrypt_password(password: string, seed: byte[], key: ptr) -> (byte[], string) {
+    byte[] empty = []
+    plain = str_bytes(password)
+    plain.push(0 as byte)
+    if seed.len > 0 {
+        i = 0
+        while i < plain.len {
+            plain[i] = ((plain[i] as int) ^ (seed[i % seed.len] as int)) as byte
+            i = i + 1
+        }
+    }
+    rnd, rerr = cryptography.random_buffer(20)
+    if rerr != "" { return empty, rerr }
+    oseed = handle_bytes(rnd)
+    k = rsa.modulus_bytes(key)
+    em, perr = oaep_sha1_pad(plain, oseed, k)
+    if perr != "" { return empty, perr }
+    mb = bytes.from_slice(em)
+    c = rsa.raw_encrypt(key, mb)
+    bytes.free(mb)
+    if c == null { return empty, "crypto/rsa: encryption failed" }
+    return handle_bytes(c), ""
+}

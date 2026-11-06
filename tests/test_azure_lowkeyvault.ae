@@ -1,0 +1,124 @@
+// Ported from testcontainers-go modules/azure/lowkeyvault/examples_test.go
+// (ExampleRun, ExampleRun_secretOperationsNetwork) and lowkeyvault_test.go
+//
+// Compile-checked only. The engine-free cases check the module's request
+// defaults, the network alias option and the access mode handling for real.
+// The cases that start Lowkey Vault run only with TCAE_LIVE_LOWKEYVAULT=1 and
+// an engine. The network example builds modules/azure/lowkeyvault/testdata
+// (Go's own client of the vault, run in a container) and checks that it
+// exits cleanly, as Go does. Not ported: Client (PKCS#12 in Go).
+
+import std.spec
+import std.string
+import std.os
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+import testcontainers.network
+import testcontainers.testing
+import modules.azure.lowkeyvault
+
+const IMAGE = "nagyesta/lowkey-vault:7.3.48-ubi10-minimal"
+
+// 1 when TCAE_LIVE_LOWKEYVAULT=1 and an engine answers. The variable is read
+// first so that nothing touches an engine unless asked to.
+fn live_on() -> int {
+    if os.getenv("TCAE_LIVE_LOWKEYVAULT") != "1" { return 0 }
+    return testing.engine_ok()
+}
+
+main() {
+    fw = spec.init()
+    live = live_on()
+
+    spec.describe(fw, "modules/azure/lowkeyvault") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("has the module's defaults (engine-free)") callback {
+            r = lowkeyvault.lowkeyvault_request_new()
+            exposed = tc.req_exposed(r)
+            spec.assert_eq(exposed.len, 2, "API and metadata ports")
+            spec.assert_str_eq(exposed[0], "8443/tcp", "API port")
+            spec.assert_str_eq(exposed[1], "8080/tcp", "metadata port")
+            spec.assert_str_eq(tc.req_env(r, "LOWKEY_VAULT_RELAXED_PORTS"), "true", "relaxed ports")
+            lowkeyvault.lowkeyvault_request_free(r)
+        }
+
+        spec.it("sets a network alias and a vault alias (WithNetworkAlias, engine-free)") callback {
+            r = lowkeyvault.lowkeyvault_request_new()
+            lowkeyvault.lowkey_network_alias(r, "lowkey-vault", "some-net")
+            nets = tc.req_networks(r)
+            spec.assert_eq(nets.len, 1, "joined one network")
+            spec.assert_str_eq(nets[0], "some-net", "that network")
+            aliases = tc.req_network_aliases(r, "some-net")
+            spec.assert_eq(aliases.len, 1, "one alias")
+            spec.assert_str_eq(aliases[0], "lowkey-vault", "the alias")
+            spec.assert_str_eq(tc.req_env(r, "LOWKEY_VAULT_ALIASES"), "localhost=lowkey-vault:<port>", "the vault alias")
+            lowkeyvault.lowkeyvault_request_free(r)
+        }
+
+        spec.it("knows its access modes and the identity header (engine-free)") callback {
+            spec.assert_str_eq(lowkeyvault.identity_header(), "header", "IDENTITY_HEADER")
+            spec.assert_true(lowkeyvault.LOCAL != lowkeyvault.NETWORK, "two modes")
+            auth, err = lowkeyvault.host_authority(null, "8443/tcp", 7)
+            spec.assert_str_eq(auth, "", "no authority")
+            spec.assert_contains(err, "unsupported access mode: 7", "an unknown mode is refused")
+        }
+
+        spec.it_when(live, "starts Lowkey Vault (ExampleRun)", "set TCAE_LIVE_LOWKEYVAULT=1 and have an engine") callback {
+            c, err = lowkeyvault.run(IMAGE)
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "lowkeyvault starts")
+            if err != "" { return }
+            st, serr = tc.state_of(c)
+            spec.assert_ok(serr, "state")
+            spec.assert_true(st.running, "state.Running")
+            url, uerr = lowkeyvault.connection_url(c, lowkeyvault.LOCAL)
+            spec.assert_ok(uerr, "connection url")
+            spec.assert_true(string.starts_with(url, "https://") == 1, "an https URL: ${url}")
+            ep, eerr = lowkeyvault.identity_endpoint(c, lowkeyvault.LOCAL)
+            spec.assert_ok(eerr, "identity endpoint")
+            spec.assert_true(string.ends_with(ep, "/metadata/identity/oauth2/token") == 1, "the token endpoint: ${ep}")
+            pw, perr = lowkeyvault.default_cert_password(c)
+            spec.assert_ok(perr, "default cert password")
+            spec.assert_true(string.length(pw) > 0, "a keystore password")
+            _u, nerr = lowkeyvault.connection_url(c, lowkeyvault.NETWORK)
+            spec.assert_true(nerr != "", "network mode needs the container on exactly one network")
+        }
+
+        spec.it_when(live, "serves another container on a network (ExampleRun_secretOperationsNetwork)", "set TCAE_LIVE_LOWKEYVAULT=1 and have an engine") callback {
+            n, nerr = network.new_random()
+            testing.cleanup_network(n)
+            spec.assert_ok(nerr, "network")
+            if nerr != "" { return }
+            c, err = lowkeyvault.run(IMAGE) {
+                lowkey_network_alias("lowkey-vault", n.name)
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "lowkeyvault starts")
+            if err != "" { return }
+            conn_url, uerr = lowkeyvault.connection_url(c, lowkeyvault.NETWORK)
+            spec.assert_ok(uerr, "connection url in network mode")
+            spec.assert_str_eq(conn_url, "https://lowkey-vault:8443", "the alias and the container port")
+            identity, ierr = lowkeyvault.identity_endpoint(c, lowkeyvault.NETWORK)
+            spec.assert_ok(ierr, "identity endpoint in network mode")
+            spec.assert_str_eq(identity, "http://lowkey-vault:8080/metadata/identity/oauth2/token", "token endpoint")
+
+            client_ctr, cerr = tc.run("") {
+                from_dockerfile("modules/azure/lowkeyvault/testdata", "Dockerfile")
+                tc.env("IDENTITY_ENDPOINT", identity)
+                tc.env("IDENTITY_HEADER", lowkeyvault.identity_header())
+                tc.env("CONNECTION_URL", conn_url)
+                with_network(n.name)
+                wait_for(wait.for_log("true"))
+            }
+            testing.cleanup_container(client_ctr)
+            spec.assert_ok(cerr, "the client container ran")
+            if cerr != "" { return }
+            st, serr = tc.state_of(client_ctr)
+            spec.assert_ok(serr, "state")
+            spec.assert_eq(st.exit_code, 0, "the client exited cleanly")
+        }
+    }
+    return spec.run_summary(fw)
+}

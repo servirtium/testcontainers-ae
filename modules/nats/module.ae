@@ -1,0 +1,135 @@
+// Ported from testcontainers-go modules/nats/nats.go, modules/nats/options.go
+//
+// modules.nats: a NATS server container (JetStream on, debug and trace
+// logging, as Go starts it).
+//
+//     import modules.nats
+//
+//     n, err = nats.run("nats:2.9") {
+//         username("foo")
+//         password("bar")
+//         argument("--name", "tcae-server")
+//         tc.env("TZ", "UTC")                  // a core option, qualified
+//     }
+//     defer tc.terminate(n.container)
+//     url, _ = nats.connection_string(n)       // "nats://localhost:32771"
+//
+// Go's options are CmdOptions kept in a map and turned into `--flag value`
+// pairs after the module's own `-DV -js`; here they are setters on the same
+// request that write the pairs into the command at once, replacing an
+// earlier value of the same flag, as the map does. Go's WithConfigFile takes
+// an io.Reader; this takes the configuration text (config_file) or a host
+// file (config_file_path). Nothing else is left out (the deprecated
+// RunContainer excepted).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    NATSContainer, run, connection_string, username, password, argument,
+    config_file, config_file_path, CLIENT_PORT, ROUTING_PORT, MONITORING_PORT,
+    CONFIG_PATH, DEFAULT_IMAGE, nats_request_new, nats_request_free
+)
+
+const CLIENT_PORT = "4222/tcp"
+const ROUTING_PORT = "6222/tcp"
+const MONITORING_PORT = "8222/tcp"
+const CONFIG_PATH = "/etc/nats.conf"
+const DEFAULT_IMAGE = "nats:2.11.7"
+
+struct NATSContainer {
+    container: *docker.Container
+    user: string
+    password: string
+}
+
+nats_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, CLIENT_PORT)
+    tc.expose(r, ROUTING_PORT)
+    tc.expose(r, MONITORING_PORT)
+    tc.cmd(r, ["-DV", "-js"])
+    tc.wait_for(r, wait.for_listening_port(CLIENT_PORT))
+    return r
+}
+
+nats_request_free(p: ptr) { tc.request_free(p) }
+
+// The value of "--flag" in the request's command, "" when absent.
+fn cmd_value(r: ptr, flag: string) -> string {
+    args = tc.req_cmd(r)
+    i = 0
+    while i + 1 < args.len {
+        if args[i] == flag { return args[i + 1] }
+        i = i + 1
+    }
+    return ""
+}
+
+// Go's WithArgument: `--flag value`; leading dashes on flag are optional.
+// A second call for the same flag replaces the first.
+argument(_ctx: ptr, flag: string, value: string) {
+    f = string.replace_all(flag, "--", "")
+    full = "--${f}"
+    args = tc.req_cmd(_ctx)
+    string[] out = []
+    i = 0
+    replaced = false
+    while i < args.len {
+        if args[i] == full && i + 1 < args.len {
+            out.push(full)
+            out.push(value)
+            replaced = true
+            i = i + 2
+        } else {
+            out.push(args[i])
+            i = i + 1
+        }
+    }
+    if !replaced {
+        out.push(full)
+        out.push(value)
+    }
+    tc.cmd(_ctx, out)
+}
+
+username(_ctx: ptr, user: string) { argument(_ctx, "user", user) }
+password(_ctx: ptr, pass: string) { argument(_ctx, "pass", pass) }
+
+// Go's WithConfigFile, from text: the content becomes /etc/nats.conf and
+// `-config /etc/nats.conf` is added to the command. Changing the
+// connectivity (listen address or ports) can break the container setup.
+config_file(_ctx: ptr, content: string) {
+    tc.cmd_arg(_ctx, "-config")
+    tc.cmd_arg(_ctx, CONFIG_PATH)
+    tc.file_content(_ctx, content, CONFIG_PATH, 420)
+}
+
+// The same, from a file on the host.
+config_file_path(_ctx: ptr, host_path: string) {
+    tc.cmd_arg(_ctx, "-config")
+    tc.cmd_arg(_ctx, CONFIG_PATH)
+    tc.file(_ctx, host_path, CONFIG_PATH, 420)
+}
+
+builder run(image: string) with nats_request_new -> (*NATSContainer, string) {
+    r = _builder
+    if r == null { r = nats_request_new() }
+    user = cmd_value(r, "--user")
+    pass = cmd_value(r, "--pass")
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run nats: ${err}" }
+    n = heap.new(NATSContainer)
+    n.container = c
+    n.user = user
+    n.password = pass
+    if err != "" { return n, "run nats: ${err}" }
+    return n, ""
+}
+
+// "nats://host:port" (Go's ConnectionString).
+connection_string(n: *NATSContainer) -> (string, string) {
+    return tc.endpoint(n.container, CLIENT_PORT, "nats")
+}

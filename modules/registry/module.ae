@@ -1,0 +1,229 @@
+// Ported from testcontainers-go modules/registry/registry.go, modules/registry/options.go
+//
+// modules.registry: a Docker Registry (distribution) container.
+//
+//     import modules.registry
+//
+//     reg, err = registry.run("registry:2.8.3") {
+//         htpasswd_file("testdata/auth/htpasswd")   // or htpasswd("user:<bcrypt>")
+//     }
+//     defer tc.terminate(reg.container)
+//     addr, _ = registry.address(reg)         // "http://localhost:32771"
+//     host, _ = registry.host_address(reg)    // "localhost:32771", reg.registry_name
+//
+//     registry.tag_image(reg, "alpine:3", "${reg.registry_name}/alpine:3")
+//     err = registry.push_image(reg, "${reg.registry_name}/alpine:3", "", "")   // or user, password
+//     err = registry.image_exists(reg, "${reg.registry_name}/alpine:3", "", "")
+//
+// Ported: Run, Address, HostAddress, RegistryName, ImageExists, DeleteImage,
+// PushImage, PullImage, TagImage, WithData, WithHtpasswd, WithHtpasswdFile.
+// Differences from Go:
+//  - Go looks the credentials for an image up in the Docker config
+//    (DockerImageAuth); image_exists, delete_image and push_image take them
+//    as a user / password pair instead ("" for none; push_image then falls
+//    back to docker.registry_auth, which reads the same config file (and its
+//    credential helpers), and
+//    sends either as X-Registry-Auth), and pull_image uses
+//    docker.registry_auth.
+//  - htpasswd(credentials) writes the line with the core's file_content
+//    rather than a temp file (Go's os.CreateTemp).
+//  - pull_image has no Go-style platform matching of the registry's image:
+//    the engine's own default platform is used.
+//  - Not ported: SetDockerAuthConfig / DockerAuthConfig (they build
+//    DOCKER_AUTH_CONFIG for Go's dockercfg library; the core reads the
+//    Docker config file directly), the WSL local-address workaround in
+//    HostAddress, and the deprecated RunContainer.
+
+import std.string
+import std.encoding
+import std.http.client
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    RegistryContainer, run, address, host_address, image_exists, delete_image,
+    push_image, pull_image, tag_image, with_data, htpasswd, htpasswd_file,
+    PORT, DEFAULT_IMAGE, registry_request_new, registry_request_free
+)
+
+const PORT = "5000/tcp"
+const DEFAULT_IMAGE = "registry:2.8.3"
+const HTPASSWD_PATH = "/auth/htpasswd"
+const CONTAINER_DATA_PATH = "/data"
+const MANIFEST_TYPES = "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json"
+
+struct RegistryContainer {
+    container: *docker.Container
+    registry_name: string        // "host:port", without a scheme
+}
+
+// Go's moduleOpts: the port, deletion enabled (convenient for tests), and
+// ready when GET / answers within 10s.
+registry_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.env(r, "REGISTRY_STORAGE_DELETE_ENABLED", "true")
+    tc.wait_for(r, wait.for_http("/") { with_port(PORT); with_startup_timeout(10s) })
+    return r
+}
+
+registry_request_free(p: ptr) { tc.request_free(p) }
+
+// ---- options ----
+
+// Go's WithData: copy a host directory to /data and use it as the
+// registry's root directory (it must have the registry's own layout). As
+// in Go, a directory copy keeps the host directory's base name in the
+// parent of the path given, so the tree is at /data only when the host
+// directory is itself called "data" (as Go's testdata/data is).
+with_data(_ctx: ptr, data_path: string) {
+    tc.file(_ctx, data_path, CONTAINER_DATA_PATH, 0)
+    tc.env(_ctx, "REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY", CONTAINER_DATA_PATH)
+}
+
+// Go's WithHtpasswdFile: copy the file to /auth/htpasswd and require basic auth.
+htpasswd_file(_ctx: ptr, path: string) {
+    tc.file(_ctx, path, HTPASSWD_PATH, 420)
+    htpasswd_env(_ctx)
+}
+
+// Go's WithHtpasswd: the credentials ("user:<bcrypt hash>" lines) as text.
+htpasswd(_ctx: ptr, credentials: string) {
+    tc.file_content(_ctx, credentials, HTPASSWD_PATH, 420)
+    htpasswd_env(_ctx)
+}
+
+fn htpasswd_env(_ctx: ptr) {
+    tc.env(_ctx, "REGISTRY_AUTH", "htpasswd")
+    tc.env(_ctx, "REGISTRY_AUTH_HTPASSWD_REALM", "Registry")
+    tc.env(_ctx, "REGISTRY_AUTH_HTPASSWD_PATH", HTPASSWD_PATH)
+}
+
+builder run(image: string) with registry_request_new -> (*RegistryContainer, string) {
+    r = _builder
+    if r == null { r = registry_request_new() }
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run registry: ${err}" }
+    reg = heap.new(RegistryContainer)
+    reg.container = c
+    reg.registry_name = ""
+    if err != "" { return reg, "run registry: ${err}" }
+    hp, herr = host_address(reg)
+    if herr != "" { return reg, "address: ${herr}" }
+    reg.registry_name = hp
+    return reg, ""
+}
+
+// "host:port" of the registry (Go's HostAddress).
+host_address(reg: *RegistryContainer) -> (string, string) {
+    ep, err = tc.endpoint(reg.container, PORT, "")
+    if err != "" { return "", "mapped port: ${err}" }
+    return ep, ""
+}
+
+// "http://host:port" (Go's Address).
+address(reg: *RegistryContainer) -> (string, string) {
+    hp, err = host_address(reg)
+    if err != "" { return "", err }
+    return "http://${hp}", ""
+}
+
+// "alpine:3" or "host:5000/team/alpine:3" -> ("team/alpine", "3") with the
+// registry host dropped (Go's getEndpointWithAuth).
+fn repo_and_tag(ref: string) -> (string, string, string) {
+    registry_host, name, tag = docker.parse_image(ref)
+    repo = name
+    if string.starts_with(name, "${registry_host}/") == 1 {
+        repo = string.substring(name, string.length(registry_host) + 1, string.length(name))
+    }
+    return registry_host, repo, tag
+}
+
+fn basic(user: string, password: string) -> string {
+    return "Basic ${encoding.base64_encode_padded(string.bytes("${user}:${password}"))}"
+}
+
+// One request against the registry: (status, digest header, error).
+fn registry_call(reg: *RegistryContainer, method: string, path: string, user: string, password: string, accept: string) -> (int, string, string) {
+    base, aerr = address(reg)
+    if aerr != "" { return 0, "", aerr }
+    req = client.request(method, "${base}${path}")
+    client.set_timeout(req, 10s)
+    if string.length(user) > 0 || string.length(password) > 0 {
+        client.set_header(req, "Authorization", basic(user, password))
+    }
+    if string.length(accept) > 0 { client.set_header(req, "Accept", accept) }
+    if method == "DELETE" { client.set_header(req, "Content-Length", "0") }
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", "${method} ${path}: ${err}" }
+    st = client.response_status(r)
+    digest = client.response_header(r, "Docker-Content-Digest")
+    client.response_free(r)
+    return st, digest, ""
+}
+
+// Go's ImageExists: "" when the reference's manifest is in the registry
+// (HEAD /v2/<repo>/manifests/<tag> is 200 with a Docker-Content-Digest).
+// ref is like "localhost:32771/alpine:3". user / password: basic auth, "" for none.
+image_exists(reg: *RegistryContainer, ref: string, user: string, password: string) -> string {
+    _, repo, tag = repo_and_tag(ref)
+    st, digest, err = registry_call(reg, "HEAD", "/v2/${repo}/manifests/${tag}", user, password, MANIFEST_TYPES)
+    if err != "" { return err }
+    if st != 200 { return "image ${ref} not in the registry (status ${st})" }
+    if string.length(digest) == 0 { return "image ${ref}: no Docker-Content-Digest header" }
+    return ""
+}
+
+// Go's DeleteImage: HEAD for the digest, then DELETE the manifest by digest (202).
+delete_image(reg: *RegistryContainer, ref: string, user: string, password: string) -> string {
+    _, repo, tag = repo_and_tag(ref)
+    st, digest, err = registry_call(reg, "HEAD", "/v2/${repo}/manifests/${tag}", user, password, MANIFEST_TYPES)
+    if err != "" { return "failed to get image digest: ${err}" }
+    if st != 200 || string.length(digest) == 0 { return "failed to get image digest: status ${st}" }
+    dst, _, derr = registry_call(reg, "DELETE", "/v2/${repo}/manifests/${digest}", user, password, "")
+    if derr != "" { return derr }
+    if dst != 202 { return "delete ${ref}: status ${dst}" }
+    return ""
+}
+
+// Go's TagImage: tag a local image (the engine's) as ref.
+tag_image(reg: *RegistryContainer, image: string, ref: string) -> string {
+    cl, cerr = docker.client()
+    if cerr != "" { return "create docker client: ${cerr}" }
+    _, name, tag = docker.parse_image(ref)
+    st, body, err = docker.api(cl, "POST", "/images/${image}/tag?repo=${docker.query_escape(name)}&tag=${docker.query_escape(tag)}", "")
+    if err != "" { return "tag image ${image}: ${err}" }
+    return docker.api_check("tag image ${image}", st, body)
+}
+
+// Go's PushImage: push a local image (already tagged with the registry's
+// name, see tag_image) through the engine, then check the registry has it.
+// The push is done by the engine: it must be able to reach reg.registry_name.
+// user / password: the registry's credentials, sent as X-Registry-Auth; with
+// both "" the Docker config's entry for the registry is used, if any (Go's
+// DockerImageAuth).
+push_image(reg: *RegistryContainer, ref: string, user: string, password: string) -> string {
+    cl, cerr = docker.client()
+    if cerr != "" { return "create docker client: ${cerr}" }
+    registry_host, name, tag = docker.parse_image(ref)
+    auth = docker.encode_registry_auth(user, password, registry_host)
+    if string.length(auth) == 0 { auth = docker.registry_auth(registry_host) }
+    string[] headers = []
+    if string.length(auth) > 0 { headers.push("X-Registry-Auth: ${auth}") }
+    st, body, err = docker.api_headers(cl, "POST", "/images/${name}/push?tag=${docker.query_escape(tag)}&tlsVerify=false", "", headers)
+    if err != "" { return "push image ${ref}: ${err}" }
+    perr = docker.api_check("push image ${ref}", st, body)
+    if perr != "" { return perr }
+    // the push stream reports a failure as an "error" line with status 200
+    if string.contains(body, "\"error\"") == 1 { return "push image ${ref}: ${body}" }
+    return image_exists(reg, ref, user, password)
+}
+
+// Go's PullImage: pull ref from its own registry into the engine.
+pull_image(reg: *RegistryContainer, ref: string) -> string {
+    cl, cerr = docker.client()
+    if cerr != "" { return "create docker client: ${cerr}" }
+    return docker.pull_image(cl, ref, "")
+}

@@ -1,0 +1,87 @@
+// Ported from testcontainers-go modules/databend/databend.go
+//
+// modules.databend: a Databend container (HTTP handler on 8000, the
+// "databend://" DSN of the databend-go driver).
+//
+//     import modules.databend
+//
+//     d, err = databend.run("datafuselabs/databend:v1.2.615") {
+//         username("user")
+//         password("pw")
+//     }
+//     defer tc.terminate(d.container)
+//     dsn, _ = databend.connection_string(d, ["sslmode=disable"])
+//     // "databend://user:pw@localhost:32771/default?sslmode=disable"
+//
+// Not ported: the databend-go / database/sql client of Go's examples and the
+// panicking MustConnectionString (Aether has no Must*).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    DatabendContainer, run, connection_string, username, password,
+    PORT, DEFAULT_IMAGE, DEFAULT_USER, DEFAULT_PASSWORD, DEFAULT_DATABASE,
+    databend_request_new, databend_request_free
+)
+
+const PORT = "8000/tcp"
+const DEFAULT_IMAGE = "datafuselabs/databend:v1.2.615"
+const DEFAULT_USER = "databend"
+const DEFAULT_PASSWORD = "databend"
+const DEFAULT_DATABASE = "default"
+
+struct DatabendContainer {
+    container: *docker.Container
+    user: string
+    password: string
+    database: string
+}
+
+databend_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.env(r, "QUERY_DEFAULT_USER", DEFAULT_USER)
+    tc.env(r, "QUERY_DEFAULT_PASSWORD", DEFAULT_PASSWORD)
+    tc.wait_for(r, wait.for_listening_port(PORT))
+    return r
+}
+
+databend_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithUsername / WithPassword.
+username(_ctx: ptr, user: string) { tc.env(_ctx, "QUERY_DEFAULT_USER", user) }
+password(_ctx: ptr, pw: string) { tc.env(_ctx, "QUERY_DEFAULT_PASSWORD", pw) }
+
+builder run(image: string) with databend_request_new -> (*DatabendContainer, string) {
+    r = _builder
+    if r == null { r = databend_request_new() }
+    user = DEFAULT_USER
+    pw = DEFAULT_PASSWORD
+    if tc.req_has_env(r, "QUERY_DEFAULT_USER") { user = tc.req_env(r, "QUERY_DEFAULT_USER") }
+    if tc.req_has_env(r, "QUERY_DEFAULT_PASSWORD") { pw = tc.req_env(r, "QUERY_DEFAULT_PASSWORD") }
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run databend: ${err}" }
+    d = heap.new(DatabendContainer)
+    d.container = c
+    d.user = user
+    d.password = pw
+    d.database = DEFAULT_DATABASE
+    if err != "" { return d, "run databend: ${err}" }
+    if string.length(user) == 0 && string.length(pw) == 0 { return d, "empty password and user" }
+    return d, ""
+}
+
+// "databend://user:password@host:port/database?a&b" (args joined with &).
+connection_string(d: *DatabendContainer, args: string[]) -> (string, string) {
+    ep, err = tc.endpoint(d.container, PORT, "")
+    if err != "" { return "", "port endpoint: ${err}" }
+    extra = ""
+    for a in args {
+        if string.length(extra) == 0 { extra = "?${a}" } else { extra = "${extra}&${a}" }
+    }
+    if string.length(d.database) == 0 { return "", "database name is empty" }
+    return "databend://${d.user}:${d.password}@${ep}/${d.database}${extra}", ""
+}

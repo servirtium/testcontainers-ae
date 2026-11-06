@@ -1,0 +1,17 @@
+testcontainers-ae is a port of testcontainers-go
+(https://github.com/testcontainers/testcontainers-go, MIT, portions copyright
+(c) 2017-2019 Gianluca Arbezzano and the testcontainers-go contributors),
+ported from commit
+55f58feb2510720e08aab90be005128aa86ddcdf (main, 2026-11-04).
+
+sql/postgres/ is a port of jackc/pgx (https://github.com/jackc/pgx, MIT,
+copyright (c) 2013-2021 Jack Christensen), v5.9.2: pgproto3/, pgconn/ and
+stdlib/. sql/LICENSE carries pgx's license and sql/NOTICE lists what came
+from which file.
+
+sql/mysql/ is a port of go-sql-driver/mysql
+(https://github.com/go-sql-driver/mysql, Mozilla Public License 2.0,
+Copyright 2012 The Go-MySQL-Driver Authors), v1.9.3 (commit 62984ad). It
+stays under the MPL-2.0 (sql/mysql/LICENSE; the authors in
+sql/mysql/AUTHORS), as does tests/test_sql_mysql_unit.ae; sql/NOTICE lists
+what came from which file.

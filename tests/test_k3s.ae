@@ -1,0 +1,83 @@
+// Ported from testcontainers-go modules/k3s (k3s_test.go, k3s_example_test.go)
+//
+// STATUS: the live case is compile-checked only. It needs a privileged
+// container, which this ported-on rootless Podman machine was not asked to
+// run, so it runs only when TCAE_K3S=1 is set; it then starts K3s, reads the
+// kubeconfig through get_kube_config and GETs the API server's /version over
+// HTTPS. The kubeconfig rewrite is checked on every run, with no engine.
+
+import std.spec
+import std.string
+import std.os
+import std.http.client
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.k3s
+
+const IMAGE = "rancher/k3s:v1.27.1-k3s1"
+
+const SAMPLE = <<YAML
+apiVersion: v1
+clusters:
+- cluster:
+    certificate-authority-data: AAAA
+    server: https://127.0.0.1:6443
+  name: default
+kind: Config
+YAML
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "modules/k3s (no engine needed)") {
+        spec.it("rewrites the kubeconfig server") callback {
+            out, err = k3s.kube_config_with_server_url(SAMPLE, "https://localhost:40000")
+            spec.assert_ok(err, "rewritten")
+            spec.assert_contains(out, "    server: https://localhost:40000", "new server, indentation kept")
+            spec.assert_true(string.contains(out, "127.0.0.1") == 0, "old server gone")
+            spec.assert_contains(out, "certificate-authority-data: AAAA", "the rest is untouched")
+        }
+    }
+
+    if string.length(os.os_getenv("TCAE_K3S")) == 0 {
+        spec.describe(fw, "modules/k3s live (set TCAE_K3S=1: needs a privileged container)") {
+            spec.it("skipped") callback { spec.assert_true(true, "skipped: privileged container") }
+        }
+        return spec.run_summary(fw)
+    }
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/k3s") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("serves the API server /version with its kubeconfig (TestK3s)") callback {
+            c, err = k3s.run(IMAGE) {
+                with_manifest("modules/k3s/nginx-manifest.yaml")
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "k3s starts")
+            if err == "" {
+                cfg, cerr = k3s.get_kube_config(c)
+                spec.assert_ok(cerr, "kubeconfig")
+                spec.assert_contains(cfg, "server: https://localhost:", "server is the mapped port")
+                ep, _ = tc.endpoint(c, k3s.SECURE_PORT, "https")
+                req = client.request("GET", "${ep}/version")
+                client.set_timeout(req, 30s)
+                client.set_insecure(req, 1)
+                r, rerr = client.send_request(req)
+                client.request_free(req)
+                spec.assert_ok(rerr, "GET /version")
+                if rerr == "" {
+                    st = client.response_status(r)
+                    body = client.response_body(r)
+                    client.response_free(r)
+                    // anonymous /version is allowed by default (200); 401/403 still prove the API server answered
+                    spec.assert_true(st == 200 || st == 401 || st == 403, "API server answered: ${st}")
+                    if st == 200 { spec.assert_contains(body, "gitVersion", "version document") }
+                }
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

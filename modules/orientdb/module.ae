@@ -1,0 +1,73 @@
+// Ported from testcontainers-go modules/orientdb/orientdb.go
+//
+// modules.orientdb: an OrientDB container (binary port 2424, Studio/HTTP 2480).
+//
+//     import modules.orientdb
+//
+//     c, err = orientdb.run("orientdb:3.2") { root_password("secret") }
+//     defer tc.terminate(c)
+//     url, _ = orientdb.server_url(c)       // "remote:localhost:32771"
+//     studio, _ = orientdb.studio_url(c)    // "http://localhost:32772"
+//
+// Not ported: nothing of the Go module's API; its tests use the OrientDB Go
+// client (gremlin/odb), which Aether has no counterpart for, so the test
+// here talks to the HTTP port.
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, server_url, studio_url, root_password,
+    BINARY_PORT, HTTP_PORT, DEFAULT_ROOT_PASSWORD, DEFAULT_IMAGE,
+    orientdb_request_new, orientdb_request_free
+)
+
+const BINARY_PORT = "2424/tcp"
+const HTTP_PORT = "2480/tcp"
+const DEFAULT_ROOT_PASSWORD = "rootpwd"
+const DEFAULT_IMAGE = "orientdb:3.2"
+
+orientdb_request_new() -> ptr {
+    r = tc.request_new()
+    tc.env(r, "ORIENTDB_ROOT_PASSWORD", DEFAULT_ROOT_PASSWORD)
+    tc.expose(r, BINARY_PORT)
+    tc.expose(r, HTTP_PORT)
+    // The HTTP listener opens before the server installs the root user from
+    // ORIENTDB_ROOT_PASSWORD (about 10 ms later, then the plugins), so GET /
+    // answers 200 while /server still refuses the chosen password. The last
+    // line OrientDB logs once it is up is "OrientDB Studio available at",
+    // after the root user exists and the plugins are installed.
+    tc.wait_for(r, wait.for_all([
+        wait.for_log("OrientDB Studio available at"),
+        wait.for_http("/") { with_port(HTTP_PORT); with_status(200) }
+    ]))
+    return r
+}
+
+orientdb_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithRootPassword.
+root_password(_ctx: ptr, password: string) { tc.env(_ctx, "ORIENTDB_ROOT_PASSWORD", password) }
+
+builder run(image: string) with orientdb_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = orientdb_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run orientdb: ${err}" }
+    return c, ""
+}
+
+// "remote:host:port" of the binary port (Go's ServerURL).
+server_url(c: *docker.Container) -> (string, string) {
+    ep, err = tc.endpoint(c, BINARY_PORT, "")
+    if err != "" { return "", "orientdb server url: ${err}" }
+    return "remote:${ep}", ""
+}
+
+// "http://host:port" of Studio (Go's StudioURL).
+studio_url(c: *docker.Container) -> (string, string) {
+    ep, err = tc.endpoint(c, HTTP_PORT, "http")
+    if err != "" { return "", "orientdb studio url: ${err}" }
+    return ep, ""
+}

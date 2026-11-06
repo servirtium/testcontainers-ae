@@ -1,0 +1,170 @@
+// Ported from testcontainers-go modules/nats/nats_test.go and the
+// credentials example in examples_test.go
+//
+// A real NATS server, spoken to over std.tcp at the mapped port: the INFO
+// line the server sends on connect, CONNECT / PING / PONG, SUB / PUB / MSG,
+// and the authorization the options configure. (Go's tests use the nats.go
+// client library; the client protocol is text, so it is spoken by hand.)
+
+import std.spec
+import std.string
+import std.tcp
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.nats
+
+const IMAGE = "nats:2.9"
+
+// Read until buf contains want (or the tries run out).
+fn read_until(sock: ptr, want: string) -> (string, string) {
+    buf = ""
+    tries = 0
+    while tries < 100 {
+        chunk, rerr = tcp.read(sock, 4096)
+        if rerr != "" && rerr != "timeout" { return buf, rerr }
+        buf = string.concat(buf, chunk)
+        if string.contains(buf, want) == 1 { return buf, "" }
+        tries = tries + 1
+    }
+    return buf, "never saw ${want} in: ${buf}"
+}
+
+fn dial(n: *nats.NATSContainer) -> ptr {
+    h, _ = tc.host(n.container)
+    port, perr = tc.mapped_port(n.container, nats.CLIENT_PORT)
+    spec.assert_ok(perr, "mapped port")
+    sock, cerr = tcp.connect(h, port)
+    spec.assert_ok(cerr, "connect to ${h}:${port}")
+    if cerr != "" { return null }
+    return sock
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/nats") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("serves INFO, PING/PONG and pub/sub (TestNATS)") callback {
+            n, err = nats.run(IMAGE)
+            if n != null { testing.cleanup_container(n.container) }
+            spec.assert_ok(err, "nats starts")
+            if err == "" {
+                url, uerr = nats.connection_string(n)
+                spec.assert_ok(uerr, "connection string")
+                spec.assert_true(string.starts_with(url, "nats://") == 1, "a nats:// URL: ${url}")
+                sock = dial(n)
+                if sock != null {
+                    info, e1 = read_until(sock, "\r\n")
+                    spec.assert_ok(e1, "INFO line")
+                    spec.assert_true(string.starts_with(info, "INFO {") == 1, "the server greets with INFO: ${info}")
+                    spec.assert_contains(info, "\"jetstream\":true", "JetStream is on (-js)")
+                    spec.assert_contains(info, "\"version\":\"2.9", "nats-server 2.9")
+                    spec.assert_true(string.contains(info, "auth_required") == 0, "no auth by default")
+                    _, w1 = tcp.write(sock, "CONNECT {\"verbose\":false}\r\nPING\r\n")
+                    spec.assert_ok(w1, "write")
+                    pong, e2 = read_until(sock, "PONG")
+                    spec.assert_ok(e2, "PONG")
+                    spec.assert_contains(pong, "PONG", "PING answers PONG")
+                    _, w2 = tcp.write(sock, "SUB foo 1\r\nPUB foo 5\r\nhello\r\nPING\r\n")
+                    spec.assert_ok(w2, "write sub/pub")
+                    msg, e3 = read_until(sock, "PONG")
+                    spec.assert_ok(e3, "message")
+                    spec.assert_contains(msg, "MSG foo 1 5\r\nhello\r\n", "the published message comes back to the subscriber")
+                    tcp.tcp_close(sock)
+                }
+            }
+        }
+
+        spec.it("username and password require authorization (WithUsername, WithPassword)") callback {
+            n, err = nats.run(IMAGE) {
+                username("foo")
+                password("bar")
+            }
+            if n != null { testing.cleanup_container(n.container) }
+            spec.assert_ok(err, "nats starts")
+            if err == "" {
+                spec.assert_str_eq(n.user, "foo", "the container carries the user")
+                spec.assert_str_eq(n.password, "bar", "and the password")
+                sock = dial(n)
+                if sock != null {
+                    info, e1 = read_until(sock, "\r\n")
+                    spec.assert_ok(e1, "INFO line")
+                    spec.assert_contains(info, "\"auth_required\":true", "INFO says auth is required")
+                    _, w1 = tcp.write(sock, "CONNECT {\"verbose\":true,\"user\":\"foo\",\"pass\":\"wrong\"}\r\nPING\r\n")
+                    spec.assert_ok(w1, "write")
+                    bad, e2 = read_until(sock, "Authorization Violation")
+                    spec.assert_ok(e2, "a wrong password is refused")
+                    spec.assert_contains(bad, "-ERR 'Authorization Violation'", "the refusal")
+                    tcp.tcp_close(sock)
+                }
+                sock2 = dial(n)
+                if sock2 != null {
+                    _, _ = read_until(sock2, "\r\n")
+                    _, w2 = tcp.write(sock2, "CONNECT {\"verbose\":true,\"user\":\"foo\",\"pass\":\"bar\"}\r\nPING\r\n")
+                    spec.assert_ok(w2, "write")
+                    good, e3 = read_until(sock2, "PONG")
+                    spec.assert_ok(e3, "the right credentials get through")
+                    spec.assert_contains(good, "+OK\r\nPONG", "+OK then PONG")
+                    tcp.tcp_close(sock2)
+                }
+            }
+        }
+
+        spec.it("a later argument for the same flag replaces the earlier (WithArgument)") callback {
+            n, err = nats.run(IMAGE) {
+                username("first")
+                username("second")
+                argument("--name", "tcae-server")
+            }
+            if n != null { testing.cleanup_container(n.container) }
+            spec.assert_ok(err, "nats starts")
+            if err == "" {
+                spec.assert_str_eq(n.user, "second", "the last user wins")
+                sock = dial(n)
+                if sock != null {
+                    info, e1 = read_until(sock, "\r\n")
+                    spec.assert_ok(e1, "INFO line")
+                    spec.assert_contains(info, "\"server_name\":\"tcae-server\"", "the argument reached nats-server")
+                    tcp.tcp_close(sock)
+                }
+            }
+        }
+
+        spec.it("starts from a config file (TestNATSWithConfigFile)") callback {
+            conf = "listen: 0.0.0.0:4222\nauthorization {\n    token: \"s3cr3t\"\n}\n"
+            n, err = nats.run(IMAGE) {
+                config_file(conf)
+            }
+            if n != null { testing.cleanup_container(n.container) }
+            spec.assert_ok(err, "nats starts")
+            if err == "" {
+                sock = dial(n)
+                if sock != null {
+                    _, _ = read_until(sock, "\r\n")
+                    _, w1 = tcp.write(sock, "CONNECT {\"verbose\":false,\"auth_token\":\"secret\"}\r\nPING\r\n")
+                    spec.assert_ok(w1, "write")
+                    bad, e2 = read_until(sock, "Authorization Violation")
+                    spec.assert_ok(e2, "a wrong token is refused")
+                    spec.assert_contains(bad, "-ERR 'Authorization Violation'", "the refusal")
+                    tcp.tcp_close(sock)
+                }
+                sock2 = dial(n)
+                if sock2 != null {
+                    _, _ = read_until(sock2, "\r\n")
+                    _, w2 = tcp.write(sock2, "CONNECT {\"verbose\":false,\"auth_token\":\"s3cr3t\"}\r\nPING\r\n")
+                    spec.assert_ok(w2, "write")
+                    _, e3 = read_until(sock2, "PONG")
+                    spec.assert_ok(e3, "the right token gets through")
+                    tcp.tcp_close(sock2)
+                }
+                logs, lerr = tc.logs(n.container)
+                spec.assert_ok(lerr, "logs")
+                spec.assert_contains(logs, "Using configuration file: /etc/nats.conf", "the config file is the one in the log")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

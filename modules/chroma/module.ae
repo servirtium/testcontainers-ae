@@ -1,0 +1,47 @@
+// Ported from testcontainers-go modules/chroma/chroma.go
+//
+// modules.chroma: a Chroma vector database (REST on 8000).
+//
+//     import modules.chroma
+//
+//     c, err = chroma.run("chromadb/chroma:1.4.0")
+//     defer tc.terminate(c)
+//     url, _ = chroma.rest_endpoint(c)    // "http://localhost:32771"
+//
+// Ready when 8000 listens and GET /api/v2/heartbeat answers 200.
+// Not ported: Go's RunContainer (deprecated); the Go test's chroma-go client
+// (the test here calls the REST API instead).
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(run, rest_endpoint, PORT, DEFAULT_IMAGE, chroma_request_new, chroma_request_free)
+
+const PORT = "8000/tcp"
+const DEFAULT_IMAGE = "chromadb/chroma:1.4.0"
+
+chroma_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(PORT),
+        wait.for_http("/api/v2/heartbeat") { with_status(200) }
+    ]))
+    return r
+}
+
+chroma_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with chroma_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = chroma_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run chroma: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" of the REST API (Go's RESTEndpoint).
+rest_endpoint(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "http")
+}

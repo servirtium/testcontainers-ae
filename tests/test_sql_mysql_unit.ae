@@ -1,0 +1,952 @@
+// Ported from go-sql-driver/mysql v1.9.3 packets_test.go (TestReadPacket*,
+// TestRegression801), utils_test.go (TestLengthEncodedInteger,
+// TestFormatBinaryDateTime, TestFormatBinaryTime, TestEscape*),
+// dsn_test.go (testDSNs, TestDSNParserInvalid, TestDSNReformat,
+// TestDSNServerPubKey, TestDSNWithCustomTLS, TestDSNTLSConfig,
+// TestDSNUnsafeCollation, TestParamsAreSorted, TestNormalizeTLSConfig) and
+// auth_test.go (the scrambles, TestAuthFast*, TestAuthSwitch*,
+// TestOldAuthSwitch), with their vectors and captured bytes.
+// Copyright 2013-2018 The Go-MySQL-Driver Authors. All rights reserved.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at http://mozilla.org/MPL/2.0/.
+//
+// Modifications: ported to Aether by the testcontainers-ae contributors.
+//
+// The MySQL driver's pure parts, no engine: packet framing (a payload over
+// 0xffffff bytes split and joined), length-encoded integers and strings,
+// DSN parsing, the native / SHA-256 / old scrambles against Go's vectors,
+// the authentication exchanges over a mock connection, ERR/OK/EOF and
+// handshake decoding, binary rows with their NULL bitmap, and the RSA-OAEP
+// (SHA-1) password encryption decrypted again with the test key in
+// tests/fixtures/mysqlrsa.
+
+import std.spec
+import std.string
+import std.bytes
+import std.fs
+import std.cryptography.rsa
+import std.cryptography.pem
+import std.cryptography.sha1
+import sql
+import sql.mysql as mysqldrv
+import sql.mysql.mysqlproto
+import sql.mysql.mysqlconn
+
+const TEST_PUB_KEY = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAol0Z8G8U+25Btxk/g/fm\nUAW/wEKjQCTjkibDE4B+qkuWeiumg6miIRhtilU6m9BFmLQSy1ltYQuu4k17A4tQ\nrIPpOQYZges/qsDFkZh3wyK5jL5WEFVdOasf6wsfszExnPmcZS4axxoYJfiuilrN\nhnwinBAqfi3S0sw5MpSI4Zl1AbOrHG4zDI62Gti2PKiMGyYDZTS9xPrBLbN95Kby\nFFclQLEzA9RJcS1nHFsWtRgHjGPhhjCQxEm9NQ1nePFhCfBfApyfH1VM2VCOQum6\nCi9bMuHWjTjckC84mzF99kOxOWVU7mwS6gnJqBzpuz8t3zq8/iQ2y7QrmZV+jTJP\nWQIDAQAB\n-----END PUBLIC KEY-----\n"
+
+fn bs(xs: int[]) -> byte[] {
+    byte[] out = []
+    for x in xs { out.push((x & 255) as byte) }
+    return out
+}
+
+fn sb(s: string) -> byte[] {
+    byte[] out = []
+    for c in string.bytes(s) { out.push(c as byte) }
+    return out
+}
+
+fn cat(a: byte[], b: byte[]) -> byte[] {
+    byte[] out = []
+    for x in a { out.push(x) }
+    for x in b { out.push(x) }
+    return out
+}
+
+fn show(b: byte[]) -> string {
+    out = ""
+    i = 0
+    for x in b {
+        if i > 0 { out = "${out}," }
+        out = "${out}${x as int}"
+        i = i + 1
+    }
+    return out
+}
+
+fn hex(b: byte[]) -> string {
+    digits = "0123456789abcdef"
+    out = ""
+    for x in b {
+        v = x as int
+        out = "${out}${string.substring(digits, v >> 4, (v >> 4) + 1)}${string.substring(digits, v & 15, (v & 15) + 1)}"
+    }
+    return out
+}
+
+fn sub(b: byte[], from: int, to: int) -> byte[] { return mysqlproto.copy_range(b, from, to) }
+
+fn has_prefix(b: byte[], p: byte[]) -> bool {
+    if b.len < p.len { return false }
+    i = 0
+    while i < p.len {
+        if b[i] != p[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// A packet with the test public key: length (1 + key), sequence, 0x01, key.
+fn pub_key_packet(seq: int) -> byte[] {
+    k = sb(TEST_PUB_KEY)
+    n = 1 + k.len
+    return cat(bs([n & 255, (n >> 8) & 255, 0, seq, 1]), k)
+}
+
+fn mock(seq: int, user: string, pw: string) -> *mysqlconn.MyConn {
+    cfg = mysqlconn.new_config()
+    cfg.user = user
+    cfg.passwd = pw
+    return mysqlconn.new_mock_conn(cfg, seq)
+}
+
+// The auth response the handshake response packet carries: its length byte
+// and the bytes after it (Go's authRespStart).
+fn written_auth_resp(c: *mysqlconn.MyConn, user: string) -> (int, byte[]) {
+    w = mysqlconn.mock_written(c)
+    start = 4 + 4 + 4 + 1 + 23 + string.length(user) + 1
+    n = w[start] as int
+    return n, sub(w, start + 1, start + 1 + n)
+}
+
+// A summary of a Config to compare with Go's expected structs.
+fn summary(cfg: *mysqlconn.Config) -> string {
+    s = "User=${cfg.user} Passwd=${cfg.passwd} Net=${cfg.net} Addr=${cfg.addr} DBName=${cfg.db_name}"
+    if cfg.param_keys.len > 0 {
+        ps = ""
+        i = 0
+        while i < cfg.param_keys.len {
+            if i > 0 { ps = "${ps}," }
+            ps = "${ps}${cfg.param_keys[i]}:${cfg.param_vals[i]}"
+            i = i + 1
+        }
+        s = "${s} Params=${ps}"
+    }
+    if cfg.charsets.len > 0 {
+        cs = ""
+        for c in cfg.charsets {
+            if string.length(cs) > 0 { cs = "${cs}," }
+            cs = "${cs}${c}"
+        }
+        s = "${s} charsets=${cs}"
+    }
+    if string.length(cfg.collation) > 0 { s = "${s} Collation=${cfg.collation}" }
+    if cfg.loc != "UTC" { s = "${s} Loc=${cfg.loc}" }
+    if string.length(cfg.tls_config) > 0 { s = "${s} TLSConfig=${cfg.tls_config}" }
+    if cfg.timeout > 0 { s = "${s} Timeout=${mysqlconn.duration_string(cfg.timeout)}" }
+    if cfg.read_timeout > 0 { s = "${s} ReadTimeout=${mysqlconn.duration_string(cfg.read_timeout)}" }
+    if cfg.write_timeout > 0 { s = "${s} WriteTimeout=${mysqlconn.duration_string(cfg.write_timeout)}" }
+    if cfg.time_truncate > 0 { s = "${s} timeTruncate=${mysqlconn.duration_string(cfg.time_truncate)}" }
+    if cfg.allow_all_files { s = "${s} AllowAllFiles" }
+    if cfg.allow_cleartext_passwords { s = "${s} AllowCleartextPasswords" }
+    if cfg.allow_fallback_to_plaintext { s = "${s} AllowFallbackToPlaintext" }
+    if !cfg.allow_native_passwords { s = "${s} !AllowNativePasswords" }
+    if cfg.allow_old_passwords { s = "${s} AllowOldPasswords" }
+    if !cfg.check_conn_liveness { s = "${s} !CheckConnLiveness" }
+    if cfg.client_found_rows { s = "${s} ClientFoundRows" }
+    if cfg.columns_with_alias { s = "${s} ColumnsWithAlias" }
+    if cfg.multi_statements { s = "${s} MultiStatements" }
+    if cfg.parse_time { s = "${s} ParseTime" }
+    if cfg.reject_read_only { s = "${s} RejectReadOnly" }
+    if cfg.max_allowed_packet != mysqlproto.DEFAULT_MAX_ALLOWED_PACKET { s = "${s} MaxAllowedPacket=${cfg.max_allowed_packet}" }
+    if string.length(cfg.connection_attributes) > 0 { s = "${s} ConnectionAttributes=${cfg.connection_attributes}" }
+    return s
+}
+
+// testDSNs: the DSN and Go's expected Config, as summary() prints it.
+fn dsn_cases() -> string[] {
+    lit = [
+        "username:password@protocol(address)/dbname?param=value",
+        "User=username Passwd=password Net=protocol Addr=address DBName=dbname Params=param:value",
+        "username:password@protocol(address)/dbname?param=value&columnsWithAlias=true",
+        "User=username Passwd=password Net=protocol Addr=address DBName=dbname Params=param:value ColumnsWithAlias",
+        "username:password@protocol(address)/dbname?param=value&columnsWithAlias=true&multiStatements=true",
+        "User=username Passwd=password Net=protocol Addr=address DBName=dbname Params=param:value ColumnsWithAlias MultiStatements",
+        "user@unix(/path/to/socket)/dbname?charset=utf8",
+        "User=user Passwd= Net=unix Addr=/path/to/socket DBName=dbname charsets=utf8",
+        "user:password@tcp(localhost:5555)/dbname?charset=utf8&tls=true",
+        "User=user Passwd=password Net=tcp Addr=localhost:5555 DBName=dbname charsets=utf8 TLSConfig=true",
+        "user:password@tcp(localhost:5555)/dbname?charset=utf8mb4,utf8&tls=skip-verify",
+        "User=user Passwd=password Net=tcp Addr=localhost:5555 DBName=dbname charsets=utf8mb4,utf8 TLSConfig=skip-verify",
+        "user:password@/dbname?loc=UTC&timeout=30s&readTimeout=1s&writeTimeout=1s&allowAllFiles=1&clientFoundRows=true&allowOldPasswords=TRUE&collation=utf8mb4_unicode_ci&maxAllowedPacket=16777216&tls=false&allowCleartextPasswords=true&parseTime=true&rejectReadOnly=true",
+        "User=user Passwd=password Net=tcp Addr=127.0.0.1:3306 DBName=dbname Collation=utf8mb4_unicode_ci TLSConfig=false Timeout=30s ReadTimeout=1s WriteTimeout=1s AllowAllFiles AllowCleartextPasswords AllowOldPasswords ClientFoundRows ParseTime RejectReadOnly MaxAllowedPacket=16777216",
+        "user:password@/dbname?allowNativePasswords=false&checkConnLiveness=false&maxAllowedPacket=0&allowFallbackToPlaintext=true",
+        "User=user Passwd=password Net=tcp Addr=127.0.0.1:3306 DBName=dbname AllowFallbackToPlaintext !AllowNativePasswords !CheckConnLiveness MaxAllowedPacket=0",
+        "user:p@ss(word)@tcp([de:ad:be:ef::ca:fe]:80)/dbname?loc=Local",
+        "User=user Passwd=p@ss(word) Net=tcp Addr=[de:ad:be:ef::ca:fe]:80 DBName=dbname Loc=Local",
+        "/dbname",
+        "User= Passwd= Net=tcp Addr=127.0.0.1:3306 DBName=dbname",
+        "/dbname%2Fwithslash",
+        "User= Passwd= Net=tcp Addr=127.0.0.1:3306 DBName=dbname/withslash",
+        "@/",
+        "User= Passwd= Net=tcp Addr=127.0.0.1:3306 DBName=",
+        "/",
+        "User= Passwd= Net=tcp Addr=127.0.0.1:3306 DBName=",
+        "",
+        "User= Passwd= Net=tcp Addr=127.0.0.1:3306 DBName=",
+        "user:p@/ssword@/",
+        "User=user Passwd=p@/ssword Net=tcp Addr=127.0.0.1:3306 DBName=",
+        "unix/?arg=%2Fsome%2Fpath.ext",
+        "User= Passwd= Net=unix Addr=/tmp/mysql.sock DBName= Params=arg:/some/path.ext",
+        "tcp(127.0.0.1)/dbname",
+        "User= Passwd= Net=tcp Addr=127.0.0.1:3306 DBName=dbname",
+        "tcp(de:ad:be:ef::ca:fe)/dbname",
+        "User= Passwd= Net=tcp Addr=[de:ad:be:ef::ca:fe]:3306 DBName=dbname",
+        "user:password@/dbname?loc=UTC&timeout=30s&parseTime=true&timeTruncate=1h",
+        "User=user Passwd=password Net=tcp Addr=127.0.0.1:3306 DBName=dbname Timeout=30s timeTruncate=1h0m0s ParseTime",
+        "foo:bar@tcp(192.168.1.50:3307)/baz?timeout=10s&connectionAttributes=program_name:MySQLGoDriver%2FTest,program_version:1.2.3",
+        "User=foo Passwd=bar Net=tcp Addr=192.168.1.50:3307 DBName=baz Timeout=10s ConnectionAttributes=program_name:MySQLGoDriver/Test,program_version:1.2.3"
+    ]
+    string[] out = []
+    for x in lit { out.push(x) }
+    return out
+}
+
+// TestLengthEncodedInteger's encodings.
+fn enc(i: int) -> byte[] {
+    if i == 0 { return bs([0]) }
+    if i == 1 { return bs([18]) }
+    if i == 2 { return bs([250]) }
+    if i == 3 { return bs([252, 0, 1]) }
+    if i == 4 { return bs([252, 52, 18]) }
+    if i == 5 { return bs([252, 255, 255]) }
+    if i == 6 { return bs([253, 0, 0, 1]) }
+    if i == 7 { return bs([253, 86, 52, 18]) }
+    if i == 8 { return bs([253, 255, 255, 255]) }
+    if i == 9 { return bs([254, 0, 0, 0, 1, 0, 0, 0, 0]) }
+    if i == 10 { return bs([254, 240, 222, 188, 154, 120, 86, 52, 18]) }
+    return bs([254, 255, 255, 255, 255, 255, 255, 255, 255])
+}
+
+// OAEP-SHA1 decoding (RFC 8017 7.1.2), for checking encrypt_password
+// with the private test key.
+fn mgf1(seed: byte[], n: int) -> byte[] {
+    byte[] out = []
+    c = 0
+    while out.len < n {
+        h = sha1.bytes(cat(seed, bs([0, 0, 0, c])))
+        for x in bytes.view(h) {
+            if out.len < n { out.push(x) }
+        }
+        bytes.free(h)
+        c = c + 1
+    }
+    return out
+}
+
+fn oaep_decode(em: byte[]) -> byte[] {
+    byte[] bad = []
+    if em.len < 42 || (em[0] as int) != 0 { return bad }
+    masked_seed = sub(em, 1, 21)
+    masked_db = sub(em, 21, em.len)
+    sm = mgf1(masked_db, 20)
+    byte[] seed = []
+    i = 0
+    while i < 20 {
+        seed.push(((masked_seed[i] as int) ^ (sm[i] as int)) as byte)
+        i = i + 1
+    }
+    dm = mgf1(seed, masked_db.len)
+    byte[] db = []
+    i = 0
+    while i < masked_db.len {
+        db.push(((masked_db[i] as int) ^ (dm[i] as int)) as byte)
+        i = i + 1
+    }
+    byte[] empty = []
+    lh = sha1.bytes(empty)
+    lhash = sub(bytes.view(lh), 0, 20)
+    bytes.free(lh)
+    if show(sub(db, 0, 20)) != show(lhash) { return bad }
+    j = 20
+    while j < db.len && (db[j] as int) == 0 { j = j + 1 }
+    if j >= db.len || (db[j] as int) != 1 { return bad }
+    return sub(db, j + 1, db.len)
+}
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "packets: framing (packets_test.go)") {
+        spec.it("reads a one-byte packet (TestReadPacketSingleByte)") callback {
+            c = mock(0, "", "")
+            mysqlconn.mock_feed(c, bs([1, 0, 0, 0, 255]))
+            p, err = mysqlconn.read_packet(c)
+            spec.assert_ok(err, "read")
+            spec.assert_str_eq(show(p), "255", "the payload")
+        }
+        spec.it("refuses a wrong sequence id and closes (TestReadPacketWrongSequenceID)") callback {
+            c = mock(1, "", "")
+            mysqlconn.mock_feed(c, bs([1, 0, 0, 0, 34]))
+            _, err = mysqlconn.read_packet(c)
+            spec.assert_str_eq(err, mysqlproto.ERR_PKT_SYNC, "client 1, server 0")
+            spec.assert_true(mysqlconn.is_closed(c), "the connection is not valid any more")
+            c2 = mock(0, "", "")
+            mysqlconn.mock_feed(c2, bs([1, 0, 0, 66, 34]))
+            _, err2 = mysqlconn.read_packet(c2)
+            spec.assert_str_eq(err2, mysqlproto.ERR_PKT_SYNC, "client 0, server 0x42")
+        }
+        spec.it("joins a payload split at 0xffffff bytes (TestReadPacketSplit)") callback {
+            max = mysqlproto.MAX_PACKET_SIZE
+            // case 1: exactly 0xffffff bytes, then an empty packet
+            d = make([]byte, max + 4 + 4)
+            d[0] = 255 as byte
+            d[1] = 255 as byte
+            d[2] = 255 as byte
+            d[4] = 17 as byte
+            d[max + 3] = 34 as byte
+            d[max + 4 + 3] = 1 as byte
+            c = mock(0, "", "")
+            mysqlconn.mock_feed(c, d)
+            p, err = mysqlconn.read_packet(c)
+            spec.assert_ok(err, "case 1 read")
+            spec.assert_eq(p.len, max, "case 1 length")
+            spec.assert_eq(p[0] as int, 17, "case 1 start")
+            spec.assert_eq(p[max - 1] as int, 34, "case 1 end")
+            // case 3: 0xffffff + 42 bytes
+            d3 = make([]byte, max + 4 + 4 + 42)
+            d3[0] = 255 as byte
+            d3[1] = 255 as byte
+            d3[2] = 255 as byte
+            d3[4] = 17 as byte
+            d3[max + 4] = 42 as byte
+            d3[max + 4 + 3] = 1 as byte
+            d3[max + 4 + 4 + 41] = 68 as byte
+            c3 = mock(0, "", "")
+            mysqlconn.mock_feed(c3, d3)
+            p3, err3 = mysqlconn.read_packet(c3)
+            spec.assert_ok(err3, "case 3 read")
+            spec.assert_eq(p3.len, max + 42, "case 3 length")
+            spec.assert_eq(p3[0] as int, 17, "case 3 start")
+            spec.assert_eq(p3[max + 41] as int, 68, "case 3 end")
+        }
+        spec.it("fails on an empty stand-alone packet, a closed connection, a missing body (TestReadPacketFail)") callback {
+            c = mock(0, "", "")
+            mysqlconn.mock_feed(c, bs([0, 0, 0, 0]))
+            _, err = mysqlconn.read_packet(c)
+            spec.assert_str_eq(err, mysqlproto.ERR_INVALID_CONN, "empty stand-alone packet")
+            c2 = mock(0, "", "")
+            mysqlconn.mock_close(c2)
+            _, err2 = mysqlconn.read_packet(c2)
+            spec.assert_str_eq(err2, mysqlproto.ERR_INVALID_CONN, "closed")
+            c3 = mock(0, "", "")
+            mysqlconn.mock_feed(c3, bs([5, 0, 0, 0, 1, 2]))
+            _, err3 = mysqlconn.read_packet(c3)
+            spec.assert_str_eq(err3, mysqlproto.ERR_INVALID_CONN, "body cut short")
+        }
+        spec.it("writes a payload over 0xffffff bytes as two packets, and an exact multiple with an empty third") callback {
+            max = mysqlproto.MAX_PACKET_SIZE
+            c = mock(0, "", "")
+            data = make([]byte, 4 + max + 10)
+            data[4] = 7 as byte
+            data[4 + max] = 9 as byte
+            spec.assert_ok(mysqlconn.write_packet(c, data), "write")
+            w = mysqlconn.mock_written(c)
+            spec.assert_eq(w.len, 4 + max + 4 + 10, "two headers and the payload")
+            spec.assert_str_eq(show(sub(w, 0, 5)), "255,255,255,0,7", "first header: 0xffffff, sequence 0")
+            spec.assert_str_eq(show(sub(w, 4 + max, 4 + max + 5)), "10,0,0,1,9", "second header: 10 bytes, sequence 1")
+            spec.assert_eq(mysqlconn.sequence_of(c), 2, "the sequence moved on twice")
+            c2 = mock(0, "", "")
+            exact = make([]byte, 4 + max)
+            spec.assert_ok(mysqlconn.write_packet(c2, exact), "write an exact 0xffffff")
+            w2 = mysqlconn.mock_written(c2)
+            spec.assert_eq(w2.len, 4 + max + 4, "the payload and an empty packet")
+            spec.assert_str_eq(show(sub(w2, 4 + max, 4 + max + 4)), "0,0,0,1", "the empty terminator, sequence 1")
+            // and read back
+            r = mock(0, "", "")
+            mysqlconn.mock_feed(r, w)
+            p, perr = mysqlconn.read_packet(r)
+            spec.assert_ok(perr, "read back")
+            spec.assert_eq(p.len, max + 10, "the whole payload")
+            spec.assert_eq(p[max] as int, 9, "the byte after the split")
+        }
+        spec.it("refuses a packet over max_allowed_packet") callback {
+            cfg = mysqlconn.new_config()
+            c = mysqlconn.new_mock_conn(cfg, 0)
+            c.max_allowed_packet = 10
+            spec.assert_str_eq(mysqlconn.write_packet(c, make([]byte, 4 + 11)), mysqlproto.ERR_PKT_TOO_LARGE, "ErrPktTooLarge")
+        }
+    }
+
+    spec.describe(fw, "length-encoded integers and strings (utils_test.go)") {
+        spec.it("reads and writes Go's table (TestLengthEncodedInteger)") callback {
+            let nums: long[] = [0, 18, 250, 256, 4660, 65535, 65536, 1193046, 16777215, 16777216, 1311768467463790320, -1]
+            i = 0
+            while i < nums.len {
+                e = enc(i)
+                n, is_null, used = mysqlproto.read_length_encoded_integer(e, 0)
+                spec.assert_false(is_null, "not NULL ${i}")
+                spec.assert_eq_long(n, nums[i], "the number ${i}")
+                spec.assert_eq(used, e.len, "the size ${i}")
+                w = mysqlproto.new_buf()
+                mysqlproto.append_length_encoded_integer(w, nums[i])
+                spec.assert_str_eq(show(mysqlproto.buf_bytes(w)), show(e), "the encoding ${i}")
+                i = i + 1
+            }
+            _, nul, used = mysqlproto.read_length_encoded_integer(bs([251]), 0)
+            spec.assert_true(nul, "0xfb is NULL")
+            spec.assert_eq(used, 1, "one byte")
+            spec.assert_eq(mysqlproto.uint64_to_string(-1) == "18446744073709551615", true, "uint64 max as text")
+        }
+        spec.it("round-trips length-encoded strings, short and 300 bytes, and finds a short one") callback {
+            long_s = ""
+            i = 0
+            while i < 300 {
+                long_s = "${long_s}x"
+                i = i + 1
+            }
+            for s in ["", "it's", long_s] {
+                w = mysqlproto.new_buf()
+                mysqlproto.append_length_encoded_string(w, s)
+                b = mysqlproto.buf_bytes(w)
+                got, is_null, n = mysqlproto.read_length_encoded_string(b, 0)
+                spec.assert_str_eq(got, s, "the string")
+                spec.assert_false(is_null, "not NULL")
+                spec.assert_eq(n, b.len, "all of it")
+            }
+            _, _, n = mysqlproto.read_length_encoded_string(bs([5, 97, 98]), 0)
+            spec.assert_eq(n, -1, "5 bytes promised, 2 there: io.EOF")
+            spec.assert_eq(mysqlproto.skip_length_encoded_string(bs([2, 97, 98, 99]), 0), 3, "skip")
+        }
+        spec.it("formats binary DATETIME and TIME (TestFormatBinaryDateTime, TestFormatBinaryTime)") callback {
+            raw = bs([186, 7, 12, 30, 15, 46, 23, 6, 18, 15, 0])   // 1978-12-30 15:46:23.987654
+            ex = ["0000-00-00", "0", "10", "0000-00-00 00:00:00", "0", "19", "1978-12-30", "4", "10",
+                  "1978-12-30 15:46:23", "7", "19", "1978-12-30 15:46:23.987654", "11", "26"]
+            k = 0
+            while k + 2 < ex.len {
+                inlen, _ = string.to_int(ex[k + 1])
+                outlen, _ = string.to_int(ex[k + 2])
+                v, err = mysqlproto.format_binary_datetime(sub(raw, 0, inlen), outlen)
+                spec.assert_ok(err, "format ${ex[k]}")
+                spec.assert_str_eq(v, ex[k], "datetime in ${inlen} out ${outlen}")
+                k = k + 3
+            }
+            byte[] empty = []
+            t0, _ = mysqlproto.format_binary_time(empty, 8)
+            spec.assert_str_eq(t0, "00:00:00", "zero")
+            t1, _ = mysqlproto.format_binary_time(empty, 15)
+            spec.assert_str_eq(t1, "00:00:00.000000", "zero with micros")
+            t2, _ = mysqlproto.format_binary_time(bs([1, 0, 0, 0, 0, 12, 34, 56]), 8)
+            spec.assert_str_eq(t2, "-12:34:56", "negative")
+            t3, _ = mysqlproto.format_binary_time(bs([0, 1, 0, 0, 0, 0, 34, 56]), 8)
+            spec.assert_str_eq(t3, "24:34:56", "a day")
+            t4, _ = mysqlproto.format_binary_time(bs([0, 255, 255, 255, 255, 23, 34, 56]), 8)
+            spec.assert_str_eq(t4, "103079215103:34:56", "100+ hours")
+            t5, _ = mysqlproto.format_binary_time(bs([0, 0, 0, 0, 0, 12, 34, 56, 99, 0, 0, 0]), 15)
+            spec.assert_str_eq(t5, "12:34:56.000099", "micros")
+            t6, _ = mysqlproto.format_binary_time(bs([0, 0, 0, 0, 0, 12, 34, 56, 99, 0, 0, 0]), 11)
+            spec.assert_str_eq(t6, "12:34:56.00", "two digits")
+        }
+        spec.it("escapes for interpolateParams (TestEscapeBackslash, TestEscapeQuotes)") callback {
+            spec.assert_str_eq(mysqlproto.escape_backslash("foo\x00"), "foo\\0", "NUL")
+            spec.assert_str_eq(mysqlproto.escape_backslash("foo\nbar"), "foo\\nbar", "newline")
+            spec.assert_str_eq(mysqlproto.escape_backslash("foo'bar\"baz\\"), "foo\\'bar\\\"baz\\\\", "quotes and backslash")
+            spec.assert_str_eq(mysqlproto.escape_backslash("foo\x1a\r"), "foo\\Z\\r", "^Z and CR")
+            spec.assert_str_eq(mysqlproto.escape_quotes("foo''bar"), "foo''''bar", "quotes doubled")
+            q, err = mysqlproto.interpolate_params("SELECT ?, ?, ?, ?, ?", [sql.int64(-3), sql.text("it's"), sql.null_value(), sql.boolean(true), sql.float64(1.5)], false, 1000)
+            spec.assert_ok(err, "interpolate")
+            spec.assert_str_eq(q, "SELECT -3, 'it\\'s', NULL, 1, 1.5", "the literals")
+            _, serr = mysqlproto.interpolate_params("SELECT ?", [sql.int64(1), sql.int64(2)], false, 1000)
+            spec.assert_str_eq(serr, mysqlproto.ERR_SKIP, "count mismatch: driver.ErrSkip")
+        }
+        spec.it("formats floats as strconv's shortest 'g'") callback {
+            spec.assert_str_eq(mysqlproto.format_float(3.14, false), "3.14", "float64")
+            spec.assert_str_eq(mysqlproto.format_float(0.1, false), "0.1", "0.1")
+            spec.assert_str_eq(mysqlproto.format_float(1234567.0, false), "1.234567e+06", "%e from 1e6")
+            spec.assert_str_eq(mysqlproto.format_float(0.00001, false), "1e-05", "%e below 1e-4")
+            spec.assert_str_eq(mysqlproto.format_float(-2.5, false), "-2.5", "negative")
+            spec.assert_str_eq(mysqlproto.format_float(mysqlproto.float32_from_bits(1036831949), true), "0.1", "float32 0.1")
+            spec.assert_str_eq(mysqlproto.format_float(mysqlproto.float32_from_bits(1078530011), true), "3.1415927", "float32 pi")
+        }
+    }
+
+    spec.describe(fw, "DSN (dsn_test.go)") {
+        spec.it("parses every testDSNs case to Go's Config (TestDSNParser)") callback {
+            cases = dsn_cases()
+            i = 0
+            while i + 1 < cases.len {
+                cfg, err = mysqlconn.parse_dsn(cases[i])
+                spec.assert_ok(err, cases[i])
+                if err == "" { spec.assert_str_eq(summary(cfg), cases[i + 1], cases[i]) }
+                i = i + 2
+            }
+        }
+        spec.it("formats each case back to a DSN that parses the same (TestDSNReformat)") callback {
+            cases = dsn_cases()
+            i = 0
+            while i + 1 < cases.len {
+                cfg1, _ = mysqlconn.parse_dsn(cases[i])
+                dsn2 = mysqlconn.format_dsn(cfg1)
+                cfg2, err = mysqlconn.parse_dsn(dsn2)
+                spec.assert_ok(err, "reparse ${dsn2}")
+                if err == "" {
+                    spec.assert_str_eq(summary(cfg2), summary(cfg1), dsn2)
+                    spec.assert_str_eq(mysqlconn.format_dsn(cfg2), dsn2, "stable")
+                }
+                i = i + 2
+            }
+        }
+        spec.it("refuses Go's invalid DSNs (TestDSNParserInvalid, TestDSNUnsafeCollation)") callback {
+            for d in ["@net(addr/", "@tcp(/", "tcp(/", "(/", "net(addr)//", "User:pass@tcp(1.2.3.4:3306)",
+                      "net()/", "user:pass@tcp(127.0.0.1:3306)/db/name",
+                      "user:password@/dbname?allowFallbackToPlaintext=PREFERRED",
+                      "user:password@/dbname?connectionAttributes=attr1:/unescaped/value%"] {
+                _, err = mysqlconn.parse_dsn(d)
+                spec.assert_true(err != "", "invalid: ${d}")
+            }
+            _, cerr = mysqlconn.parse_dsn("/dbname?collation=gbk_chinese_ci&interpolateParams=true")
+            spec.assert_str_eq(cerr, "invalid DSN: interpolateParams can not be used with unsafe collations", "unsafe collation")
+        }
+        spec.it("sorts the other params when formatting (TestParamsAreSorted)") callback {
+            cfg = mysqlconn.new_config()
+            cfg.db_name = "dbname"
+            cfg.interpolate_params = true
+            cfg.param_keys.push("quux")
+            cfg.param_vals.push("loo")
+            cfg.param_keys.push("foobar")
+            cfg.param_vals.push("baz")
+            spec.assert_str_eq(mysqlconn.format_dsn(cfg), "/dbname?interpolateParams=true&foobar=baz&quux=loo", "sorted")
+        }
+        spec.it("takes the server public key by name (TestDSNServerPubKey)") callback {
+            spec.assert_ok(mysqlconn.register_server_pub_key("testKey", TEST_PUB_KEY), "register")
+            cfg, err = mysqlconn.parse_dsn("User:password@tcp(localhost:5555)/dbname?serverPubKey=testKey")
+            spec.assert_ok(err, "parse")
+            spec.assert_str_eq(cfg.server_pub_key, "testKey", "the name")
+            spec.assert_true(cfg.pub_key != null, "the key")
+            spec.assert_eq(rsa.modulus_bytes(cfg.pub_key), 256, "a 2048-bit key")
+            _, err2 = mysqlconn.parse_dsn("User:password@tcp(localhost:5555)/dbname?serverPubKey=invalid_name")
+            spec.assert_str_eq(err2, "invalid value / unknown server pub key name: invalid_name", "unknown name")
+            mysqlconn.register_server_pub_key("&%!:", TEST_PUB_KEY)
+            cfg3, err3 = mysqlconn.parse_dsn("User:password@tcp(localhost:5555)/dbname?serverPubKey=%26%25%21%3A")
+            spec.assert_ok(err3, "query-escaped name (TestDSNServerPubKeyQueryEscape)")
+            spec.assert_true(cfg3.pub_key != null, "found")
+            mysqlconn.deregister_server_pub_key("testKey")
+            mysqlconn.deregister_server_pub_key("&%!:")
+        }
+        spec.it("resolves tls= names (TestDSNWithCustomTLS, TestDSNTLSConfig, TestNormalizeTLSConfig)") callback {
+            _, err = mysqlconn.parse_dsn("User:password@tcp(localhost:5555)/dbname?tls=invalid_tls")
+            spec.assert_str_eq(err, "invalid value / unknown config name: invalid_tls", "missing custom TLS")
+            mysqlconn.register_tls_config("utils_test", "", "foohost")
+            cfg, err2 = mysqlconn.parse_dsn("User:password@tcp(localhost:5555)/dbname?tls=utils_test")
+            spec.assert_ok(err2, "custom")
+            spec.assert_str_eq(cfg.tls.server_name, "foohost", "its server name")
+            mysqlconn.register_tls_config("utils_test", "", "")
+            cfg2, _ = mysqlconn.parse_dsn("User:password@tcp(localhost:5555)/dbname?tls=utils_test")
+            spec.assert_str_eq(cfg2.tls.server_name, "localhost", "the host when it has none")
+            mysqlconn.deregister_tls_config("utils_test")
+            mysqlconn.register_tls_config("&%!:", "", "foohost")
+            cfg3, err3 = mysqlconn.parse_dsn("User:password@tcp(localhost:5555)/dbname?tls=%26%25%21%3A")
+            spec.assert_ok(err3, "query-escaped name")
+            spec.assert_str_eq(cfg3.tls.server_name, "foohost", "found")
+            mysqlconn.deregister_tls_config("&%!:")
+            spec.assert_str_eq(mysqlconn.register_tls_config("skip-verify", "", ""), "key 'skip-verify' is reserved", "reserved")
+            t1, _ = mysqlconn.parse_dsn("tcp(example.com:1234)/?tls=true")
+            spec.assert_str_eq(t1.tls.server_name, "example.com", "host with port")
+            t2, _ = mysqlconn.parse_dsn("tcp(example.com)/?tls=true")
+            spec.assert_str_eq(t2.tls.server_name, "example.com", "host without port")
+            n1, _ = mysqlconn.parse_dsn("tcp(myserver:3306)/?tls=false")
+            spec.assert_true(n1.tls == null, "false: none")
+            s1, _ = mysqlconn.parse_dsn("tcp(myserver:3306)/?tls=skip-verify")
+            spec.assert_true(s1.tls.insecure_skip_verify, "skip-verify: InsecureSkipVerify")
+            spec.assert_str_eq(s1.tls.server_name, "", "no server name")
+            p1, _ = mysqlconn.parse_dsn("tcp(myserver:3306)/?tls=preferred")
+            spec.assert_true(p1.tls.preferred && p1.allow_fallback_to_plaintext, "preferred: fallback allowed")
+        }
+        spec.it("refuses tls=skip-verify at connect, before dialling") callback {
+            _, err = mysqlconn.connect("u:p@tcp(127.0.0.1:1)/db?tls=skip-verify")
+            spec.assert_contains(err, "tls=skip-verify asks for TLS without certificate verification", "refused, not weakened")
+        }
+        spec.it("parses durations and prints them as Go does") callback {
+            d, err = mysqlconn.parse_duration("1.5s")
+            spec.assert_ok(err, "1.5s")
+            spec.assert_eq_long(d, 1500000000, "ns")
+            spec.assert_str_eq(mysqlconn.duration_string(d), "1.5s", "back")
+            d2, _ = mysqlconn.parse_duration("1h30m")
+            spec.assert_str_eq(mysqlconn.duration_string(d2), "1h30m0s", "1h30m0s")
+            d3, _ = mysqlconn.parse_duration("250ms")
+            spec.assert_str_eq(mysqlconn.duration_string(d3), "250ms", "250ms")
+            _, e4 = mysqlconn.parse_duration("10")
+            spec.assert_contains(e4, "missing unit", "no unit")
+        }
+    }
+
+    spec.describe(fw, "packets: ERR, OK, EOF, handshake, columns, rows") {
+        spec.it("decodes an ERR packet with its SQLSTATE; sql.sqlstate and error_number find them") callback {
+            data = cat(bs([255, 21, 4, 35]), sb("28000Access denied for user 'u'@'h' (using password: YES)"))
+            e = mysqlproto.parse_error_packet(data)
+            spec.assert_eq(e.number, 1045, "ER_ACCESS_DENIED_ERROR")
+            spec.assert_str_eq(e.sqlstate, "28000", "the SQLSTATE")
+            s = mysqlproto.mysql_error_string(e)
+            spec.assert_str_eq(s, "Error 1045 (28000): Access denied for user 'u'@'h' (using password: YES)", "Go's MySQLError.Error()")
+            spec.assert_str_eq(sql.sqlstate(s), "28000", "sql.sqlstate")
+            spec.assert_eq(mysqldrv.error_number(s), 1045, "error_number")
+            e2 = mysqlproto.parse_error_packet(cat(bs([255, 16, 4]), sb("Too many connections")))
+            spec.assert_str_eq(mysqlproto.mysql_error_string(e2), "Error 1040: Too many connections", "no SQLSTATE marker")
+            spec.assert_str_eq(sql.sqlstate("Error 1040: Too many connections"), "", "none")
+            spec.assert_str_eq(sql.sqlstate("ERROR: x (SQLSTATE 42P01)"), "42P01", "Postgres' form still")
+        }
+        spec.it("decodes an OK packet: affected rows, insert id, status") callback {
+            ok, err = mysqlproto.parse_ok_packet(bs([0, 1, 252, 0, 1, 2, 0, 0, 0]))
+            spec.assert_ok(err, "decode")
+            spec.assert_eq_long(ok.affected_rows, 1, "affected rows")
+            spec.assert_eq_long(ok.insert_id, 256, "insert id (length-encoded)")
+            spec.assert_eq(ok.status, mysqlproto.STATUS_IN_AUTOCOMMIT, "autocommit")
+            spec.assert_true(mysqlproto.is_eof_packet(bs([254, 0, 0, 2, 0])), "a 4.1 EOF")
+            spec.assert_true(mysqlproto.is_eof_packet(bs([254])), "an old EOF")
+            spec.assert_false(mysqlproto.is_eof_packet(bs([254, 1, 2, 3, 4, 5, 6, 7, 8])), "a row that starts 0xfe")
+        }
+        spec.it("parses a captured handshake whose plugin name has no NUL (TestRegression801)") callback {
+            c = mock(42, "", "")
+            mysqlconn.mock_feed(c, bs([72, 0, 0, 42, 10, 53, 46, 53, 46, 56, 0, 165, 0, 0, 0,
+                60, 70, 63, 58, 68, 104, 34, 97, 0, 223, 247, 33, 2, 0, 15, 128, 21, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 98, 120, 114, 47, 85, 75, 109, 99, 51, 77,
+                50, 64, 0, 109, 121, 115, 113, 108, 95, 110, 97, 116, 105, 118, 101, 95,
+                112, 97, 115, 115, 119, 111, 114, 100]))
+            auth_data, plugin, err = mysqlconn.read_handshake_packet(c)
+            spec.assert_ok(err, "parse")
+            spec.assert_str_eq(plugin, "mysql_native_password", "the plugin")
+            spec.assert_str_eq(show(auth_data), "60,70,63,58,68,104,34,97,98,120,114,47,85,75,109,99,51,77,50,64", "the 20-byte scramble")
+            spec.assert_str_eq(mysqlconn.server_version(c), "5.5.8", "the server version")
+            spec.assert_true((mysqlconn.server_flags(c) & mysqlproto.CLIENT_PROTOCOL41) != 0, "protocol 41")
+        }
+        spec.it("refuses TLS when the server has none, unless allowFallbackToPlaintext") callback {
+            hs = bs([72, 0, 0, 0, 10, 53, 46, 53, 46, 56, 0, 165, 0, 0, 0,
+                60, 70, 63, 58, 68, 104, 34, 97, 0, 223, 247, 33, 2, 0, 15, 128, 21, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 98, 120, 114, 47, 85, 75, 109, 99, 51, 77,
+                50, 64, 0, 109, 121, 115, 113, 108, 95, 110, 97, 116, 105, 118, 101, 95,
+                112, 97, 115, 115, 119, 111, 114, 100])
+            cfg, _ = mysqlconn.parse_dsn("u:p@tcp(h:1)/db?tls=true")
+            c = mysqlconn.new_mock_conn(cfg, 0)
+            mysqlconn.mock_feed(c, hs)
+            _, _, err = mysqlconn.read_handshake_packet(c)
+            spec.assert_str_eq(err, mysqlproto.ERR_NO_TLS, "ErrNoTLS (flags 0xf7df: no CLIENT_SSL)")
+            cfg2, _ = mysqlconn.parse_dsn("u:p@tcp(h:1)/db?tls=preferred")
+            c2 = mysqlconn.new_mock_conn(cfg2, 0)
+            mysqlconn.mock_feed(c2, hs)
+            _, _, err2 = mysqlconn.read_handshake_packet(c2)
+            spec.assert_ok(err2, "preferred falls back to plain text")
+        }
+        spec.it("decodes a column definition and Go's type names") callback {
+            w = mysqlproto.new_buf()
+            mysqlproto.append_length_encoded_string(w, "def")
+            mysqlproto.append_length_encoded_string(w, "app")
+            mysqlproto.append_length_encoded_string(w, "t")
+            mysqlproto.append_length_encoded_string(w, "t")
+            mysqlproto.append_length_encoded_string(w, "id")
+            mysqlproto.append_length_encoded_string(w, "id")
+            mysqlproto.put_u8(w, 12)
+            mysqlproto.put_u16(w, 63)
+            mysqlproto.put_u32(w, 20)
+            mysqlproto.put_u8(w, mysqlproto.FIELD_TYPE_LONGLONG)
+            mysqlproto.put_u16(w, mysqlproto.FLAG_NOT_NULL | mysqlproto.FLAG_UNSIGNED)
+            mysqlproto.put_u8(w, 0)
+            mysqlproto.put_u16(w, 0)
+            f, err = mysqlproto.parse_column(mysqlproto.buf_bytes(w), true)
+            spec.assert_ok(err, "decode")
+            spec.assert_str_eq(f.name, "id", "name")
+            spec.assert_str_eq(f.table_name, "t", "table (columnsWithAlias)")
+            spec.assert_eq(f.field_type, mysqlproto.FIELD_TYPE_LONGLONG, "type")
+            spec.assert_str_eq(mysqlproto.type_database_name(f), "UNSIGNED BIGINT", "DatabaseTypeName")
+            f.field_type = mysqlproto.FIELD_TYPE_BLOB
+            spec.assert_str_eq(mysqlproto.type_database_name(f), "BLOB", "binary charset: BLOB")
+            f.charset = 45
+            spec.assert_str_eq(mysqlproto.type_database_name(f), "TEXT", "a text charset: TEXT")
+        }
+        spec.it("decodes text and binary rows, the binary NULL bitmap offset by 2") callback {
+            row = mysqlproto.new_row()
+            spec.assert_ok(mysqlproto.decode_text_row(cat(bs([1, 55, 251, 2]), sb("hi")), 3, row), "text row")
+            spec.assert_str_eq(row.values[0], "7", "text")
+            spec.assert_true(row.nulls[1], "0xfb NULL")
+            spec.assert_str_eq(row.values[2], "hi", "string")
+            let fields: mysqlproto.Field[] = []
+            types = [mysqlproto.FIELD_TYPE_TINY, mysqlproto.FIELD_TYPE_LONG, mysqlproto.FIELD_TYPE_LONGLONG,
+                     mysqlproto.FIELD_TYPE_DOUBLE, mysqlproto.FIELD_TYPE_VAR_STRING, mysqlproto.FIELD_TYPE_BLOB,
+                     mysqlproto.FIELD_TYPE_DATETIME, mysqlproto.FIELD_TYPE_NEWDECIMAL, mysqlproto.FIELD_TYPE_FLOAT]
+            for t in types {
+                fields.push(mysqlproto.Field { table_name: "", name: "c", length: 0, flags: 0, field_type: t, decimals: 0, charset: 63 })
+            }
+            // NULL bitmap over 9 columns + 2: column 4 (bit 6 of byte 0) is NULL
+            w = mysqlproto.new_buf()
+            mysqlproto.put_u8(w, 0)
+            mysqlproto.put_u8(w, 64)
+            mysqlproto.put_u8(w, 0)
+            mysqlproto.put_u8(w, 255)                              // TINY -1
+            mysqlproto.put_u32(w, 4294967294)                      // LONG -2
+            mysqlproto.put_u64(w, 9000000000)                      // LONGLONG
+            mysqlproto.put_u64(w, 4614253070214989087)             // DOUBLE 3.14
+            mysqlproto.append_length_encoded_string(w, "\x00\x01\xff")  // BLOB bytes
+            mysqlproto.put_raw(w, bs([7, 232, 7, 1, 2, 3, 4, 5]))  // DATETIME 2024-01-02 03:04:05
+            mysqlproto.append_length_encoded_string(w, "12.50")    // DECIMAL as text
+            mysqlproto.put_u32(w, 1075838976)                      // FLOAT 2.5
+            r2 = mysqlproto.new_row()
+            spec.assert_ok(mysqlproto.decode_binary_row(mysqlproto.buf_bytes(w), fields, r2), "binary row")
+            spec.assert_str_eq(r2.values[0], "-1", "TINY signed")
+            spec.assert_str_eq(r2.values[1], "-2", "LONG signed")
+            spec.assert_str_eq(r2.values[2], "9000000000", "LONGLONG")
+            spec.assert_str_eq(r2.values[3], "3.14", "DOUBLE shortest")
+            spec.assert_true(r2.nulls[4], "the NULL bitmap's column")
+            spec.assert_str_eq(show(sb(r2.values[5])), "0,1,255", "BLOB bytes")
+            spec.assert_str_eq(r2.values[6], "2024-01-02 03:04:05", "DATETIME as text")
+            spec.assert_str_eq(r2.values[7], "12.50", "DECIMAL as text")
+            spec.assert_str_eq(r2.values[8], "2.5", "FLOAT")
+        }
+        spec.it("builds COM_STMT_EXECUTE with the NULL bitmap and types (writeExecutePacket)") callback {
+            bool[] ld = []
+            body, err = mysqlproto.execute_packet(1, [sql.int64(1), sql.null_value(), sql.text("ab"), sql.boolean(true)], ld)
+            spec.assert_ok(err, "build")
+            spec.assert_str_eq(show(body), "23,1,0,0,0,0,1,0,0,0,2,1,8,0,6,0,254,0,1,0,1,0,0,0,0,0,0,0,2,97,98,1", "command, id, flags, iterations, bitmap, bound, types, values")
+        }
+    }
+
+    spec.describe(fw, "auth: scrambles (auth_test.go)") {
+        spec.it("mysql_old_password (TestScrambleOldPass)") callback {
+            sc = bs([9, 8, 7, 6, 5, 4, 3, 2])
+            spec.assert_str_eq(hex(mysqlproto.scramble_old_password(sc, " pass")), "47575c5a435b4251", "' pass'")
+            spec.assert_str_eq(hex(mysqlproto.scramble_old_password(sc, "pass ")), "47575c5a435b4251", "'pass '")
+            spec.assert_str_eq(hex(mysqlproto.scramble_old_password(sc, "123\t456")), "575c47505b5b5559", "tab")
+            spec.assert_str_eq(hex(mysqlproto.scramble_old_password(sc, "C0mpl!ca ted#PASS123")), "5d5d554849584a45", "long")
+        }
+        spec.it("caching_sha2_password's SHA-256 scramble (TestScrambleSHA256Pass)") callback {
+            sc = bs([10, 47, 74, 111, 75, 73, 34, 48, 88, 76, 114, 74, 37, 13, 3, 80, 82, 2, 23, 21])
+            spec.assert_str_eq(hex(mysqlproto.scramble_sha256_password(sc, "secret")), "f490e76f66d9d86665ce54d98c78d0acfe2fb0b08b423da807144873d30b312c", "secret")
+            spec.assert_str_eq(hex(mysqlproto.scramble_sha256_password(sc, "secret2")), "abc3934a012cf342e876071c8ee202de51785b430258a7a0138bc79c4d800bc6", "secret2")
+        }
+        spec.it("mysql_native_password's SHA-1 scramble (TestAuthFastNativePassword's vector)") callback {
+            sc = bs([70, 114, 92, 94, 1, 38, 11, 116, 63, 114, 23, 101, 126, 103, 26, 95, 81, 17, 24, 21])
+            spec.assert_str_eq(show(mysqlproto.scramble_password(sc, "secret")), "53,177,140,159,251,189,127,53,109,252,172,50,211,192,240,164,26,48,207,45", "secret")
+            spec.assert_eq(mysqlproto.scramble_password(sc, "").len, 0, "empty password: nothing")
+        }
+        spec.it("RSA-OAEP (SHA-1) encrypts (password + NUL) XOR scramble, and the private key gets it back") callback {
+            pub_pem, _ = fs.read("tests/fixtures/mysqlrsa/public.pem")
+            priv_pem, _ = fs.read("tests/fixtures/mysqlrsa/private.pem")
+            pub, perr = mysqlproto.parse_pkix_public_key(pub_pem)
+            spec.assert_ok(perr, "parse PUBLIC KEY")
+            seed = bs([6, 81, 96, 114, 14, 42, 50, 30, 76, 47, 1, 95, 126, 81, 62, 94, 83, 80, 52, 85])
+            enc, eerr = mysqlproto.encrypt_password("secret", seed, pub)
+            spec.assert_ok(eerr, "encrypt")
+            spec.assert_eq(enc.len, 256, "a 2048-bit block")
+            enc2, _ = mysqlproto.encrypt_password("secret", seed, pub)
+            spec.assert_true(show(enc) != show(enc2), "a fresh OAEP seed each time")
+            der, _, derr = pem.parse(priv_pem)
+            spec.assert_ok(derr, "parse RSA PRIVATE KEY")
+            key, kerr = rsa.key_from_pkcs1_der(der)
+            spec.assert_ok(kerr, "load the private key")
+            cb = bytes.from_slice(enc)
+            m = rsa.raw_decrypt(key, cb)
+            plain = oaep_decode(sub(bytes.view(m), 0, 256))
+            spec.assert_eq(plain.len, 7, "secret + NUL")
+            byte[] got = []
+            i = 0
+            while i < plain.len {
+                got.push(((plain[i] as int) ^ (seed[i % seed.len] as int)) as byte)
+                i = i + 1
+            }
+            spec.assert_str_eq(show(got), show(cat(sb("secret"), bs([0]))), "the password and its NUL")
+            em, _ = mysqlproto.oaep_sha1_pad(sb("x"), bs([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]), 128)
+            spec.assert_str_eq(show(oaep_decode(em)), "120", "pad and decode agree")
+            k2, k2err = mysqlproto.parse_pkix_public_key(TEST_PUB_KEY)
+            spec.assert_ok(k2err, "Go's testPubKey parses")
+            spec.assert_eq(rsa.modulus_bytes(k2), 256, "2048 bits")
+        }
+    }
+
+    spec.describe(fw, "auth: the exchanges over a mock connection (auth_test.go)") {
+        spec.it("caching_sha2_password, fast auth success (TestAuthFastCachingSHA256PasswordCached)") callback {
+            c = mock(1, "root", "secret")
+            ad = bs([90, 105, 74, 126, 30, 48, 37, 56, 3, 23, 115, 127, 69, 22, 41, 84, 32, 123, 43, 118])
+            resp, err = mysqlconn.auth(c, ad, "caching_sha2_password")
+            spec.assert_ok(err, "auth")
+            spec.assert_ok(mysqlconn.write_handshake_response_packet(c, resp, "caching_sha2_password"), "write")
+            n, got = written_auth_resp(c, "root")
+            spec.assert_eq(n, 32, "32 bytes")
+            spec.assert_str_eq(show(got), "102,32,5,35,143,161,140,241,171,232,56,139,43,14,107,196,249,170,147,60,220,204,120,178,214,15,184,150,26,61,57,235", "Go's bytes")
+            mysqlconn.mock_clear_written(c)
+            mysqlconn.mock_feed(c, bs([2, 0, 0, 2, 1, 3, 7, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0]))
+            spec.assert_ok(mysqlconn.handle_auth_result(c, ad, "caching_sha2_password"), "fast auth success, then OK")
+        }
+        spec.it("caching_sha2_password, empty password (TestAuthFastCachingSHA256PasswordEmpty)") callback {
+            c = mock(1, "root", "")
+            ad = bs([90, 105, 74, 126, 30, 48, 37, 56, 3, 23, 115, 127, 69, 22, 41, 84, 32, 123, 43, 118])
+            resp, _ = mysqlconn.auth(c, ad, "caching_sha2_password")
+            mysqlconn.write_handshake_response_packet(c, resp, "caching_sha2_password")
+            n, _ = written_auth_resp(c, "root")
+            spec.assert_eq(n, 0, "no auth response")
+            mysqlconn.mock_feed(c, bs([7, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0]))
+            spec.assert_ok(mysqlconn.handle_auth_result(c, ad, "caching_sha2_password"), "OK")
+        }
+        spec.it("caching_sha2_password, full auth with the server's RSA key (TestAuthFastCachingSHA256PasswordFullRSA)") callback {
+            c = mock(1, "root", "secret")
+            ad = bs([6, 81, 96, 114, 14, 42, 50, 30, 76, 47, 1, 95, 126, 81, 62, 94, 83, 80, 52, 85])
+            resp, _ = mysqlconn.auth(c, ad, "caching_sha2_password")
+            mysqlconn.write_handshake_response_packet(c, resp, "caching_sha2_password")
+            _, got = written_auth_resp(c, "root")
+            spec.assert_str_eq(show(got), "171,201,138,146,89,159,11,170,0,67,165,49,175,94,218,68,177,109,110,86,34,33,44,190,67,240,70,110,40,139,124,41", "Go's bytes")
+            mysqlconn.mock_clear_written(c)
+            mysqlconn.mock_feed(c, bs([2, 0, 0, 2, 1, 4]))
+            mysqlconn.mock_queue(c, pub_key_packet(4))
+            mysqlconn.mock_queue(c, bs([7, 0, 0, 6, 0, 0, 0, 2, 0, 0, 0]))
+            spec.assert_ok(mysqlconn.handle_auth_result(c, ad, "caching_sha2_password"), "full auth")
+            w = mysqlconn.mock_written(c)
+            spec.assert_true(has_prefix(w, bs([1, 0, 0, 3, 2, 0, 1, 0, 5])), "public key request, then 256 bytes with sequence 5")
+            spec.assert_eq(w.len, 5 + 4 + 256, "the encrypted password")
+        }
+        spec.it("caching_sha2_password, full auth with a registered key (TestAuthFastCachingSHA256PasswordFullRSAWithKey)") callback {
+            mysqlconn.register_server_pub_key("k", TEST_PUB_KEY)
+            cfg, _ = mysqlconn.parse_dsn("root:secret@tcp(h:1)/?serverPubKey=k")
+            c = mysqlconn.new_mock_conn(cfg, 1)
+            ad = bs([6, 81, 96, 114, 14, 42, 50, 30, 76, 47, 1, 95, 126, 81, 62, 94, 83, 80, 52, 85])
+            resp, _ = mysqlconn.auth(c, ad, "caching_sha2_password")
+            mysqlconn.write_handshake_response_packet(c, resp, "caching_sha2_password")
+            mysqlconn.mock_clear_written(c)
+            mysqlconn.mock_feed(c, bs([2, 0, 0, 2, 1, 4]))
+            mysqlconn.mock_queue(c, bs([7, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0]))
+            spec.assert_ok(mysqlconn.handle_auth_result(c, ad, "caching_sha2_password"), "full auth")
+            spec.assert_true(has_prefix(mysqlconn.mock_written(c), bs([0, 1, 0, 3])), "256 bytes straight away, sequence 3")
+            mysqlconn.deregister_server_pub_key("k")
+        }
+        spec.it("caching_sha2_password, full auth over TLS sends the password (TestAuthFastCachingSHA256PasswordFullSecure)") callback {
+            c = mock(1, "root", "secret")
+            ad = bs([6, 81, 96, 114, 14, 42, 50, 30, 76, 47, 1, 95, 126, 81, 62, 94, 83, 80, 52, 85])
+            resp, _ = mysqlconn.auth(c, ad, "caching_sha2_password")
+            mysqlconn.write_handshake_response_packet(c, resp, "caching_sha2_password")
+            mysqlconn.mock_pretend_tls(c)
+            mysqlconn.mock_clear_written(c)
+            mysqlconn.mock_feed(c, bs([2, 0, 0, 2, 1, 4]))
+            mysqlconn.mock_queue(c, bs([7, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0]))
+            spec.assert_ok(mysqlconn.handle_auth_result(c, ad, "caching_sha2_password"), "full auth")
+            spec.assert_str_eq(show(mysqlconn.mock_written(c)), "7,0,0,3,115,101,99,114,101,116,0", "secret and NUL")
+        }
+        spec.it("mysql_clear_password needs allowCleartextPasswords (TestAuthFastCleartextPassword*)") callback {
+            c = mock(1, "root", "secret")
+            ad = bs([70, 114, 92, 94, 1, 38, 11, 116, 63, 114, 23, 101, 126, 103, 26, 95, 81, 17, 24, 21])
+            _, err = mysqlconn.auth(c, ad, "mysql_clear_password")
+            spec.assert_str_eq(err, mysqlproto.ERR_CLEARTEXT_PASSWORD, "not allowed")
+            c.cfg.allow_cleartext_passwords = true
+            resp, err2 = mysqlconn.auth(c, ad, "mysql_clear_password")
+            spec.assert_ok(err2, "allowed")
+            mysqlconn.write_handshake_response_packet(c, resp, "mysql_clear_password")
+            n, got = written_auth_resp(c, "root")
+            spec.assert_eq(n, 7, "7 bytes")
+            spec.assert_str_eq(show(got), "115,101,99,114,101,116,0", "secret and NUL")
+            mysqlconn.mock_feed(c, bs([7, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0]))
+            spec.assert_ok(mysqlconn.handle_auth_result(c, ad, "mysql_clear_password"), "OK")
+        }
+        spec.it("mysql_native_password (TestAuthFastNativePassword, NotAllowed)") callback {
+            c = mock(1, "root", "secret")
+            ad = bs([70, 114, 92, 94, 1, 38, 11, 116, 63, 114, 23, 101, 126, 103, 26, 95, 81, 17, 24, 21])
+            resp, _ = mysqlconn.auth(c, ad, "mysql_native_password")
+            mysqlconn.write_handshake_response_packet(c, resp, "mysql_native_password")
+            n, got = written_auth_resp(c, "root")
+            spec.assert_eq(n, 20, "20 bytes")
+            spec.assert_str_eq(show(got), "53,177,140,159,251,189,127,53,109,252,172,50,211,192,240,164,26,48,207,45", "Go's bytes")
+            mysqlconn.mock_feed(c, bs([7, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0]))
+            spec.assert_ok(mysqlconn.handle_auth_result(c, ad, "mysql_native_password"), "OK")
+            c2 = mock(1, "root", "secret")
+            c2.cfg.allow_native_passwords = false
+            _, err = mysqlconn.auth(c2, ad, "mysql_native_password")
+            spec.assert_str_eq(err, mysqlproto.ERR_NATIVE_PASSWORD, "not allowed")
+        }
+        spec.it("sha256_password asks for the key, then sends RSA (TestAuthFastSHA256PasswordRSA)") callback {
+            c = mock(1, "root", "secret")
+            ad = bs([6, 81, 96, 114, 14, 42, 50, 30, 76, 47, 1, 95, 126, 81, 62, 94, 83, 80, 52, 85])
+            resp, _ = mysqlconn.auth(c, ad, "sha256_password")
+            spec.assert_str_eq(show(resp), "1", "request the public key")
+            mysqlconn.write_handshake_response_packet(c, resp, "sha256_password")
+            mysqlconn.mock_clear_written(c)
+            mysqlconn.mock_feed(c, pub_key_packet(2))
+            mysqlconn.mock_queue(c, bs([7, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0]))
+            spec.assert_ok(mysqlconn.handle_auth_result(c, ad, "sha256_password"), "OK")
+            spec.assert_true(has_prefix(mysqlconn.mock_written(c), bs([0, 1, 0, 3])), "256 bytes, sequence 3")
+        }
+        spec.it("an auth switch to caching_sha2_password (TestAuthSwitchCachingSHA256PasswordCached)") callback {
+            c = mock(2, "", "secret")
+            mysqlconn.mock_feed(c, bs([44, 0, 0, 2, 254, 99, 97, 99, 104, 105, 110, 103, 95,
+                115, 104, 97, 50, 95, 112, 97, 115, 115, 119, 111, 114, 100, 0, 101,
+                11, 26, 18, 94, 97, 22, 72, 2, 46, 70, 106, 29, 55, 45, 94, 76, 90, 84,
+                50, 0]))
+            mysqlconn.mock_queue(c, bs([7, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0]))
+            ad = bs([123, 87, 15, 84, 20, 58, 37, 121, 91, 117, 51, 24, 19, 47, 43, 9, 41, 112, 67, 110])
+            spec.assert_ok(mysqlconn.handle_auth_result(c, ad, "mysql_native_password"), "switched and OK")
+            spec.assert_str_eq(show(mysqlconn.mock_written(c)), "32,0,0,3,219,72,64,97,56,197,167,203,64,236,168,80,223,56,103,217,196,176,124,60,253,41,195,10,205,190,177,206,63,118,211,69", "the SHA-256 scramble of the new data")
+        }
+        spec.it("an auth switch, then full auth with the fetched key (TestAuthSwitchCachingSHA256PasswordFullRSA)") callback {
+            c = mock(2, "", "secret")
+            mysqlconn.mock_feed(c, bs([44, 0, 0, 2, 254, 99, 97, 99, 104, 105, 110, 103, 95,
+                115, 104, 97, 50, 95, 112, 97, 115, 115, 119, 111, 114, 100, 0, 101,
+                11, 26, 18, 94, 97, 22, 72, 2, 46, 70, 106, 29, 55, 45, 94, 76, 90, 84,
+                50, 0]))
+            mysqlconn.mock_queue(c, bs([2, 0, 0, 4, 1, 4]))
+            mysqlconn.mock_queue(c, pub_key_packet(6))
+            mysqlconn.mock_queue(c, bs([7, 0, 0, 8, 0, 0, 0, 2, 0, 0, 0]))
+            ad = bs([123, 87, 15, 84, 20, 58, 37, 121, 91, 117, 51, 24, 19, 47, 43, 9, 41, 112, 67, 110])
+            spec.assert_ok(mysqlconn.handle_auth_result(c, ad, "mysql_native_password"), "full auth")
+            want = bs([32, 0, 0, 3, 219, 72, 64, 97, 56, 197, 167, 203, 64, 236, 168, 80, 223,
+                56, 103, 217, 196, 176, 124, 60, 253, 41, 195, 10, 205, 190, 177, 206, 63,
+                118, 211, 69, 1, 0, 0, 5, 2, 0, 1, 0, 7])
+            spec.assert_true(has_prefix(mysqlconn.mock_written(c), want), "hash, key request, 256 encrypted bytes")
+        }
+        spec.it("an auth switch to mysql_native_password (TestAuthSwitchNativePassword)") callback {
+            c = mock(2, "", "secret")
+            mysqlconn.mock_feed(c, bs([44, 0, 0, 2, 254, 109, 121, 115, 113, 108, 95, 110, 97,
+                116, 105, 118, 101, 95, 112, 97, 115, 115, 119, 111, 114, 100, 0, 96,
+                71, 63, 8, 1, 58, 75, 12, 69, 95, 66, 60, 117, 31, 48, 31, 89, 39, 55,
+                31, 0]))
+            mysqlconn.mock_queue(c, bs([7, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0]))
+            ad = bs([96, 71, 63, 8, 1, 58, 75, 12, 69, 95, 66, 60, 117, 31, 48, 31, 89, 39, 55, 31])
+            spec.assert_ok(mysqlconn.handle_auth_result(c, ad, "caching_sha2_password"), "OK")
+            spec.assert_str_eq(show(mysqlconn.mock_written(c)), "20,0,0,3,202,41,195,164,34,226,49,103,21,211,167,199,227,116,8,48,57,71,149,146", "Go's bytes")
+        }
+        spec.it("auth switches to mysql_old_password, new and old form (TestAuthSwitchOldPassword, TestOldAuthSwitch)") callback {
+            ad = bs([95, 84, 103, 43, 61, 49, 123, 61, 91, 50, 40, 113, 35, 84, 96, 101, 92, 123, 121, 107])
+            c = mock(2, "", "secret")
+            c.cfg.allow_old_passwords = true
+            mysqlconn.mock_feed(c, bs([41, 0, 0, 2, 254, 109, 121, 115, 113, 108, 95, 111, 108,
+                100, 95, 112, 97, 115, 115, 119, 111, 114, 100, 0, 95, 84, 103, 43, 61,
+                49, 123, 61, 91, 50, 40, 113, 35, 84, 96, 101, 92, 123, 121, 107, 0]))
+            mysqlconn.mock_queue(c, bs([8, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 0]))
+            spec.assert_ok(mysqlconn.handle_auth_result(c, ad, "mysql_native_password"), "OK")
+            spec.assert_str_eq(show(mysqlconn.mock_written(c)), "9,0,0,3,86,83,83,79,74,78,65,66,0", "Go's bytes")
+            c2 = mock(2, "", "secret")
+            c2.cfg.allow_old_passwords = true
+            mysqlconn.mock_feed(c2, bs([1, 0, 0, 2, 254]))
+            mysqlconn.mock_queue(c2, bs([8, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 0]))
+            spec.assert_ok(mysqlconn.handle_auth_result(c2, ad, "mysql_native_password"), "OK")
+            spec.assert_str_eq(show(mysqlconn.mock_written(c2)), "9,0,0,3,86,83,83,79,74,78,65,66,0", "the old switch keeps the first scramble")
+            c3 = mock(2, "", "secret")
+            mysqlconn.mock_feed(c3, bs([1, 0, 0, 2, 254]))
+            spec.assert_str_eq(mysqlconn.handle_auth_result(c3, ad, "mysql_native_password"), mysqlproto.ERR_OLD_PASSWORD, "not allowed (TestOldAuthSwitchNotAllowed)")
+        }
+        spec.it("an auth switch to sha256_password, key fetched (TestAuthSwitchSHA256PasswordRSA)") callback {
+            c = mock(2, "", "secret")
+            mysqlconn.mock_feed(c, bs([38, 0, 0, 2, 254, 115, 104, 97, 50, 53, 54, 95, 112, 97,
+                115, 115, 119, 111, 114, 100, 0, 78, 82, 62, 40, 100, 1, 59, 31, 44, 69,
+                33, 112, 8, 81, 51, 96, 65, 82, 16, 114, 0]))
+            mysqlconn.mock_queue(c, pub_key_packet(4))
+            mysqlconn.mock_queue(c, bs([7, 0, 0, 6, 0, 0, 0, 2, 0, 0, 0]))
+            ad = bs([123, 87, 15, 84, 20, 58, 37, 121, 91, 117, 51, 24, 19, 47, 43, 9, 41, 112, 67, 110])
+            spec.assert_ok(mysqlconn.handle_auth_result(c, ad, "mysql_native_password"), "OK")
+            spec.assert_true(has_prefix(mysqlconn.mock_written(c), bs([1, 0, 0, 3, 1, 0, 1, 0, 5])), "key request, then 256 bytes")
+        }
+        spec.it("an ERR answer is the server's error") callback {
+            c = mock(2, "", "secret")
+            mysqlconn.mock_feed(c, cat(bs([28, 0, 0, 2, 255, 21, 4, 35]), sb("28000Access denied for x")))
+            err = mysqlconn.handle_auth_result(c, bs([1, 2, 3]), "mysql_native_password")
+            spec.assert_str_eq(err, "Error 1045 (28000): Access denied for x", "ERR")
+        }
+    }
+
+    spec.describe(fw, "the driver") {
+        spec.it("registers as \"mysql\"") callback {
+            mysqldrv.register()
+            mysqldrv.register()
+            spec.assert_true(sql.lookup("mysql") != null, "registered")
+            db, err = sql.open("mysql", "u:p@tcp(127.0.0.1:1)/db")
+            spec.assert_ok(err, "open does not connect")
+            sql.close(db)
+        }
+    }
+
+    return spec.run_summary(fw)
+}

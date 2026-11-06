@@ -1,0 +1,340 @@
+// Ported from testcontainers-go wait/sql_test.go and modules/postgres/postgres_test.go
+// (TestContainerWithWaitForSQL), with jackc/pgx v5.9.2's pgconn_test.go cases
+// (connect, auth methods, errors with their SQLSTATE, transactions, prepared
+// statements, TLS) as far as sql/postgres implements them.
+//
+// `sql` and its PostgreSQL driver against a real PostgreSQL 16 started by
+// modules.postgres: SCRAM-SHA-256 (the image's default), MD5, TLS 1.3 with
+// a test CA (tests/fixtures/pgtls), and wait.for_sql. Three containers in
+// all; the cases on one container share it.
+
+import std.spec
+import std.string
+import std.tcp
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.testing
+import modules.postgres as pgmod      // aliased: an Aether gap (README "Known gaps") hides a module named in a type when another module with the same last name is imported under an alias
+import sql
+import sql.postgres as pgsql
+import sql.postgres.pgproto3
+
+const IMAGE = "postgres:16-alpine"
+const CA = "tests/fixtures/pgtls/ca.crt"
+
+// The entrypoint wrapper for TLS: Postgres wants its key owned by the
+// server's user and private, which a copied file is not, so copy the pair
+// into place first (Go's WithSSLCert does the same with a script).
+const TLS_ENTRYPOINT = <<SH
+set -e
+mkdir -p /var/lib/postgresql/tls
+cp /tmp/tls/server.crt /tmp/tls/server.key /var/lib/postgresql/tls/
+chown -R postgres:postgres /var/lib/postgresql/tls
+chmod 600 /var/lib/postgresql/tls/server.key
+exec docker-entrypoint.sh "$0" "$@" -c ssl=on -c ssl_cert_file=/var/lib/postgresql/tls/server.crt -c ssl_key_file=/var/lib/postgresql/tls/server.key
+SH
+
+fn dsn(pg: *pgmod.PostgresContainer, args: string) -> string {
+    u, _ = pgmod.connection_string(pg, args)
+    return u
+}
+
+// The first message the server answers a StartupMessage with, decoded with
+// sql.postgres.pgproto3: (kind, auth type).
+fn first_answer(pg: *pgmod.PostgresContainer) -> (int, int, string) {
+    h, _ = tc.host(pg.container)
+    port, _ = tc.mapped_port(pg.container, pgmod.PORT)
+    sock, cerr = tcp.connect(h, port)
+    if cerr != "" { return 0, 0, cerr }
+    w = pgproto3.new_buf()
+    pgproto3.startup_message(w, ["user", pg.user, "database", pg.db_name])
+    _, werr = tcp.write_all(sock, pgproto3.buf_bytes(w))
+    if werr != "" { tcp.tcp_close(sock); return 0, 0, werr }
+    d = pgproto3.new_decoder()
+    buf = make([]byte, 512)
+    tries = 0
+    while tries < 50 {
+        m, err = pgproto3.next_message(d)
+        if err != "" { tcp.tcp_close(sock); return 0, 0, err }
+        if m != null {
+            tcp.tcp_close(sock)
+            return m.kind, m.auth_type, ""
+        }
+        n, rerr = tcp.read_into(sock, buf)
+        if rerr != "" && rerr != "timeout" { break }
+        pgproto3.feed(d, buf[0..n])
+        tries = tries + 1
+    }
+    tcp.tcp_close(sock)
+    return 0, 0, "no answer"
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+    pgsql.register()
+
+    spec.describe(fw, "sql with sql.postgres against PostgreSQL") {
+        // one container for the SCRAM cases, started by its for_sql wait
+        pg, perr = pgmod.run(IMAGE) {
+            database("app")
+            username("appuser")
+            password("s3cret")
+            basic_wait_strategies()
+            tc.additional_wait(wait.for_sql(pgmod.PORT, "postgres", |host: string, port: int| -> "postgres://appuser:s3cret@${host}:${port}/app?sslmode=disable"))
+        }
+        if pg != null { testing.cleanup_container(pg.container) }
+
+        spec.it("starts with wait.for_sql on the default query (TestContainerWithWaitForSQL/default_query)") callback {
+            spec.assert_ok(perr, "postgres starts and answers SELECT 1")
+        }
+
+        spec.it("connects and pings with SCRAM-SHA-256") callback {
+            if perr != "" { return }
+            k, at, herr = first_answer(pg)
+            spec.assert_ok(herr, "an answer to the StartupMessage")
+            spec.assert_eq(k, 82, "an authentication request ('R')")
+            spec.assert_eq(at, pgproto3.AUTH_SASL, "SASL: the server asks for SCRAM")
+            db, oerr = sql.open("postgres", dsn(pg, "sslmode=disable"))
+            spec.assert_ok(oerr, "open")
+            spec.assert_ok(sql.ping(db), "ping")
+            r, qerr = sql.query_row(db, "SELECT current_user, current_database(), version()", [])
+            spec.assert_ok(qerr, "query_row")
+            u, _ = sql.string_at(r, 0)
+            d, _ = sql.string_at(r, 1)
+            v, _ = sql.string_at(r, 2)
+            spec.assert_str_eq(u, "appuser", "the user")
+            spec.assert_str_eq(d, "app", "the database")
+            spec.assert_contains(v, "PostgreSQL 16", "the server")
+            sql.close(db)
+        }
+
+        spec.it("reports a wrong password with SQLSTATE 28P01") callback {
+            if perr != "" { return }
+            db, _ = sql.open("pgx/v5", "postgres://appuser:wrong@localhost:1/app?sslmode=disable")
+            sql.close(db)
+            port, _ = tc.mapped_port(pg.container, pgmod.PORT)
+            h, _ = tc.host(pg.container)
+            db2, _ = sql.open("pgx/v5", "host=${h} port=${port} user=appuser password=wrong dbname=app sslmode=disable")
+            err = sql.ping(db2)
+            spec.assert_contains(err, "password authentication failed for user \"appuser\"", "the server's message")
+            spec.assert_str_eq(sql.sqlstate(err), "28P01", "invalid_password")
+            spec.assert_contains(err, "failed to connect to `user=appuser database=app`", "pgx's ConnectError prefix")
+            sql.close(db2)
+        }
+
+        spec.it("creates, inserts with parameters and reads typed values back") callback {
+            if perr != "" { return }
+            db, _ = sql.open("postgres", dsn(pg, "sslmode=disable"))
+            _, cerr = sql.exec(db, "CREATE TABLE items (id int PRIMARY KEY, name text, ok bool, price float8, data bytea, note text, at timestamp)", [])
+            spec.assert_ok(cerr, "create table")
+            res, ierr = sql.exec(db, "INSERT INTO items VALUES ($1, $2, $3, $4, $5, $6, $7), ($8, $9, $10, $11, $12, $13, $14)", [
+                sql.int64(1), sql.text("it's \"quoted\" \\ back"), sql.boolean(true), sql.float64(0.1), sql.blob([0 as byte, 39 as byte, 92 as byte, 255 as byte]), sql.null_value(), sql.text("2024-02-29 12:34:56.789"),
+                sql.int64(2), sql.text(""), sql.boolean(false), sql.float64(-2.5), sql.blob([]), sql.text("x"), sql.null_value()])
+            spec.assert_ok(ierr, "parameterised insert")
+            spec.assert_eq_long(sql.rows_affected(res), 2, "two rows inserted")
+            _, lerr = sql.last_insert_id(res)
+            spec.assert_err_contains(lerr, "LastInsertId is not supported", "as pgx")
+            rows, qerr = sql.query(db, "SELECT id, name, ok, price, data, note, at FROM items WHERE id >= $1 ORDER BY id", [sql.int64(1)])
+            spec.assert_ok(qerr, "select")
+            names = sql.column_names(rows)
+            types = sql.column_types(rows)
+            spec.assert_eq(names.len, 7, "seven columns")
+            spec.assert_str_eq(names[1], "name", "column name")
+            spec.assert_str_eq(types[0], "INT4", "int4")
+            spec.assert_str_eq(types[4], "BYTEA", "bytea")
+            spec.assert_str_eq(types[6], "TIMESTAMP", "timestamp")
+            spec.assert_true(sql.next(rows), "row 1")
+            id, e1 = sql.int_at(rows, 0)
+            spec.assert_ok(e1, "int")
+            spec.assert_eq_long(id, 1, "id")
+            name, _ = sql.string_at(rows, 1)
+            spec.assert_str_eq(name, "it's \"quoted\" \\ back", "text with quotes and a backslash, bound not rendered")
+            ok, _ = sql.bool_at(rows, 2)
+            spec.assert_true(ok, "bool")
+            price, _ = sql.float_at(rows, 3)
+            spec.assert_true(price == 0.1, "float8 round-trips 0.1 exactly")
+            data, _ = sql.bytes_at(rows, 4)
+            spec.assert_eq(data.len, 4, "bytea length")
+            spec.assert_eq(data[0] as int, 0, "a NUL byte")
+            spec.assert_eq(data[1] as int, 39, "a quote")
+            spec.assert_eq(data[2] as int, 92, "a backslash")
+            spec.assert_eq(data[3] as int, 255, "0xff")
+            spec.assert_true(sql.is_null_at(rows, 5), "NULL")
+            _, nerr = sql.string_at(rows, 5)
+            spec.assert_err_contains(nerr, "converting NULL to string is unsupported", "Go's message")
+            at, _ = sql.string_at(rows, 6)
+            spec.assert_str_eq(at, "2024-02-29 12:34:56.789", "timestamp as text")
+            spec.assert_true(sql.next(rows), "row 2")
+            empty, _ = sql.string_at(rows, 1)
+            spec.assert_str_eq(empty, "", "the empty string is not NULL")
+            spec.assert_false(sql.is_null_at(rows, 1), "not null")
+            b2, _ = sql.bytes_at(rows, 4)
+            spec.assert_eq(b2.len, 0, "empty bytea")
+            spec.assert_true(sql.is_null_at(rows, 6), "a NULL timestamp")
+            spec.assert_false(sql.next(rows), "two rows")
+            sql.close_rows(rows)
+            sql.close(db)
+        }
+
+        spec.it("returns the server's error with its SQLSTATE and position") callback {
+            if perr != "" { return }
+            db, _ = sql.open("postgres", dsn(pg, "sslmode=disable"))
+            _, e1 = sql.exec(db, "SELEC 1", [])
+            spec.assert_str_eq(sql.sqlstate(e1), "42601", "syntax_error")
+            spec.assert_contains(e1, "ERROR: syntax error at or near \"SELEC\"", "the message")
+            spec.assert_contains(e1, "position=1", "the position")
+            _, e2 = sql.query(db, "SELECT * FROM missing WHERE id = $1", [sql.int64(1)])
+            spec.assert_str_eq(sql.sqlstate(e2), "42P01", "undefined_table, from the extended protocol")
+            _, e3 = sql.exec(db, "INSERT INTO items (id) VALUES (1)", [])
+            spec.assert_str_eq(sql.sqlstate(e3), "23505", "unique_violation")
+            spec.assert_contains(e3, "detail=Key (id)=(1) already exists.", "the detail")
+            spec.assert_ok(sql.ping(db), "the connection is still usable after errors")
+            sql.close(db)
+        }
+
+        spec.it("rolls back and commits transactions") callback {
+            if perr != "" { return }
+            db, _ = sql.open("postgres", dsn(pg, "sslmode=disable"))
+            _, cerr = sql.exec(db, "CREATE TABLE ledger (n int)", [])
+            spec.assert_ok(cerr, "create")
+            tx, berr = sql.begin(db)
+            spec.assert_ok(berr, "begin")
+            _, ierr = sql.tx_exec(tx, "INSERT INTO ledger VALUES ($1)", [sql.int64(1)])
+            spec.assert_ok(ierr, "insert in the tx")
+            r, _ = sql.tx_query_row(tx, "SELECT count(*) FROM ledger", [])
+            n, _ = sql.int_at(r, 0)
+            spec.assert_eq_long(n, 1, "seen inside the tx")
+            spec.assert_ok(sql.rollback(tx), "rollback")
+            r2, _ = sql.query_row(db, "SELECT count(*) FROM ledger", [])
+            n2, _ = sql.int_at(r2, 0)
+            spec.assert_eq_long(n2, 0, "rollback left no row")
+            tx2, _ = sql.begin(db)
+            sql.tx_exec(tx2, "INSERT INTO ledger VALUES ($1)", [sql.int64(2)])
+            spec.assert_ok(sql.commit(tx2), "commit")
+            spec.assert_str_eq(sql.commit(tx2), sql.ERR_TX_DONE, "a second commit is Go's ErrTxDone")
+            r3, _ = sql.query_row(db, "SELECT count(*), max(n) FROM ledger", [])
+            n3, _ = sql.int_at(r3, 0)
+            m3, _ = sql.int_at(r3, 1)
+            spec.assert_eq_long(n3, 1, "commit kept the row")
+            spec.assert_eq_long(m3, 2, "the committed value")
+            tx3, _ = sql.begin(db)
+            _, derr = sql.tx_exec(tx3, "SELECT 1/0", [])
+            spec.assert_str_eq(sql.sqlstate(derr), "22012", "division_by_zero")
+            spec.assert_str_eq(sql.commit(tx3), "commit unexpectedly resulted in rollback", "pgx's ErrTxCommitRollback")
+            sql.close(db)
+        }
+
+        spec.it("prepares a statement and runs it twice") callback {
+            if perr != "" { return }
+            db, _ = sql.open("postgres", dsn(pg, "sslmode=disable"))
+            st, err = sql.prepare(db, "SELECT $1::int * $2::int, $3::text")
+            spec.assert_ok(err, "prepare")
+            spec.assert_eq(sql.num_input(st), 3, "three parameters")
+            r1, e1 = sql.stmt_query_row(st, [sql.int64(6), sql.int64(7), sql.text("a")])
+            spec.assert_ok(e1, "first")
+            v1, _ = sql.int_at(r1, 0)
+            spec.assert_eq_long(v1, 42, "6 * 7")
+            r2, _ = sql.stmt_query_row(st, [sql.int64(-1), sql.int64(3), sql.null_value()])
+            v2, _ = sql.int_at(r2, 0)
+            spec.assert_eq_long(v2, -3, "-1 * 3")
+            spec.assert_true(sql.is_null_at(r2, 1), "a NULL parameter")
+            spec.assert_ok(sql.stmt_close(st), "deallocate")
+            sql.close(db)
+        }
+
+        spec.it("runs wait.for_sql with a custom query, and times out with a bad one (TestContainerWithWaitForSQL)") callback {
+            if perr != "" { return }
+            ok = wait.with_query(wait.for_sql(pgmod.PORT, "postgres", |host: string, port: int| -> "postgres://appuser:s3cret@${host}:${port}/app?sslmode=disable"), "SELECT 10")
+            spec.assert_ok(wait.until_ready(ok, pg.container), "custom query")
+            spec.assert_str_eq(wait.describe(ok), "SQL database on port 5432 using driver \"postgres\" with query \"SELECT 10\"", "Go's String()")
+            bad = wait.with_query(wait.for_sql(pgmod.PORT, "postgres", |host: string, port: int| -> "postgres://appuser:s3cret@${host}:${port}/app?sslmode=disable"), "SELECT 'a' from b")
+            wait.with_startup_timeout(bad, 2s)
+            berr = wait.until_ready(bad, pg.container)
+            spec.assert_contains(berr, "timed out", "a bad query never succeeds")
+            spec.assert_contains(berr, "42P01", "and says why")
+            creds = wait.for_sql(pgmod.PORT, "pgx", |host: string, port: int| -> "postgres://appuser:wrong@${host}:${port}/app?sslmode=disable")
+            wait.with_startup_timeout(creds, 2s)
+            cerr = wait.until_ready(creds, pg.container)
+            spec.assert_contains(cerr, "timed out", "wrong credentials time out")
+            spec.assert_contains(cerr, "28P01", "with the server's reason")
+            nodrv = wait.for_sql(pgmod.PORT, "nosuchdriver", |host: string, port: int| -> "x")
+            spec.assert_contains(wait.until_ready(nodrv, pg.container), "sql: unknown driver \"nosuchdriver\"", "an unknown driver fails at once")
+        }
+        testing.cleanup_all()
+    }
+
+    spec.describe(fw, "MD5 authentication") {
+        spec.after_each() callback { testing.cleanup_all() }
+        spec.it("authenticates with md5(md5(password + user) + salt)") callback {
+            pg, err = pgmod.run(IMAGE) {
+                username("md5user")
+                password("md5pass")
+                tc.env("POSTGRES_HOST_AUTH_METHOD", "md5")
+                tc.env("POSTGRES_INITDB_ARGS", "--auth-host=md5 -c password_encryption=md5")
+                basic_wait_strategies()
+            }
+            if pg != null { testing.cleanup_container(pg.container) }
+            spec.assert_ok(err, "postgres starts")
+            if err != "" { return }
+            k, at, herr = first_answer(pg)
+            spec.assert_ok(herr, "an answer")
+            spec.assert_eq(k, 82, "an authentication request")
+            spec.assert_eq(at, pgproto3.AUTH_MD5_PASSWORD, "the server asks for MD5")
+            db, _ = sql.open("postgres", dsn(pg, "sslmode=disable"))
+            r, qerr = sql.query_row(db, "SELECT rolpassword LIKE 'md5%' FROM pg_authid WHERE rolname = current_user", [])
+            spec.assert_ok(qerr, "connected with MD5")
+            md5ed, _ = sql.bool_at(r, 0)
+            spec.assert_true(md5ed, "the stored password is an MD5 hash")
+            sql.close(db)
+            db2, _ = sql.open("postgres", "postgres://md5user:nope@localhost:1/md5user")
+            sql.close(db2)
+            h, _ = tc.host(pg.container)
+            port, _ = tc.mapped_port(pg.container, pgmod.PORT)
+            db3, _ = sql.open("postgres", "postgres://md5user:nope@${h}:${port}/md5user?sslmode=disable")
+            spec.assert_str_eq(sql.sqlstate(sql.ping(db3)), "28P01", "a wrong MD5 password")
+            sql.close(db3)
+        }
+    }
+
+    spec.describe(fw, "TLS") {
+        spec.after_each() callback { testing.cleanup_all() }
+        spec.it("connects over TLS 1.3 with sslmode=verify-full against the test CA") callback {
+            pg, err = pgmod.run(IMAGE) {
+                tc.file("tests/fixtures/pgtls/server.crt", "/tmp/tls/server.crt", 420)
+                tc.file("tests/fixtures/pgtls/server.key", "/tmp/tls/server.key", 384)
+                tc.entrypoint(["sh", "-c", TLS_ENTRYPOINT])
+                basic_wait_strategies()
+            }
+            if pg != null { testing.cleanup_container(pg.container) }
+            spec.assert_ok(err, "postgres starts with ssl=on")
+            if err != "" { return }
+            db, _ = sql.open("postgres", dsn(pg, "sslmode=verify-full&sslrootcert=${CA}"))
+            r, qerr = sql.query_row(db, "SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()", [])
+            spec.assert_ok(qerr, "query over TLS")
+            on, _ = sql.bool_at(r, 0)
+            ver, _ = sql.string_at(r, 1)
+            spec.assert_true(on, "the server sees TLS")
+            spec.assert_str_eq(ver, "TLSv1.3", "TLS 1.3")
+            sql.close(db)
+
+            sys, _ = sql.open("postgres", dsn(pg, "sslmode=verify-full"))
+            serr = sql.ping(sys)
+            spec.assert_contains(serr, "tls error", "the test CA is not in the system store")
+            sql.close(sys)
+
+            req, _ = sql.open("postgres", dsn(pg, "sslmode=require"))
+            rerr = sql.ping(req)
+            spec.assert_contains(rerr, "sslrootcert", "require without a root cert says what to give instead")
+            sql.close(req)
+
+            pref, _ = sql.open("postgres", dsn(pg, "sslmode=prefer"))
+            r2, perr2 = sql.query_row(pref, "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()", [])
+            spec.assert_ok(perr2, "prefer falls back to plain text when verification fails")
+            on2, _ = sql.bool_at(r2, 0)
+            spec.assert_false(on2, "the fallback is not TLS")
+            sql.close(pref)
+        }
+    }
+    return spec.run_summary(fw)
+}

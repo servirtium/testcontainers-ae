@@ -1,0 +1,16 @@
+# testcontainers-ae as an Aether package: `ae add <where this repository
+# lives>` joins this repository's root to the consumer's module search path
+# (`modules = "."`), so the dotted imports resolve:
+#
+#   import testcontainers as tc          -> testcontainers/module.ae
+#   import testcontainers.wait           -> testcontainers/wait/module.ae
+#   import testcontainers.network        -> testcontainers/network/module.ae
+#   import testcontainers.docker         -> testcontainers/docker/module.ae
+#   import testcontainers.testing        -> testcontainers/testing/module.ae
+#   import modules.redis                 -> modules/redis/module.ae
+#
+# See DESIGN.md for the API and README.md for a quickstart.
+[package]
+name = "testcontainers-ae"
+version = "0.1.0"
+modules = "."

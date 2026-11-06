@@ -1,0 +1,30 @@
+// Run with TESTCONTAINERS_RYUK_DISABLED=true: no reaper starts, and the
+// explicit terminate is what removes the container.
+
+import std.os
+import std.string
+import testcontainers as tc
+import testcontainers.docker
+
+main() {
+    c, err = tc.run("alpine:3") { cmd(["sleep", "600"]) }
+    if err != "" { println("ERR ${err}"); os.exit(2) }
+    println("REAPER ${tc.reaper_running()}")
+    cl, _ = docker.client()
+    string[] want = []
+    want.push("${docker.LABEL_SESSION_ID}=${tc.session_id()}")
+    ids, _ = docker.list_containers(cl, want)
+    println("SESSION_CONTAINERS ${ids.len}")
+    doc, _ = tc.inspect(c)
+    lj = docker.json_body(doc)
+    println("REAP_LABEL ${std_contains(lj, "org.testcontainers.reap")}")
+    terr = tc.terminate(c)
+    println("TERMINATE '${terr}'")
+    ids2, _ = docker.list_containers(cl, want)
+    println("AFTER ${ids2.len}")
+    os.exit(0)
+}
+
+fn std_contains(s: string, sub: string) -> int {
+    return string.contains(s, sub)
+}

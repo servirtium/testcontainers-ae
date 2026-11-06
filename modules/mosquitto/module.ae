@@ -1,0 +1,64 @@
+// Ported from testcontainers-go modules/mosquitto/mosquitto.go
+//
+// modules.mosquitto: an Eclipse Mosquitto MQTT broker.
+//
+//     import modules.mosquitto
+//
+//     c, err = mosquitto.run("eclipse-mosquitto:2") {
+//         config_file("testdata/mosquitto.conf")   // optional; default allows anonymous
+//     }
+//     defer tc.terminate(c)
+//     url, _ = mosquitto.broker_url(c)             // "mqtt://localhost:32771"
+//
+// The default configuration (one listener on 1883, anonymous clients
+// allowed) is copied in by the factory; config_file copies the caller's file
+// to the same path after it, so it replaces the default.
+//
+// Not ported: Go's Container wrapper type (the module returns the plain
+// *docker.Container, as redis does; nothing else is stored on it).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, broker_url, config_file,
+    PORT, CONFIG_PATH, DEFAULT_CONFIG,
+    mosquitto_request_new, mosquitto_request_free
+)
+
+const PORT = "1883/tcp"
+const CONFIG_PATH = "/mosquitto/config/mosquitto.conf"
+
+// A minimal config: the image exits at once without a listener directive.
+const DEFAULT_CONFIG = "listener 1883\nallow_anonymous true\n"
+
+mosquitto_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.file_content(r, DEFAULT_CONFIG, CONFIG_PATH, 420)
+    tc.wait_for(r, wait.for_listening_port(PORT))
+    return r
+}
+
+mosquitto_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithConfigFile: a custom mosquitto.conf replacing the default one. It
+// must contain at least a "listener 1883" directive.
+config_file(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, CONFIG_PATH, 420)
+}
+
+builder run(image: string) with mosquitto_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = mosquitto_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run mosquitto: ${err}" }
+    return c, ""
+}
+
+// "mqtt://host:port" (Go's BrokerURL).
+broker_url(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "mqtt")
+}

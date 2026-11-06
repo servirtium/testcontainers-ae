@@ -1,0 +1,70 @@
+// Ported from testcontainers-go modules/openfga/openfga.go
+//
+// modules.openfga: an OpenFGA authorization server (in-memory datastore).
+//
+//     import modules.openfga
+//
+//     c, err = openfga.run("openfga/openfga:v1.18.0")
+//     defer tc.terminate(c)
+//     http, _ = openfga.http_endpoint(c)             // "http://localhost:32771"
+//     grpc, _ = openfga.grpc_endpoint(c)             // "http://localhost:32772"
+//     play, _ = openfga.playground_endpoint(c)       // "http://localhost:32773/playground"
+//
+// Not ported: the deprecated RunContainer (and the OpenFGA Go SDK its tests
+// use; the test here calls the HTTP API).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, grpc_endpoint, http_endpoint, playground_endpoint,
+    HTTP_PORT, GRPC_PORT, PLAYGROUND_PORT, DEFAULT_IMAGE,
+    openfga_request_new, openfga_request_free
+)
+
+const HTTP_PORT = "8080/tcp"
+const GRPC_PORT = "8081/tcp"
+const PLAYGROUND_PORT = "3000/tcp"
+const DEFAULT_IMAGE = "openfga/openfga:v1.18.0"
+
+openfga_request_new() -> ptr {
+    r = tc.request_new()
+    tc.cmd(r, ["run"])
+    tc.expose(r, PLAYGROUND_PORT)
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, GRPC_PORT)
+    tc.wait_for(r, wait.for_http("/healthz") {
+        with_port(HTTP_PORT)
+        with_response_matcher(|body: string| -> string.contains(body, "SERVING") == 1)
+    })
+    return r
+}
+
+openfga_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with openfga_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = openfga_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run openfga: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" of the gRPC port (Go's GrpcEndpoint).
+grpc_endpoint(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, GRPC_PORT, "http")
+}
+
+// "http://host:port" of the HTTP API (Go's HttpEndpoint).
+http_endpoint(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, HTTP_PORT, "http")
+}
+
+// "http://host:port/playground" (Go's PlaygroundEndpoint).
+playground_endpoint(c: *docker.Container) -> (string, string) {
+    ep, err = tc.endpoint(c, PLAYGROUND_PORT, "http")
+    if err != "" { return "", "failed to get playground endpoint: ${err}" }
+    return "${ep}/playground", ""
+}

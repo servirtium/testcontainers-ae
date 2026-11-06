@@ -1,0 +1,43 @@
+// Ported from testcontainers-go modules/memcached/memcached.go
+//
+// modules.memcached: a Memcached container.
+//
+//     import modules.memcached
+//
+//     c, err = memcached.run("memcached:1.6-alpine")
+//     defer tc.terminate(c)
+//     hostport, _ = memcached.host_port(c)      // "localhost:32771"
+//
+// Nothing is left out of the Go module (it has the one option-less Run and
+// HostPort).
+
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(run, host_port, PORT, DEFAULT_IMAGE, memcached_request_new, memcached_request_free)
+
+const PORT = "11211/tcp"
+const DEFAULT_IMAGE = "memcached:1.6-alpine"
+
+memcached_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_listening_port(PORT))
+    return r
+}
+
+memcached_request_free(p: ptr) { tc.request_free(p) }
+
+builder run(image: string) with memcached_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = memcached_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run memcached: ${err}" }
+    return c, ""
+}
+
+// "host:port" (Go's HostPort).
+host_port(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "")
+}

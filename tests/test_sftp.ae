@@ -1,0 +1,94 @@
+// Ported from testcontainers-go modules/sftp/sftp_test.go
+//
+// A real SFTP server: the mapped port must send the SSH identification
+// banner ("SSH-2.0-..."). Aether's std has no SSH client, so the banner is as
+// far as the wire goes; the configured users are checked in the container
+// (id, and the writable upload/ directory atmoz/sftp creates).
+
+import std.spec
+import std.string
+import std.tcp
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.sftp
+
+const IMAGE = "atmoz/sftp:latest"
+
+// The first line the server sends on the mapped port.
+fn ssh_banner(c: *docker.Container) -> (string, string) {
+    h, _ = tc.host(c)
+    port, perr = tc.mapped_port(c, sftp.PORT)
+    if perr != "" { return "", perr }
+    sock, cerr = tcp.connect(h, port)
+    if cerr != "" { return "", "connect ${h}:${port}: ${cerr}" }
+    buf = ""
+    tries = 0
+    while string.contains(buf, "\n") == 0 && tries < 50 {
+        chunk, rerr = tcp.read(sock, 256)
+        if rerr != "" && rerr != "timeout" { break }
+        buf = string.concat(buf, chunk)
+        tries = tries + 1
+    }
+    tcp.tcp_close(sock)
+    return string.trim(buf), ""
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/sftp") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("starts with a user and sends the SSH banner (TestSFTP)") callback {
+            c, err = sftp.run(IMAGE) {
+                user("testuser", "testpassword")
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "sftp starts")
+            if err == "" {
+                addr, aerr = sftp.address(c)
+                spec.assert_ok(aerr, "address")
+                spec.assert_true(string.length(addr) > 0, "an address: ${addr}")
+                spec.assert_true(string.contains(addr, "://") == 0, "host:port: ${addr}")
+                banner, berr = ssh_banner(c)
+                spec.assert_ok(berr, "banner")
+                spec.assert_true(string.starts_with(banner, "SSH-2.0-") == 1, "an SSH-2.0 banner: ${banner}")
+
+                // the configured user exists, with a writable upload directory
+                code, out, eerr = tc.exec(c, ["id", "testuser"])
+                spec.assert_ok(eerr, "exec id")
+                spec.assert_eq(code, 0, "the user exists: ${out}")
+                code2, out2, e2 = tc.exec(c, ["sh", "-c", "ls -ld /home/testuser/upload && touch /home/testuser/upload/probe"])
+                spec.assert_ok(e2, "exec ls")
+                spec.assert_eq(code2, 0, "upload/ exists and is writable by root: ${out2}")
+            }
+        }
+
+        spec.it("creates every user given") callback {
+            c, err = sftp.run(IMAGE) {
+                user("alice", "pw-a")
+                user("bob", "pw-b")
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "sftp starts")
+            if err == "" {
+                code, _, _ = tc.exec(c, ["id", "alice"])
+                spec.assert_eq(code, 0, "alice exists")
+                code2, _, _ = tc.exec(c, ["id", "bob"])
+                spec.assert_eq(code2, 0, "bob exists")
+                code3, _, _ = tc.exec(c, ["id", "carol"])
+                spec.assert_true(code3 != 0, "carol was not asked for")
+            }
+        }
+
+        spec.it("refuses to run without a user (TestSFTP_NoUsers)") callback {
+            c, err = sftp.run(IMAGE)
+            testing.cleanup_container(c)
+            spec.assert_true(c == null, "no container")
+            spec.assert_contains(err, "at least one user is required", "the error says why: ${err}")
+        }
+    }
+    return spec.run_summary(fw)
+}

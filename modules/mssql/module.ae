@@ -1,0 +1,164 @@
+// Ported from testcontainers-go modules/mssql/mssql.go
+//
+// modules.mssql: a Microsoft SQL Server container. The container carries
+// the sa password, which is read back from the container's environment.
+//
+//     import modules.mssql
+//
+//     m, err = mssql.run("mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04") {
+//         accept_eula()
+//         password("Strong@Passw0rd")
+//         init_sql("testdata/seed.sql")
+//     }
+//     defer tc.terminate(m.container)
+//     url, _ = mssql.connection_string(m, ["encrypt=false"])
+//     // "sqlserver://sa:Strong@Passw0rd@localhost:32771?encrypt=false"
+//
+// init_sql is Go's WithInitSQL, one script a call: the file is copied into
+// the container before start and, once the wait strategies are satisfied,
+// run with sqlcmd as sa (an "after ready" command, with both the new
+// mssql-tools18 and the legacy mssql-tools on PATH). As in Go, a script that
+// fails in SQL does not fail `run` (only a failure to exec does).
+//
+// Run requires the EULA: without accept_eula() (ACCEPT_EULA=Y, any case)
+// `run` returns "EULA not accepted ..." before starting anything.
+//
+// Not ported: Go's RunContainer (deprecated), and the database/sql helpers
+// of Go's tests (no SQL client in Aether's std).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+import std.json
+
+exports(
+    MSSQLServerContainer, run, connection_string, password_of, accept_eula,
+    password, init_sql, PORT, DEFAULT_USERNAME, DEFAULT_PASSWORD,
+    DEFAULT_IMAGE, mssql_request_new, mssql_request_free
+)
+
+const PORT = "1433/tcp"
+const DEFAULT_USERNAME = "sa"
+const DEFAULT_PASSWORD = "Strong@Passw0rd"
+const DEFAULT_IMAGE = "mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04"
+
+const S_SCRIPTS = "mssql.init_scripts"   // host paths, one a line
+
+struct MSSQLServerContainer {
+    container: *docker.Container
+    user: string
+    pass: string
+}
+
+// Go's moduleOpts: the port, the default sa password, the listening port
+// and the "Recovery is complete." log line.
+mssql_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.env(r, "MSSQL_SA_PASSWORD", DEFAULT_PASSWORD)
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(PORT) { with_startup_timeout(60s) },
+        wait.for_log("Recovery is complete.")
+    ]))
+    return r
+}
+
+mssql_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithAcceptEULA.
+accept_eula(_ctx: ptr) { tc.env(_ctx, "ACCEPT_EULA", "Y") }
+
+// Go's WithPassword: MSSQL_SA_PASSWORD ("" is the default password).
+password(_ctx: ptr, pw: string) {
+    p = pw
+    if string.length(p) == 0 { p = DEFAULT_PASSWORD }
+    tc.env(_ctx, "MSSQL_SA_PASSWORD", p)
+}
+
+// Go's WithInitSQL: scripts run in the order given, after the container is ready.
+init_sql(_ctx: ptr, host_path: string) {
+    if !tc.req_has_setting(_ctx, S_SCRIPTS) {
+        tc.set_setting(_ctx, S_SCRIPTS, host_path)
+    } else {
+        tc.set_setting(_ctx, S_SCRIPTS, "${tc.req_setting(_ctx, S_SCRIPTS)}\n${host_path}")
+    }
+}
+
+fn split_on(s: string, sep: string) -> string[] {
+    string[] out = []
+    if string.length(s) == 0 { return out }
+    rest = s
+    i = string.index_of(rest, sep)
+    while i >= 0 {
+        out.push(string.substring(rest, 0, i))
+        rest = string.substring(rest, i + string.length(sep), string.length(rest))
+        i = string.index_of(rest, sep)
+    }
+    out.push(rest)
+    return out
+}
+
+// The sa password in single quotes for sh.
+fn sh_quote(s: string) -> string {
+    return "'${string.replace_all(s, "'", "'\\''")}'"
+}
+
+// Run a SQL Server container (Go's mssql.Run).
+builder run(image: string) with mssql_request_new -> (*MSSQLServerContainer, string) {
+    r = _builder
+    if r == null { r = mssql_request_new() }
+    if string.to_upper(tc.req_env(r, "ACCEPT_EULA")) != "Y" {
+        mssql_request_free(r)
+        return null, "EULA not accepted. Please use the accept_eula option to accept the EULA"
+    }
+    pw = tc.req_env(r, "MSSQL_SA_PASSWORD")
+    i = 0
+    for script in split_on(tc.req_setting(r, S_SCRIPTS), "\n") {
+        target = "/tmp/script_${i}.sql"
+        tc.file(r, script, target, 420)
+        tc.after_ready_command(r, ["sh", "-c", "PATH=/opt/mssql-tools18/bin:/opt/mssql-tools/bin:$PATH sqlcmd -S localhost -U ${DEFAULT_USERNAME} -P ${sh_quote(pw)} -No -i ${target}"])
+        i = i + 1
+    }
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run mssql: ${err}" }
+    m = heap.new(MSSQLServerContainer)
+    m.container = c
+    m.user = DEFAULT_USERNAME
+    m.pass = ""
+    if err != "" { return m, "run mssql: ${err}" }
+    // the password, from the container's environment
+    doc, ierr = tc.inspect(c)
+    if ierr != "" { return m, "inspect mssql: ${ierr}" }
+    cfg, _ = json.object_get(doc, "Config")
+    envv, _ = json.object_get(cfg, "Env")
+    n = json.json_array_size(envv)
+    k = 0
+    while k < n {
+        ev, _ = json.array_get(envv, k)
+        e, _ = json.get_string(ev)
+        if string.starts_with(e, "MSSQL_SA_PASSWORD=") == 1 {
+            m.pass = string.substring(e, 18, string.length(e))
+            k = n
+        }
+        k = k + 1
+    }
+    json.free(doc)
+    return m, ""
+}
+
+// The sa password (Go's Password).
+password_of(m: *MSSQLServerContainer) -> string { return m.pass }
+
+// "sqlserver://sa:password@host:port?a&b" (Go's ConnectionString; the
+// extra arguments, like "encrypt=false", are joined with &).
+connection_string(m: *MSSQLServerContainer, args: string[]) -> (string, string) {
+    ep, err = tc.endpoint(m.container, PORT, "")
+    if err != "" { return "", "port endpoint: ${err}" }
+    extra = ""
+    for a in args {
+        if string.length(extra) > 0 { extra = "${extra}&" }
+        extra = "${extra}${a}"
+    }
+    return "sqlserver://${m.user}:${m.pass}@${ep}?${extra}", ""
+}

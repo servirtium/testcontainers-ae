@@ -1,0 +1,195 @@
+// Ported from testcontainers-go modules/azure/servicebus/servicebus.go and options.go
+//
+// modules.azure.servicebus: the Azure Service Bus emulator, with the SQL
+// Server container it needs, started first on a network of its own.
+//
+//     import modules.azure.servicebus
+//
+//     s, err = servicebus.run("mcr.microsoft.com/azure-messaging/servicebus-emulator:1.1.2") {
+//         accept_eula()
+//         mssql_image("mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04")
+//         mssql_env("TESTCONTAINERS_TEST_VAR", "test")
+//         config_file("modules/azure/servicebus/testdata/servicebus_config.json")
+//     }
+//     defer servicebus.terminate(s)         // servicebus, mssql, then the network
+//     cs, _ = servicebus.connection_string(s)
+//     // "Endpoint=sb://localhost:32771;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;"
+//
+// The EULA is required; unlike Go, which starts SQL Server and only then
+// notices the missing EULA, `run` refuses before starting anything.
+// Go's WithMSSQL(img, opts...) takes arbitrary container options for the SQL
+// Server container; here they are mssql_image and mssql_env (repeatable), the
+// ones the Go tests and docs use. config(text) / config_file(path) are Go's
+// WithConfig (an io.Reader there), copied to
+// /ServiceBus_Emulator/ConfigFiles/Config.json.
+//
+// Status: compile-checked only (alpha; no engine was used to port it).
+//
+// Not ported: the Azure Service Bus SDK use in Go's docs.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+import testcontainers.network
+import modules.mssql
+
+exports(
+    ServiceBusContainer, run, terminate, connection_string, connection_string_for,
+    mssql_container, accept_eula, mssql_image, mssql_env, config, config_file,
+    PORT, HTTP_PORT, CONFIG_FILE, DEFAULT_MSSQL_IMAGE, SHARED_ACCESS_KEY_NAME,
+    SHARED_ACCESS_KEY, servicebus_request_new, servicebus_request_free
+)
+
+const PORT = "5672/tcp"
+const HTTP_PORT = "5300/tcp"
+const SHARED_ACCESS_KEY_NAME = "RootManageSharedAccessKey"
+const SHARED_ACCESS_KEY = "SAS_KEY_VALUE"
+const ALIAS_SERVICEBUS = "servicebus"
+const ALIAS_MSSQL = "mssql"
+const DEFAULT_MSSQL_IMAGE = "mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04"
+const CONFIG_FILE = "/ServiceBus_Emulator/ConfigFiles/Config.json"
+
+const SET_MSSQL_IMAGE = "servicebus.mssql_image"
+const SET_MSSQL_ENV = "servicebus.mssql_env"   // KEY=value, one a line
+
+struct ServiceBusContainer {
+    container: *docker.Container
+    mssql: *mssql.MSSQLServerContainer
+    net: *docker.Network
+}
+
+servicebus_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.expose(r, HTTP_PORT)
+    // zero because the SQL Server container is started first
+    tc.env(r, "SQL_WAIT_INTERVAL", "0")
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(PORT),
+        wait.for_listening_port(HTTP_PORT),
+        wait.for_http("/health") { with_port(HTTP_PORT); with_status(200) }
+    ]))
+    return r
+}
+
+servicebus_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithAcceptEULA.
+accept_eula(_ctx: ptr) { tc.env(_ctx, "ACCEPT_EULA", "Y") }
+
+// Go's WithMSSQL image: the SQL Server image (default 2022-CU14).
+mssql_image(_ctx: ptr, img: string) { tc.set_setting(_ctx, SET_MSSQL_IMAGE, img) }
+
+// An environment variable for the SQL Server container (Go's
+// WithMSSQL(img, testcontainers.WithEnv(...))); call it again for more.
+mssql_env(_ctx: ptr, key: string, value: string) {
+    line = "${key}=${value}"
+    if tc.req_has_setting(_ctx, SET_MSSQL_ENV) { line = "${tc.req_setting(_ctx, SET_MSSQL_ENV)}\n${line}" }
+    tc.set_setting(_ctx, SET_MSSQL_ENV, line)
+}
+
+// Go's WithConfig from the JSON text.
+config(_ctx: ptr, content: string) { tc.file_content(_ctx, content, CONFIG_FILE, 420) }
+
+// Go's WithConfig from a file on the host.
+config_file(_ctx: ptr, host_path: string) { tc.file(_ctx, host_path, CONFIG_FILE, 420) }
+
+fn split_lines(s: string) -> string[] {
+    string[] out = []
+    if string.length(s) == 0 { return out }
+    rest = s
+    i = string.index_of(rest, "\n")
+    while i >= 0 {
+        out.push(string.substring(rest, 0, i))
+        rest = string.substring(rest, i + 1, string.length(rest))
+        i = string.index_of(rest, "\n")
+    }
+    out.push(rest)
+    return out
+}
+
+// Stop what a failed run already started.
+fn cleanup(m: *mssql.MSSQLServerContainer, net: *docker.Network) {
+    if m != null { tc.terminate(m.container) }
+    if net != null { network.remove(net) }
+}
+
+builder run(image: string) with servicebus_request_new -> (*ServiceBusContainer, string) {
+    r = _builder
+    if r == null { r = servicebus_request_new() }
+    if string.to_upper(tc.req_env(r, "ACCEPT_EULA")) != "Y" {
+        servicebus_request_free(r)
+        return null, "run servicebus: EULA not accepted. Please use the accept_eula option to accept the EULA"
+    }
+    mimg = DEFAULT_MSSQL_IMAGE
+    if tc.req_has_setting(r, SET_MSSQL_IMAGE) { mimg = tc.req_setting(r, SET_MSSQL_IMAGE) }
+    menv = split_lines(tc.req_setting(r, SET_MSSQL_ENV))
+
+    net, nerr = network.new_random()
+    if nerr != "" {
+        servicebus_request_free(r)
+        return null, "new mssql network: ${nerr}"
+    }
+    // the SQL Server container first; the EULA is accepted for it, as the emulator needs it
+    m, merr = mssql.run(mimg) {
+        accept_eula()
+        tc.network_alias(net.name, ALIAS_MSSQL)
+        for kv in menv {
+            eq = string.index_of(kv, "=")
+            if eq > 0 { tc.env(string.substring(kv, 0, eq), string.substring(kv, eq + 1, string.length(kv))) }
+        }
+    }
+    if merr != "" {
+        servicebus_request_free(r)
+        cleanup(m, net)
+        return null, "run mssql container: ${merr}"
+    }
+    tc.env(r, "SQL_SERVER", ALIAS_MSSQL)
+    tc.env(r, "MSSQL_SA_PASSWORD", mssql.password_of(m))
+    tc.network_alias(r, net.name, ALIAS_SERVICEBUS)
+
+    s = heap.new(ServiceBusContainer)
+    s.container = null
+    s.mssql = m
+    s.net = net
+    c, err = tc.run_request(r, image)
+    s.container = c
+    if err != "" { return s, "run servicebus: ${err}" }
+    return s, ""
+}
+
+// Go's Terminate: the servicebus container, the mssql container, then the
+// network between them. Null-safe. Returns the errors joined.
+terminate(s: *ServiceBusContainer) -> string {
+    if s == null { return "" }
+    errs = ""
+    if s.container != null {
+        err = tc.terminate(s.container)
+        if err != "" { errs = "${errs}terminate servicebus container: ${err}; " }
+    }
+    if s.mssql != null {
+        err = tc.terminate(s.mssql.container)
+        if err != "" { errs = "${errs}terminate mssql container: ${err}; " }
+    }
+    if s.net != null {
+        err = network.remove(s.net)
+        if err != "" { errs = "${errs}remove mssql network: ${err}; " }
+    }
+    return errs
+}
+
+// The SQL Server container the emulator uses (Go's MSSQLContainer).
+mssql_container(s: *ServiceBusContainer) -> *mssql.MSSQLServerContainer { return s.mssql }
+
+// The format Go's ConnectionString documents, for a "host:port".
+connection_string_for(host_port: string) -> string {
+    return "Endpoint=sb://${host_port};SharedAccessKeyName=${SHARED_ACCESS_KEY_NAME};SharedAccessKey=${SHARED_ACCESS_KEY};UseDevelopmentEmulator=true;"
+}
+
+// Endpoint=sb://<host>:<port>;SharedAccessKeyName=...;SharedAccessKey=...;UseDevelopmentEmulator=true;
+connection_string(s: *ServiceBusContainer) -> (string, string) {
+    ep, err = tc.endpoint(s.container, PORT, "")
+    if err != "" { return "", "port endpoint: ${err}" }
+    return connection_string_for(ep), ""
+}

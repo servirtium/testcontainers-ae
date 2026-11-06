@@ -1,0 +1,94 @@
+// Ported from testcontainers-go modules/valkey/valkey.go, modules/valkey/options.go
+//
+// modules.valkey: a Valkey container (a Redis-protocol server).
+//
+//     import modules.valkey
+//
+//     c, err = valkey.run("valkey/valkey:7.2.5") {
+//         log_level(valkey.LOG_LEVEL_VERBOSE)
+//         snapshotting(10, 1)
+//     }
+//     defer tc.terminate(c)
+//     url, _ = valkey.connection_string(c)      // "redis://localhost:32771"
+//
+// Not ported: WithTLS and TLSConfig (they need a CA, client and server
+// certificate generated at run time, which Go gets from
+// github.com/mdelapenya/tlscert; Aether's std has no certificate builder
+// yet, same as modules.redis) and the deprecated RunContainer.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, connection_string, log_level, snapshotting, config_file,
+    PORT, DEFAULT_IMAGE, CONFIG_FILE_PATH,
+    LOG_LEVEL_DEBUG, LOG_LEVEL_VERBOSE, LOG_LEVEL_NOTICE, LOG_LEVEL_WARNING,
+    valkey_request_new, valkey_request_free
+)
+
+const PORT = "6379/tcp"
+const DEFAULT_IMAGE = "valkey/valkey:7.2.5"
+const CONFIG_FILE_PATH = "/usr/local/valkey.conf"
+
+const LOG_LEVEL_DEBUG = "debug"
+const LOG_LEVEL_VERBOSE = "verbose"
+const LOG_LEVEL_NOTICE = "notice"
+const LOG_LEVEL_WARNING = "warning"
+
+// The module's defaults: the port, the valkey-server entrypoint, and the
+// two waits Go uses (port listening, then the ready line).
+valkey_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, PORT)
+    tc.entrypoint(r, ["valkey-server"])
+    tc.wait_for(r, wait.for_all([
+        wait.for_listening_port(PORT) { with_startup_timeout(10s) },
+        wait.for_log("* Ready to accept connections")
+    ]) { with_deadline(60s) })
+    return r
+}
+
+valkey_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithLogLevel: --loglevel <level>.
+log_level(_ctx: ptr, level: string) {
+    tc.cmd_arg(_ctx, "--loglevel")
+    tc.cmd_arg(_ctx, level)
+}
+
+// Go's WithSnapshotting: --save <seconds> <changed keys>, each at least 1.
+snapshotting(_ctx: ptr, seconds: int, changed_keys: int) {
+    s = seconds
+    if s < 1 { s = 1 }
+    k = changed_keys
+    if k < 1 { k = 1 }
+    tc.cmd_arg(_ctx, "--save")
+    tc.cmd_arg(_ctx, "${s}")
+    tc.cmd_arg(_ctx, "${k}")
+}
+
+// Go's WithConfigFile: copy the host file to /usr/local/valkey.conf and
+// make it the first argument of valkey-server.
+config_file(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, CONFIG_FILE_PATH, 493)
+    string[] args = []
+    args.push(CONFIG_FILE_PATH)
+    for a in tc.req_cmd(_ctx) { args.push(a) }
+    tc.cmd(_ctx, args)
+}
+
+// Run a Valkey container (Go's valkey.Run).
+builder run(image: string) with valkey_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = valkey_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run valkey: ${err}" }
+    return c, ""
+}
+
+// "redis://host:port" (Go's ConnectionString without TLS).
+connection_string(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, PORT, "redis")
+}

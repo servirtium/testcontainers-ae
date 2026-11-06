@@ -1,0 +1,216 @@
+// Ported from testcontainers-go network/network_test.go, from_dockerfile_test.go, image_test.go, logconsumer_test.go, docker_client_test.go (events)
+//
+// Networks (two containers talking by alias), building an image from a
+// Dockerfile context, log consumers on a followed log, and the engine's
+// event stream.
+
+import std.spec
+import std.string
+import std.json
+import std.os
+import std.sync
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.network
+import testcontainers.wait
+import testcontainers.testing
+
+const ALPINE = "alpine:3"
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "networks") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("lets two containers talk by alias on a user-defined network") callback {
+            n, nerr = network.new_random() { label("purpose", "alias-test"); attachable() }
+            testing.cleanup_network(n)
+            spec.assert_ok(nerr, "network")
+            if nerr != "" { return }
+            web, werr = tc.run("nginx:alpine") {
+                with_network(n.name)
+                network_alias(n.name, "web")
+                network_alias(n.name, "www")
+                expose("80/tcp")
+                wait_for(wait.for_http("/"))
+            }
+            testing.cleanup_container(web)
+            spec.assert_ok(werr, "nginx on the network")
+            cli, cerr = tc.run(ALPINE) {
+                with_network(n.name)
+                cmd(["sleep", "300"])
+            }
+            testing.cleanup_container(cli)
+            spec.assert_ok(cerr, "a client on the network")
+            if werr != "" || cerr != "" { return }
+            code, out, _ = tc.exec(cli, ["wget", "-qO-", "http://web/"])
+            spec.assert_eq(code, 0, "the alias resolves")
+            spec.assert_contains(out, "Welcome to nginx", "and nginx answers")
+            code2, _, _ = tc.exec(cli, ["wget", "-qO-", "http://www/"])
+            spec.assert_eq(code2, 0, "the second alias too")
+            aliases, _ = tc.network_aliases(web, n.name)
+            joined = ""
+            for a in aliases { joined = "${joined}${a} " }
+            spec.assert_contains(joined, "web", "the aliases are reported")
+            nets, _ = tc.networks(web)
+            spec.assert_eq(nets.len, 1, "on one network")
+            spec.assert_str_eq(nets[0], n.name, "ours")
+            doc, ierr = network.inspect(n)
+            spec.assert_ok(ierr, "inspect the network")
+            lv, _ = json.object_get(doc, "Labels")
+            ld, _ = json.encode(lv)
+            spec.assert_contains(ld, "\"org.testcontainers.sessionId\":\"${tc.session_id()}\"", "labelled with the session")
+            spec.assert_contains(ld, "\"purpose\":\"alias-test\"", "and with ours")
+            json.free(doc)
+        }
+
+        spec.it("joins two networks, and removes a network") callback {
+            a, _ = network.new_random()
+            b, _ = network.new_random() { internal() }
+            testing.cleanup_network(a)
+            testing.cleanup_network(b)
+            c, err = tc.run(ALPINE) {
+                with_network(a.name)
+                network_alias(b.name, "second")
+                cmd(["sleep", "300"])
+            }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "run on two networks")
+            nets, _ = tc.networks(c)
+            spec.assert_eq(nets.len, 2, "both networks")
+            ips, _ = tc.container_ips(c)
+            spec.assert_eq(ips.len, 2, "an IP on each")
+            tc.terminate(c)
+            spec.assert_ok(network.remove(a), "remove")
+            spec.assert_ok(network.remove(a), "removing twice is fine")
+            cl, _ = docker.client()
+            _, gerr = docker.inspect_network(cl, a.id)
+            spec.assert_true(docker.is_not_found(gerr), "the engine no longer has it")
+        }
+    }
+
+    spec.describe(fw, "images") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("builds from a Dockerfile context with build args, and removes the image at terminate") callback {
+            c, err = tc.run("") {
+                from_dockerfile("tests/testdata/build", "Dockerfile")
+                build_arg("GREETING", "bonjour")
+                wait_for(wait.for_log("built says"))
+            }
+            spec.assert_ok(err, "built and ran")
+            if err != "" { testing.cleanup_container(c); return }
+            out, _ = tc.logs(c)
+            spec.assert_str_eq(out, "built says bonjour and from the context\n", "the build arg and the context's files")
+            img = tc.image_of(c)
+            spec.assert_true(string.starts_with(img, "testcontainers-ae/") == 1, "a generated tag: ${img}")
+            cl, _ = docker.client()
+            spec.assert_true(docker.image_exists(cl, img), "the image exists")
+            spec.assert_ok(tc.terminate(c), "terminate")
+            spec.assert_false(docker.image_exists(cl, img), "and is gone with the container")
+        }
+
+        spec.it("reports a failing build's error") callback {
+            c, err = tc.run("") {
+                from_dockerfile("tests/testdata/build", "Dockerfile.missing")
+            }
+            testing.cleanup_container(c)
+            spec.assert_null(c, "no container")
+            spec.assert_err(err, "a build error")
+        }
+
+        spec.it("pulls, and knows an image exists") callback {
+            cl, _ = docker.client()
+            spec.assert_ok(docker.pull_image(cl, "alpine:3", ""), "pull (already there: a no-op pull)")
+            spec.assert_true(docker.image_exists(cl, "alpine:3"), "exists")
+            spec.assert_false(docker.image_exists(cl, "testcontainersae/never:0"), "a missing one does not")
+            doc, ierr = docker.image_inspect(cl, "alpine:3")
+            spec.assert_ok(ierr, "inspect")
+            json.free(doc)
+        }
+    }
+
+    spec.describe(fw, "logs") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("feeds log consumers from start to end, stdout and stderr apart") callback {
+            got = ref(0)
+            out_lines = ""
+            err_lines = ""
+            c, err = tc.run(ALPINE) {
+                cmd(["sh", "-c", "echo first; echo oops >&2; sleep 1; echo second; sleep 1; echo done"])
+                log_consumer(|kind: int, line: string| {
+                    if kind == 2 { err_lines = "${err_lines}${line}" } else { out_lines = "${out_lines}${line}" }
+                    ref_set(got, ref_get(got) + 1)
+                })
+                wait_for(wait.for_exit())
+            }
+            spec.assert_ok(err, "run")
+            spec.assert_ok(tc.terminate(c), "terminate waits for the consumers")
+            spec.assert_str_eq(out_lines, "first\nsecond\ndone\n", "stdout, as it came")
+            spec.assert_str_eq(err_lines, "oops\n", "stderr")
+            spec.assert_eq(ref_get(got) as int, 4, "one call a frame")
+            ref_free(got)
+        }
+
+        spec.it("follows a running container's log") callback {
+            c, err = tc.run(ALPINE) { cmd(["sh", "-c", "for i in 1 2 3; do echo n$i; sleep 0.3; done; sleep 300"]) }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "run")
+            // The follower gets a line some time after it is in the log:
+            // Podman tails its log file on a poll, measured at 200-400 ms
+            // behind GET /logs. So wait for the follower itself to see n3
+            // (published through an atomic, the follower being another
+            // thread) instead of a fixed sleep after the log has it.
+            seen = ""
+            got_n3 = sync.atomic_new(0)
+            spec.assert_ok(tc.logs_follow(c, |kind: int, line: string| {
+                seen = "${seen}${line}"
+                if string.contains(line, "n3") == 1 { sync.atomic_store(got_n3, 1) }
+            }), "follow")
+            spec.assert_ok(wait.until_ready(wait.for_log("n3"), c), "the log reached n3")
+            n = 0
+            while sync.atomic_load(got_n3) == 0 && n < 1000 {
+                sleep(10)
+                n = n + 1
+            }
+            spec.assert_eq(sync.atomic_load(got_n3) as int, 1, "the follower reached n3 within 10s")
+            spec.assert_str_eq(seen, "n1\nn2\nn3\n", "the follower saw it all")
+        }
+    }
+
+    spec.describe(fw, "events") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("streams the engine's events for the session") callback {
+            cl, _ = docker.client()
+            f = json.obj()
+            lbl = json.arr()
+            json.push(lbl, json.str("org.testcontainers.sessionId=${tc.session_id()}"))
+            json.set(f, "label", lbl)
+            typ = json.arr()
+            json.push(typ, json.str("container"))
+            json.set(f, "type", typ)
+            s, serr = docker.events_open(cl, f, 0, 0)
+            spec.assert_ok(serr, "open the event stream")
+            if serr != "" { return }
+            c, err = tc.run(ALPINE) { cmd(["sleep", "300"]) }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "run")
+            found = false
+            n = 0
+            while !found && n < 50 {
+                line, ok = docker.stream_next_line(s)
+                if !ok { break }
+                if string.contains(line, "\"start\"") == 1 && string.contains(line, tc.id(c)) == 1 { found = true }
+                n = n + 1
+            }
+            docker.stream_close(s)
+            spec.assert_true(found, "the container's start event arrived")
+        }
+    }
+
+    return spec.run_summary(fw)
+}

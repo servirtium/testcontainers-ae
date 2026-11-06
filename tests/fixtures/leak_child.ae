@@ -1,0 +1,19 @@
+// A test that crashes: it starts a container and a network, prints their
+// ids, and exits without cleaning up. test_reaper.ae runs it as a child
+// process and checks that Ryuk removes both after it is gone.
+
+import std.os
+import testcontainers as tc
+import testcontainers.network
+
+main() {
+    n, nerr = network.new_random()
+    if nerr != "" { println("ERR ${nerr}"); os.exit(2) }
+    c, err = tc.run("alpine:3") { cmd(["sleep", "600"]); with_network(n.name) }
+    if err != "" { println("ERR ${err}"); os.exit(2) }
+    println("CONTAINER ${tc.id(c)}")
+    println("NETWORK ${n.id}")
+    println("REAPER ${tc.reaper_running()}")
+    // no terminate, no network.remove: a crash
+    os.exit(3)
+}

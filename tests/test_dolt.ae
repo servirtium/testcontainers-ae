@@ -1,0 +1,107 @@
+// Ported from testcontainers-go modules/dolt/dolt_test.go
+//
+// A real Dolt SQL server (TestDolt): the DSN is user:password@tcp(host:port)/db,
+// the server's MySQL handshake arrives over std.tcp, and the module's
+// post-start initialization really created the database and the user (checked
+// with `dolt sql` in the container). The root-user rule and the empty
+// password refusal are checked on the credentials alone.
+
+import std.spec
+import std.string
+import std.tcp
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.dolt
+
+const IMAGE = "dolthub/dolt-sql-server:1.32.4"
+
+fn greeting(host: string, port: int) -> (int, string, string) {
+    sock, cerr = tcp.connect(host, port)
+    if cerr != "" { return 0, "", cerr }
+    buf = ""
+    total = 0
+    tries = 0
+    while tries < 100 && total < 16 {
+        chunk, n, rerr = tcp.read_n(sock, 512)
+        if rerr != "" && rerr != "timeout" { tcp.tcp_close(sock); return 0, "", rerr }
+        if n > 0 {
+            if total == 0 { buf = chunk }
+            else { buf = string.concat(buf, chunk) }
+            total = total + n
+        }
+        tries = tries + 1
+    }
+    tcp.tcp_close(sock)
+    if total < 6 { return 0, "", "short greeting (${total} bytes)" }
+    proto = string.char_at_n(buf, total, 4)
+    ver = ""
+    i = 5
+    while i < total {
+        ch = string.char_at_n(buf, total, i)
+        if ch == 0 { i = total } else { ver = "${ver}${string.from_char(ch)}"; i = i + 1 }
+    }
+    return proto, ver, ""
+}
+
+fn sql_out(c: *docker.Container, q: string) -> (string, string) {
+    code, out, err = tc.exec(c, ["dolt", "sql", "-r", "csv", "-q", q])
+    if err != "" { return "", err }
+    if code != 0 { return "", "exit ${code}: ${out}" }
+    return out, ""
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/dolt") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("starts with the defaults and initializes the database and user (TestDolt)") callback {
+            d, err = dolt.run(IMAGE)
+            if d != null { testing.cleanup_container(d.container) }
+            spec.assert_ok(err, "dolt starts and initializes")
+            if err == "" {
+                ep, _ = tc.endpoint(d.container, dolt.PORT, "")
+                dsn, derr = dolt.connection_string(d, "")
+                spec.assert_ok(derr, "connection string")
+                spec.assert_str_eq(dsn, "test:test@tcp(${ep})/test", "the default DSN")
+                with_args, _ = dolt.connection_string(d, "tls=skip-verify")
+                spec.assert_str_eq(with_args, "test:test@tcp(${ep})/test?tls=skip-verify", "args after ?")
+
+                h, _ = tc.host(d.container)
+                port, perr = tc.mapped_port(d.container, dolt.PORT)
+                spec.assert_ok(perr, "mapped port")
+                proto, ver, gerr = greeting(h, port)
+                spec.assert_ok(gerr, "read the greeting from ${h}:${port}")
+                spec.assert_eq(proto, 10, "handshake protocol version 10")
+
+                dbs, serr = sql_out(d.container, "SHOW DATABASES")
+                spec.assert_ok(serr, "SHOW DATABASES")
+                spec.assert_contains(dbs, "test", "the database exists: ${dbs}")
+                users, uerr = sql_out(d.container, "SELECT user FROM mysql.user")
+                spec.assert_ok(uerr, "list users")
+                spec.assert_contains(users, "test", "the user exists: ${users}")
+            }
+        }
+
+        spec.it("root needs no password; another user does (TestDoltWithNonRootUserAndEmptyPassword)") callback {
+            r = dolt.dolt_request_new()
+            tc.env(r, "DOLT_USER", "ROOT")
+            dolt.default_credentials(r)
+            spec.assert_true(tc.req_has_env(r, "DOLT_USER") == false, "root drops DOLT_USER")
+            spec.assert_true(tc.req_has_env(r, "DOLT_PASSWORD") == false, "root drops DOLT_PASSWORD")
+            dolt.dolt_request_free(r)
+
+            d, err = dolt.run(IMAGE) {
+                username("alice")
+                password("")
+            }
+            if d != null { testing.cleanup_container(d.container) }
+            spec.assert_contains(err, "empty password can be used only with the root user", "the credentials check")
+            spec.assert_true(d == null, "no container was started")
+        }
+    }
+    return spec.run_summary(fw)
+}

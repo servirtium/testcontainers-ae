@@ -1,0 +1,124 @@
+// Ported from testcontainers-go modules/openldap/openldap.go
+//
+// modules.openldap: an OpenLDAP container (bitnami's image, slapd on 1389).
+// Like Go's OpenLDAPContainer, the result carries the admin credentials and
+// the root DN, so a test can bind with them:
+//
+//     import modules.openldap
+//
+//     ol, err = openldap.run("bitnamilegacy/openldap:2.6.6") {
+//         admin_username("openldap")
+//         admin_password("secret")
+//         root("dc=mydomain,dc=com")
+//         initial_ldif("testdata/users.ldif")
+//     }
+//     defer tc.terminate(ol.container)
+//     url, _ = openldap.connection_string(ol)       // "ldap://localhost:32771"
+//     dn = openldap.admin_dn(ol)                    // "cn=openldap,dc=mydomain,dc=com"
+//     err = openldap.load_ldif(ol, ldif_text)       // ldapadd inside the container
+//
+// Differences from Go: the credentials are read from the request the caller's
+// block built (as modules/postgres does) rather than from Inspect afterwards;
+// the effect is the same. initial_ldif runs ldapadd as an after-ready command
+// that takes the credentials from the container's own environment, so it
+// follows whatever the block set. Go's examples bind and search with
+// go-ldap, which is not ported; the test binds with one hand-built BER
+// BindRequest. Not ported: the deprecated RunContainer.
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    OpenLDAPContainer, run, connection_string, load_ldif, admin_dn,
+    admin_username, admin_password, root, initial_ldif,
+    PORT, DEFAULT_IMAGE, DEFAULT_USER, DEFAULT_PASSWORD, DEFAULT_ROOT,
+    openldap_request_new, openldap_request_free
+)
+
+const PORT = "1389/tcp"
+const DEFAULT_IMAGE = "bitnamilegacy/openldap:2.6.6"
+const DEFAULT_USER = "admin"
+const DEFAULT_PASSWORD = "adminpassword"
+const DEFAULT_ROOT = "dc=example,dc=org"
+const INITIAL_LDIF_PATH = "/initial_ldif.ldif"
+
+struct OpenLDAPContainer {
+    container: *docker.Container
+    admin_username: string
+    admin_password: string
+    root_dn: string
+}
+
+// Go's moduleOpts: default credentials and root, the port, the slapd log
+// line and the port listening.
+openldap_request_new() -> ptr {
+    r = tc.request_new()
+    tc.env(r, "LDAP_ADMIN_USERNAME", DEFAULT_USER)
+    tc.env(r, "LDAP_ADMIN_PASSWORD", DEFAULT_PASSWORD)
+    tc.env(r, "LDAP_ROOT", DEFAULT_ROOT)
+    tc.expose(r, PORT)
+    tc.wait_for(r, wait.for_all([
+        wait.for_log("** Starting slapd **"),
+        wait.for_listening_port(PORT)
+    ]))
+    return r
+}
+
+openldap_request_free(p: ptr) { tc.request_free(p) }
+
+// ---- options ----
+
+// Go's WithAdminUsername.
+admin_username(_ctx: ptr, username: string) { tc.env(_ctx, "LDAP_ADMIN_USERNAME", username) }
+// Go's WithAdminPassword.
+admin_password(_ctx: ptr, password: string) { tc.env(_ctx, "LDAP_ADMIN_PASSWORD", password) }
+// Go's WithRoot.
+root(_ctx: ptr, root_dn: string) { tc.env(_ctx, "LDAP_ROOT", root_dn) }
+
+// Go's WithInitialLdif: copy the host file into the container and ldapadd it
+// once the server is ready. The credentials come from the container's env.
+initial_ldif(_ctx: ptr, host_path: string) {
+    tc.file(_ctx, host_path, INITIAL_LDIF_PATH, 420)
+    tc.after_ready_command(_ctx, ["sh", "-c",
+        "ldapadd -H ldap://localhost:1389 -x -D \"cn=$LDAP_ADMIN_USERNAME,$LDAP_ROOT\" -w \"$LDAP_ADMIN_PASSWORD\" -f ${INITIAL_LDIF_PATH}"])
+}
+
+builder run(image: string) with openldap_request_new -> (*OpenLDAPContainer, string) {
+    r = _builder
+    if r == null { r = openldap_request_new() }
+    user = tc.req_env(r, "LDAP_ADMIN_USERNAME")
+    pw = tc.req_env(r, "LDAP_ADMIN_PASSWORD")
+    root_dn = tc.req_env(r, "LDAP_ROOT")
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run openldap: ${err}" }
+    ol = heap.new(OpenLDAPContainer)
+    ol.container = c
+    ol.admin_username = user
+    ol.admin_password = pw
+    ol.root_dn = root_dn
+    if err != "" { return ol, "run openldap: ${err}" }
+    return ol, ""
+}
+
+// "ldap://host:port" (Go's ConnectionString).
+connection_string(ol: *OpenLDAPContainer) -> (string, string) {
+    return tc.endpoint(ol.container, PORT, "ldap")
+}
+
+// The admin's bind DN: cn=<username>,<root> (what Go's LoadLdif binds as).
+admin_dn(ol: *OpenLDAPContainer) -> string {
+    return "cn=${ol.admin_username},${ol.root_dn}"
+}
+
+// Go's LoadLdif: copy the LDIF text into the container and ldapadd it as the admin.
+load_ldif(ol: *OpenLDAPContainer, ldif: string) -> string {
+    err = tc.copy_to_container(ol.container, ldif, "/tmp/ldif.ldif", 420)
+    if err != "" { return err }
+    code, out, eerr = tc.exec(ol.container, ["ldapadd", "-H", "ldap://localhost:1389", "-x",
+        "-D", admin_dn(ol), "-w", ol.admin_password, "-f", "/tmp/ldif.ldif"])
+    if eerr != "" { return eerr }
+    if code != 0 { return out }
+    return ""
+}

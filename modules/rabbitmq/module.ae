@@ -1,0 +1,157 @@
+// Ported from testcontainers-go modules/rabbitmq/rabbitmq.go, modules/rabbitmq/options.go, modules/rabbitmq/mounts/rabbitmq-testcontainers.conf.tpl
+//
+// modules.rabbitmq: a RabbitMQ container. Like Go's, `run` returns a struct
+// that holds the container and the admin credentials, which the URL helpers
+// put in the AMQP URLs.
+//
+//     import modules.rabbitmq
+//
+//     r, err = rabbitmq.run("rabbitmq:3.12.11-management-alpine") {
+//         admin_username("alice")
+//         admin_password("s3cret")
+//     }
+//     defer tc.terminate(r.container)
+//     url, _ = rabbitmq.amqp_url(r)        // "amqp://alice:s3cret@localhost:32771"
+//     http, _ = rabbitmq.http_url(r)       // "http://localhost:32772" (management UI/API)
+//
+// Go renders the node config from a text/template; here it is built with
+// string interpolation in `run`, after the caller's block, from the admin
+// credentials the block set (kept in the request's RABBITMQ_DEFAULT_USER /
+// RABBITMQ_DEFAULT_PASS env, which the image also reads). The ssl() option's
+// config fragment travels from the block to `run` as the module setting
+// "rabbitmq.ssl_conf" (tc.set_setting), which is not sent to the engine.
+//
+// Not ported: Go's RunContainer (deprecated), and the SSLVerificationMode
+// type (a plain string here: SSL_VERIFY_NONE / SSL_VERIFY_PEER).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    RabbitMQContainer, run, amqp_url, amqps_url, http_url, https_url,
+    admin_username, admin_password, ssl,
+    AMQP_PORT, AMQPS_PORT, HTTP_PORT, HTTPS_PORT, DEFAULT_IMAGE,
+    DEFAULT_USER, DEFAULT_PASSWORD, CUSTOM_CONF_PATH,
+    SSL_VERIFY_NONE, SSL_VERIFY_PEER,
+    rabbitmq_request_new, rabbitmq_request_free
+)
+
+const AMQP_PORT = "5672/tcp"
+const AMQPS_PORT = "5671/tcp"
+const HTTP_PORT = "15672/tcp"
+const HTTPS_PORT = "15671/tcp"
+const DEFAULT_IMAGE = "rabbitmq:3.12.11-management-alpine"
+const DEFAULT_USER = "guest"
+const DEFAULT_PASSWORD = "guest"
+const CUSTOM_CONF_PATH = "/etc/rabbitmq/rabbitmq-testcontainers.conf"
+
+const SSL_VERIFY_NONE = "verify_none"
+const SSL_VERIFY_PEER = "verify_peer"
+
+const SSL_SETTING = "rabbitmq.ssl_conf"
+const CA_CERT_PATH = "/etc/rabbitmq/ca_cert.pem"
+const CERT_PATH = "/etc/rabbitmq/rabbitmq_cert.pem"
+const KEY_PATH = "/etc/rabbitmq/rabbitmq_key.pem"
+
+struct RabbitMQContainer {
+    container: *docker.Container
+    admin_username: string
+    admin_password: string
+}
+
+// The module's defaults: guest/guest, the four ports, and the wait for
+// "Server startup complete" (a regexp, as in Go).
+rabbitmq_request_new() -> ptr {
+    r = tc.request_new()
+    tc.env(r, "RABBITMQ_DEFAULT_USER", DEFAULT_USER)
+    tc.env(r, "RABBITMQ_DEFAULT_PASS", DEFAULT_PASSWORD)
+    tc.expose(r, AMQP_PORT)
+    tc.expose(r, AMQPS_PORT)
+    tc.expose(r, HTTPS_PORT)
+    tc.expose(r, HTTP_PORT)
+    tc.wait_for(r, wait.for_log(".*Server startup complete.*") { as_regexp(); with_startup_timeout(60s) })
+    return r
+}
+
+rabbitmq_request_free(p: ptr) { tc.request_free(p) }
+
+// ---- options ----
+
+// Go's WithAdminUsername / WithAdminPassword.
+admin_username(_ctx: ptr, username: string) { tc.env(_ctx, "RABBITMQ_DEFAULT_USER", username) }
+admin_password(_ctx: ptr, password: string) { tc.env(_ctx, "RABBITMQ_DEFAULT_PASS", password) }
+
+// Go's WithSSL(SSLSettings{...}): the CA, certificate and key files are
+// copied into /etc/rabbitmq, the plain TCP listener is replaced by an SSL one
+// on 5671, and the wait also needs the TLS listener's log line.
+// verification_mode is SSL_VERIFY_NONE or SSL_VERIFY_PEER.
+ssl(_ctx: ptr, ca_cert_file: string, cert_file: string, key_file: string, verification_mode: string, fail_if_no_cert: bool, verification_depth: int) {
+    tc.file(_ctx, ca_cert_file, CA_CERT_PATH, 420)
+    tc.file(_ctx, cert_file, CERT_PATH, 420)
+    tc.file(_ctx, key_file, KEY_PATH, 420)
+    fail = "false"
+    if fail_if_no_cert { fail = "true" }
+    frag = "listeners.tcp = none\n"
+    frag = "${frag}listeners.ssl.default = 5671\n"
+    frag = "${frag}ssl_options.cacertfile = ${CA_CERT_PATH}\n"
+    frag = "${frag}ssl_options.certfile = ${CERT_PATH}\n"
+    frag = "${frag}ssl_options.keyfile = ${KEY_PATH}\n"
+    frag = "${frag}ssl_options.depth = ${verification_depth}\n"
+    frag = "${frag}ssl_options.verify = ${verification_mode}\n"
+    frag = "${frag}ssl_options.fail_if_no_peer_cert = ${fail}\n"
+    tc.set_setting(_ctx, SSL_SETTING, frag)
+    tc.additional_wait(_ctx, wait.for_log("started TLS (SSL) listener on [::]:5671"))
+}
+
+// The node config Go renders from its template.
+fn render_config(user: string, pass: string, ssl_conf: string) -> string {
+    out = "# Injected by testcontainers\n"
+    out = "${out}default_user = ${user}\n"
+    out = "${out}default_pass = ${pass}\n"
+    if string.length(ssl_conf) > 0 { out = "${out}\n${ssl_conf}" }
+    return out
+}
+
+// Run a RabbitMQ container (Go's rabbitmq.Run).
+builder run(image: string) with rabbitmq_request_new -> (*RabbitMQContainer, string) {
+    r = _builder
+    if r == null { r = rabbitmq_request_new() }
+    user = tc.req_env(r, "RABBITMQ_DEFAULT_USER")
+    pass = tc.req_env(r, "RABBITMQ_DEFAULT_PASS")
+    tc.file_content(r, render_config(user, pass, tc.req_setting(r, SSL_SETTING)), CUSTOM_CONF_PATH, 420)
+    tc.env(r, "RABBITMQ_CONFIG_FILE", CUSTOM_CONF_PATH)
+    c, err = tc.run_request(r, image)
+    if c == null { return null, "run rabbitmq: ${err}" }
+    rc = heap.new(RabbitMQContainer)
+    rc.container = c
+    rc.admin_username = user
+    rc.admin_password = pass
+    if err != "" { return rc, "run rabbitmq: ${err}" }
+    return rc, ""
+}
+
+// "amqp://user:password@host:port" (Go's AmqpURL).
+amqp_url(r: *RabbitMQContainer) -> (string, string) {
+    ep, err = tc.endpoint(r.container, AMQP_PORT, "")
+    if err != "" { return "", err }
+    return "amqp://${r.admin_username}:${r.admin_password}@${ep}", ""
+}
+
+// "amqps://user:password@host:port" (Go's AmqpsURL).
+amqps_url(r: *RabbitMQContainer) -> (string, string) {
+    ep, err = tc.endpoint(r.container, AMQPS_PORT, "")
+    if err != "" { return "", err }
+    return "amqps://${r.admin_username}:${r.admin_password}@${ep}", ""
+}
+
+// "http://host:port", the management UI and API (Go's HttpURL).
+http_url(r: *RabbitMQContainer) -> (string, string) {
+    return tc.endpoint(r.container, HTTP_PORT, "http")
+}
+
+// "https://host:port" (Go's HttpsURL).
+https_url(r: *RabbitMQContainer) -> (string, string) {
+    return tc.endpoint(r.container, HTTPS_PORT, "https")
+}

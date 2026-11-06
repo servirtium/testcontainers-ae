@@ -1,0 +1,68 @@
+// Ported from testcontainers-go modules/s3mock/s3mock.go
+//
+// modules.s3mock: an Adobe S3Mock container (an S3-compatible API for tests).
+//
+//     import modules.s3mock
+//
+//     c, err = s3mock.run("adobe/s3mock:3.9.1") {
+//         initial_buckets(["a", "b"])
+//     }
+//     defer tc.terminate(c)
+//     url, _ = s3mock.endpoint_url(c)          // "http://localhost:32771"
+//     surl, _ = s3mock.https_endpoint_url(c)   // "https://localhost:32772"
+//
+// Nothing is left out (the Go module has no S3 client helper).
+
+import std.string
+import testcontainers as tc
+import testcontainers.wait
+import testcontainers.docker
+
+exports(
+    run, initial_buckets, endpoint_url, https_endpoint_url,
+    HTTP_PORT, HTTPS_PORT, DEFAULT_IMAGE, s3mock_request_new, s3mock_request_free
+)
+
+const HTTP_PORT = "9090/tcp"
+const HTTPS_PORT = "9191/tcp"
+const DEFAULT_IMAGE = "adobe/s3mock:3.9.1"
+
+s3mock_request_new() -> ptr {
+    r = tc.request_new()
+    tc.expose(r, HTTP_PORT)
+    tc.expose(r, HTTPS_PORT)
+    tc.wait_for(r, wait.for_http("/favicon.ico") { with_port(HTTP_PORT) })
+    return r
+}
+
+s3mock_request_free(p: ptr) { tc.request_free(p) }
+
+// Go's WithInitialBuckets: buckets created at start (no-op for an empty list).
+initial_buckets(_ctx: ptr, buckets: string[]) {
+    joined = ""
+    for b in buckets {
+        if string.length(joined) > 0 { joined = "${joined}," }
+        joined = "${joined}${b}"
+    }
+    if string.length(joined) == 0 { return }
+    tc.env(_ctx, "COM_ADOBE_TESTING_S3MOCK_DOMAIN_INITIAL_BUCKETS", joined)
+    tc.env(_ctx, "COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS", joined)
+}
+
+builder run(image: string) with s3mock_request_new -> (*docker.Container, string) {
+    r = _builder
+    if r == null { r = s3mock_request_new() }
+    c, err = tc.run_request(r, image)
+    if err != "" { return c, "run s3mock: ${err}" }
+    return c, ""
+}
+
+// "http://host:port" of the HTTP endpoint.
+endpoint_url(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, HTTP_PORT, "http")
+}
+
+// "https://host:port" of the HTTPS endpoint (self-signed certificate).
+https_endpoint_url(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, HTTPS_PORT, "https")
+}

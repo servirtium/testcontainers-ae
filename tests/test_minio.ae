@@ -1,0 +1,146 @@
+// Ported from testcontainers-go modules/minio/minio_test.go
+//
+// A real MinIO: /minio/health/live answers 200, and the S3 API is called with
+// AWS Signature V4 (signed here with std.cryptography's HMAC-SHA256): a
+// ListBuckets and a CreateBucket / ListBuckets / DeleteBucket round trip are
+// accepted with the module's credentials and refused (403) with the default
+// ones or a wrong secret, which shows the credentials took effect.
+// Go's test uses the minio-go client, which has no Aether counterpart.
+
+import std.spec
+import std.string
+import std.http.client
+import std.cryptography
+import std.time
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.minio
+
+// Go's quay.io/minio/minio image is no longer pullable (MinIO stopped publishing
+// community images); Chainguard's build of upstream MinIO is.
+const IMAGE = "cgr.dev/chainguard/minio:latest"
+const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+fn hmac_raw(key: string, msg: string) -> string {
+    d, _, _ = cryptography.hmac_sha256_bytes(string.bytes(key), string.bytes(msg))
+    return d
+}
+
+fn hmac_hex(key: string, msg: string) -> string {
+    h, _ = cryptography.hmac_sha256_hex(string.bytes(key), string.bytes(msg))
+    return h
+}
+
+// A signed S3 request with an empty body: (status, body, error).
+fn s3(method: string, hostport: string, path: string, access: string, secret: string) -> (int, string, string) {
+    now = time.now()
+    amz_date = time.strftime(now, "%Y%m%dT%H%M%SZ")
+    day = time.strftime(now, "%Y%m%d")
+    scope = "${day}/us-east-1/s3/aws4_request"
+    signed = "host;x-amz-content-sha256;x-amz-date"
+    canon = "${method}\n${path}\n\nhost:${hostport}\nx-amz-content-sha256:${EMPTY_SHA256}\nx-amz-date:${amz_date}\n\n${signed}\n${EMPTY_SHA256}"
+    ch, _ = cryptography.sha256_hex(string.bytes(canon))
+    to_sign = "AWS4-HMAC-SHA256\n${amz_date}\n${scope}\n${ch}"
+    k1 = hmac_raw("AWS4${secret}", day)
+    k2 = hmac_raw(k1, "us-east-1")
+    k3 = hmac_raw(k2, "s3")
+    k4 = hmac_raw(k3, "aws4_request")
+    sig = hmac_hex(k4, to_sign)
+    req = client.request(method, "http://${hostport}${path}")
+    client.set_timeout(req, 10s)
+    client.set_header(req, "x-amz-date", amz_date)
+    client.set_header(req, "x-amz-content-sha256", EMPTY_SHA256)
+    client.set_header(req, "Authorization", "AWS4-HMAC-SHA256 Credential=${access}/${scope}, SignedHeaders=${signed}, Signature=${sig}")
+    r, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return 0, "", err }
+    status = client.response_status(r)
+    body = client.response_body(r)
+    client.response_free(r)
+    return status, body, ""
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/minio") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("runs with the given credentials (TestMinio)") callback {
+            m, err = minio.run(IMAGE) {
+                username("thisismyuser")
+                password("thisismypassword")
+            }
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "minio starts")
+            if err == "" {
+                spec.assert_str_eq(m.username, "thisismyuser", "the struct carries the user")
+                spec.assert_str_eq(m.password, "thisismypassword", "the struct carries the password")
+                hp, cerr = minio.connection_string(m)
+                spec.assert_ok(cerr, "connection string")
+                spec.assert_true(string.starts_with(hp, "localhost:") == 1, "host:port, no scheme: ${hp}")
+
+                live, _, lerr = s3("GET", hp, "/minio/health/live", "x", "y")
+                spec.assert_ok(lerr, "GET /minio/health/live")
+                spec.assert_eq(live, 200, "the health endpoint is live")
+
+                anon = client.request("GET", "http://${hp}/")
+                r, aerr = client.send_request(anon)
+                client.request_free(anon)
+                spec.assert_ok(aerr, "anonymous GET /")
+                if aerr == "" {
+                    spec.assert_eq(client.response_status(r), 403, "anonymous listing is refused")
+                    client.response_free(r)
+                }
+
+                ok, body, e1 = s3("GET", hp, "/", m.username, m.password)
+                spec.assert_ok(e1, "signed GET /")
+                spec.assert_eq(ok, 200, "the module's credentials are accepted")
+                spec.assert_contains(body, "ListAllMyBucketsResult", "a bucket listing")
+
+                bad, _, e2 = s3("GET", hp, "/", m.username, "not-the-password")
+                spec.assert_ok(e2, "wrong secret")
+                spec.assert_eq(bad, 403, "a wrong secret is refused")
+                dflt, _, e3 = s3("GET", hp, "/", minio.DEFAULT_USER, minio.DEFAULT_PASSWORD)
+                spec.assert_ok(e3, "default credentials")
+                spec.assert_eq(dflt, 403, "the default credentials no longer work")
+
+                mk, _, e4 = s3("PUT", hp, "/tcae-bucket", m.username, m.password)
+                spec.assert_ok(e4, "create bucket")
+                spec.assert_eq(mk, 200, "CreateBucket")
+                s5, list, e5 = s3("GET", hp, "/", m.username, m.password)
+                spec.assert_ok(e5, "list buckets")
+                spec.assert_eq(s5, 200, "ListBuckets")
+                spec.assert_contains(list, "<Name>tcae-bucket</Name>", "the new bucket is listed")
+                rm, _, e6 = s3("DELETE", hp, "/tcae-bucket", m.username, m.password)
+                spec.assert_ok(e6, "delete bucket")
+                spec.assert_eq(rm, 204, "DeleteBucket")
+            }
+        }
+
+        spec.it("defaults to minioadmin/minioadmin") callback {
+            m, err = minio.run(IMAGE)
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "minio starts")
+            if err == "" {
+                spec.assert_str_eq(m.username, "minioadmin", "default user")
+                spec.assert_str_eq(m.password, "minioadmin", "default password")
+                hp, _ = minio.connection_string(m)
+                ok, _, e1 = s3("GET", hp, "/", "minioadmin", "minioadmin")
+                spec.assert_ok(e1, "signed GET /")
+                spec.assert_eq(ok, 200, "the defaults are accepted")
+            }
+        }
+
+        spec.it("refuses an empty password before creating anything") callback {
+            m, err = minio.run(IMAGE) {
+                password("")
+            }
+            spec.assert_true(m == null, "no container")
+            spec.assert_contains(err, "username or password has not been set", "Go's validateCreds message")
+        }
+    }
+    return spec.run_summary(fw)
+}

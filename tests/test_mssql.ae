@@ -1,0 +1,129 @@
+// Ported from testcontainers-go modules/mssql/mssql_test.go (TestMSSQLServer,
+// TestMSSQLServerWithMissingEulaOption, TestMSSQLServerWithConnectionStringParameters,
+// TestMSSQLServerWithCustomStrongPassword) and examples_test.go (WithInitSQL)
+//
+// A real SQL Server (amd64 only: emulated here, so slow, and it may not run
+// at all under every emulator). The EULA check is local. One TDS exchange on
+// the mapped port: a PRELOGIN packet answered by a tabular-result packet. The
+// custom password and the seed script are checked with sqlcmd in the container.
+
+import std.spec
+import std.string
+import std.tcp
+import std.bytes
+import testcontainers as tc
+import testcontainers.docker
+import testcontainers.testing
+import modules.mssql
+
+const IMAGE = "mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04"
+
+// A TDS PRELOGIN: header (type 0x12, last packet, length 26), the VERSION and
+// ENCRYPTION options (ENCRYPT_NOT_SUP), the terminator and the option data.
+fn prelogin() -> ptr {
+    b = bytes.new(32)
+    bytes.set(b, 0, 18)
+    bytes.set(b, 1, 1)
+    bytes.set_be16(b, 2, 26)
+    bytes.set_be16(b, 4, 0)
+    bytes.set(b, 6, 1)
+    bytes.set(b, 7, 0)
+    bytes.set(b, 8, 0)
+    bytes.set_be16(b, 9, 11)
+    bytes.set_be16(b, 11, 6)
+    bytes.set(b, 13, 1)
+    bytes.set_be16(b, 14, 17)
+    bytes.set_be16(b, 16, 1)
+    bytes.set(b, 18, 255)
+    bytes.set_be32(b, 19, 0)
+    bytes.set_be16(b, 23, 0)
+    bytes.set(b, 25, 2)
+    bytes.set_length(b, 26)
+    return b
+}
+
+// Read n bytes of the response header as hex.
+fn read_hex(sock: ptr, n: int) -> (string, string) {
+    buf = bytes.new(n + 16)
+    got = 0
+    tries = 0
+    out = ""
+    while got < n && tries < 200 {
+        cv = bytes.capacity_view(buf)
+        m, rerr = tcp.read_into(sock, cv[got..n])
+        if rerr != "" && rerr != "timeout" { bytes.free(buf); return "", rerr }
+        got = got + m
+        tries = tries + 1
+    }
+    if got < n { bytes.free(buf); return "", "short read: ${got} of ${n} bytes" }
+    v = bytes.capacity_view(buf)
+    i = 0
+    while i < n {
+        d = v[i] & 255
+        hexd = "0123456789abcdef"
+        out = "${out}${string.substring(hexd, d / 16, d / 16 + 1)}${string.substring(hexd, d % 16, d % 16 + 1)}"
+        i = i + 1
+    }
+    bytes.free(buf)
+    return out, ""
+}
+
+fn sqlcmd(m: *mssql.MSSQLServerContainer, sql: string) -> (int, string, string) {
+    return tc.exec(m.container, ["sh", "-c", "PATH=/opt/mssql-tools18/bin:/opt/mssql-tools/bin:$PATH sqlcmd -S localhost -U sa -P '${mssql.password_of(m)}' -No -h -1 -W -Q \"${sql}\""])
+}
+
+main() {
+    fw = spec.init()
+    if testing.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
+
+    spec.describe(fw, "modules/mssql") {
+        spec.after_each() callback { testing.cleanup_all() }
+
+        spec.it("refuses to start without the EULA (TestMSSQLServerWithMissingEulaOption)") callback {
+            m, err = mssql.run(IMAGE)
+            spec.assert_true(m == null, "no container")
+            spec.assert_contains(err, "EULA not accepted", "the error says why")
+            m2, err2 = mssql.run(IMAGE) { tc.env("ACCEPT_EULA", "yes") }
+            spec.assert_true(m2 == null, "no container for ACCEPT_EULA=yes")
+            spec.assert_contains(err2, "EULA not accepted", "only Y is accepted")
+        }
+
+        spec.it("answers a TDS PRELOGIN and runs the seed script (TestMSSQLServer, TestMSSQLServerWithCustomStrongPassword)") callback {
+            m, err = mssql.run(IMAGE) {
+                accept_eula()
+                password("Strong@Passw0rd")
+                init_sql("modules/mssql/testdata/seed.sql")
+            }
+            if m != null { testing.cleanup_container(m.container) }
+            spec.assert_ok(err, "sql server starts")
+            if err == "" {
+                spec.assert_str_eq(mssql.password_of(m), "Strong@Passw0rd", "the password is read back")
+                url, uerr = mssql.connection_string(m, ["encrypt=false", "TrustServerCertificate=true"])
+                spec.assert_ok(uerr, "connection string")
+                spec.assert_true(string.starts_with(url, "sqlserver://sa:Strong@Passw0rd@localhost:") == 1, "a sqlserver:// URL: ${url}")
+                spec.assert_true(string.ends_with(url, "?encrypt=false&TrustServerCertificate=true") == 1, "with the extra arguments")
+
+                h, _ = tc.host(m.container)
+                port, perr = tc.mapped_port(m.container, mssql.PORT)
+                spec.assert_ok(perr, "mapped port")
+                sock, cerr = tcp.connect(h, port)
+                spec.assert_ok(cerr, "connect")
+                if cerr == "" {
+                    req = prelogin()
+                    _, werr = tcp.write_all(sock, bytes.view(req))
+                    bytes.free(req)
+                    spec.assert_ok(werr, "write PRELOGIN")
+                    hex, rerr = read_hex(sock, 8)
+                    spec.assert_ok(rerr, "read the response header")
+                    spec.assert_str_eq(string.substring(hex, 0, 4), "0401", "a tabular result, last packet")
+                    tcp.close(sock)
+                }
+                code, out, xerr = sqlcmd(m, "SELECT COUNT(*) FROM pizza_palace.pizzas")
+                spec.assert_ok(xerr, "sqlcmd")
+                spec.assert_eq(code, 0, "sqlcmd exits 0: ${out}")
+                spec.assert_contains(out, "2", "the seed script created two pizzas")
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}
