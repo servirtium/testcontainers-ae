@@ -3,6 +3,8 @@
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -12,6 +14,7 @@
 
 ```
 Cache-Control: must-revalidate
+Content-Length: 247
 Content-Type: application/json
 Server: CouchDB/3.5.3 (Erlang OTP/27)
 ```
@@ -27,6 +30,8 @@ Server: CouchDB/3.5.3 (Erlang OTP/27)
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -36,6 +41,7 @@ Server: CouchDB/3.5.3 (Erlang OTP/27)
 
 ```
 Cache-Control: must-revalidate
+Content-Length: 27
 Content-Type: application/json
 Server: CouchDB/3.5.3 (Erlang OTP/27)
 ```
@@ -51,6 +57,8 @@ Server: CouchDB/3.5.3 (Erlang OTP/27)
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -60,6 +68,7 @@ Server: CouchDB/3.5.3 (Erlang OTP/27)
 
 ```
 Cache-Control: must-revalidate
+Content-Length: 64
 Content-Type: application/json
 Server: CouchDB/3.5.3 (Erlang OTP/27)
 ```
@@ -76,6 +85,8 @@ Server: CouchDB/3.5.3 (Erlang OTP/27)
 
 ```
 Authorization: Basic REDACTED[admin-wrong-password]
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -85,6 +96,7 @@ Authorization: Basic REDACTED[admin-wrong-password]
 
 ```
 Cache-Control: must-revalidate
+Content-Length: 67
 Content-Type: application/json
 Server: CouchDB/3.5.3 (Erlang OTP/27)
 ```
@@ -101,6 +113,8 @@ Server: CouchDB/3.5.3 (Erlang OTP/27)
 
 ```
 Authorization: Basic REDACTED[admin]
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -110,6 +124,7 @@ Authorization: Basic REDACTED[admin]
 
 ```
 Cache-Control: must-revalidate
+Content-Length: 12
 Content-Type: application/json
 Location: http://{{request.host}}/tcae_db
 Server: CouchDB/3.5.3 (Erlang OTP/27)
@@ -127,6 +142,8 @@ Server: CouchDB/3.5.3 (Erlang OTP/27)
 
 ```
 Authorization: Basic REDACTED[admin]
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -136,6 +153,7 @@ Authorization: Basic REDACTED[admin]
 
 ```
 Cache-Control: must-revalidate
+Content-Length: 464
 Content-Type: application/json
 Server: CouchDB/3.5.3 (Erlang OTP/27)
 ```

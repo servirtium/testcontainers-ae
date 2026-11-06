@@ -3,6 +3,8 @@
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -13,6 +15,8 @@
 ```
 content-type: application/json; charset=utf-8
 version: 5.15.0
+connection: keep-alive
+content-length: 117
 ```
 ### Response body recorded for playback (200: application/json; charset=utf-8):
 

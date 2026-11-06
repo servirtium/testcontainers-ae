@@ -75,7 +75,7 @@ Per suite (registered at the top of its `main`):
 |---|---|---|---|---|
 | vault | UUIDs (request and cluster ids) | `vault-cluster-<hex>`, RFC 3339 times, Unix times | the root token in `X-Vault-Token` | |
 | couchdb | the 32-hex server uuid | Unix start times, `*_seq` tokens | each `Authorization: Basic` credential, as `REDACTED[<label>]` | `X-Couch-Request-ID`, `X-CouchDB-Body-Time` |
-| consul | the node id | Raft indexes, runtime counters, `cpu_count`, `arch` in `/v1/agent/self` | | `X-Consul-Index` |
+| consul | the node id | Raft indexes (the `X-Consul-Index` header's value too), runtime counters, `cpu_count`, `arch` in `/v1/agent/self` | | |
 | openfga | the store's ULID (it comes back in a later request path, and the token round-trips) | RFC 3339 times | | |
 | typesense | | `created_at` | each `X-TYPESENSE-API-KEY`, as `REDACTED[<key>]` | |
 | mockserver | the expectation's UUID | | | |

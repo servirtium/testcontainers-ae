@@ -3,6 +3,8 @@
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -11,6 +13,8 @@
 ### Response headers recorded for playback:
 
 ```
+connection: keep-alive
+content-length: 0
 ```
 ### Response body recorded for playback (404: text/plain):
 
@@ -22,7 +26,10 @@
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Content-Length: 107
 Content-Type: application/json
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -33,7 +40,9 @@ Content-Type: application/json
 
 ```
 version: 5.15.0
+connection: keep-alive
 content-type: application/json; charset=utf-8
+content-length: 312
 ```
 ### Response body recorded for playback (201: application/json; charset=utf-8):
 
@@ -63,6 +72,8 @@ content-type: application/json; charset=utf-8
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -71,6 +82,8 @@ content-type: application/json; charset=utf-8
 ### Response headers recorded for playback:
 
 ```
+connection: keep-alive
+content-length: 15
 ```
 ### Response body recorded for playback (200: text/plain):
 
@@ -83,6 +96,8 @@ Hello from tcae
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -91,6 +106,8 @@ Hello from tcae
 ### Response headers recorded for playback:
 
 ```
+connection: keep-alive
+content-length: 0
 ```
 ### Response body recorded for playback (404: text/plain):
 

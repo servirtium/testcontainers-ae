@@ -4,6 +4,8 @@
 
 ```
 Authorization: Basic REDACTED[testuser]
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -13,6 +15,7 @@ Authorization: Basic REDACTED[testuser]
 
 ```
 Cache-Control: must-revalidate
+Content-Length: 12
 Content-Type: application/json
 Location: http://{{request.host}}/custom_db
 Server: CouchDB/3.5.3 (Erlang OTP/27)
@@ -30,6 +33,8 @@ Server: CouchDB/3.5.3 (Erlang OTP/27)
 
 ```
 Authorization: Basic REDACTED[admin]
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -39,6 +44,7 @@ Authorization: Basic REDACTED[admin]
 
 ```
 Cache-Control: must-revalidate
+Content-Length: 67
 Content-Type: application/json
 Server: CouchDB/3.5.3 (Erlang OTP/27)
 ```

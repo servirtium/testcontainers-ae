@@ -3,6 +3,8 @@
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -13,6 +15,7 @@
 ```
 Content-Type: application/json
 Vary: Origin
+Content-Length: 21
 ```
 ### Response body recorded for playback (200: application/json):
 
@@ -26,7 +29,10 @@ Vary: Origin
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Content-Length: 15
 Content-Type: application/json
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -39,6 +45,7 @@ Content-Type: application/json
 Content-Type: application/json
 Vary: Origin
 X-Http-Code: 201
+Content-Length: 144
 ```
 ### Response body recorded for playback (201: application/json):
 
@@ -51,6 +58,8 @@ X-Http-Code: 201
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -61,6 +70,7 @@ X-Http-Code: 201
 ```
 Content-Type: application/json
 Vary: Origin
+Content-Length: 201
 ```
 ### Response body recorded for playback (200: application/json):
 
@@ -73,6 +83,8 @@ Vary: Origin
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -84,6 +96,7 @@ Vary: Origin
 Content-Type: application/json
 Openfga-Store-Id: {{store-id-1}}
 Vary: Origin
+Content-Length: 163
 ```
 ### Response body recorded for playback (200: application/json):
 

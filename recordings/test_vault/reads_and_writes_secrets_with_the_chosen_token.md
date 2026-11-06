@@ -3,6 +3,8 @@
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -14,6 +16,7 @@
 Cache-Control: no-store
 Content-Type: application/json
 Strict-Transport-Security: max-age=31536000; includeSubDomains
+Content-Length: 295
 ```
 ### Response body recorded for playback (200: application/json):
 
@@ -27,6 +30,8 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 X-Vault-Token: REDACTED-TOKEN
 ```
 ### Request body recorded for playback ():
@@ -39,6 +44,7 @@ X-Vault-Token: REDACTED-TOKEN
 Cache-Control: no-store
 Content-Type: application/json
 Strict-Transport-Security: max-age=31536000; includeSubDomains
+Content-Length: 315
 ```
 ### Response body recorded for playback (200: application/json):
 
@@ -52,6 +58,8 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 X-Vault-Token: REDACTED-TOKEN
 ```
 ### Request body recorded for playback ():
@@ -64,6 +72,7 @@ X-Vault-Token: REDACTED-TOKEN
 Cache-Control: no-store
 Content-Type: application/json
 Strict-Transport-Security: max-age=31536000; includeSubDomains
+Content-Length: 561
 ```
 ### Response body recorded for playback (200: application/json):
 
@@ -77,7 +86,10 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Content-Length: 22
 Content-Type: application/json
+Host: {{request.host}}
 X-Vault-Token: REDACTED-TOKEN
 ```
 ### Request body recorded for playback ():
@@ -91,6 +103,7 @@ X-Vault-Token: REDACTED-TOKEN
 Cache-Control: no-store
 Content-Type: application/json
 Strict-Transport-Security: max-age=31536000; includeSubDomains
+Content-Length: 279
 ```
 ### Response body recorded for playback (200: application/json):
 
@@ -104,6 +117,8 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 X-Vault-Token: REDACTED-TOKEN
 ```
 ### Request body recorded for playback ():
@@ -116,6 +131,7 @@ X-Vault-Token: REDACTED-TOKEN
 Cache-Control: no-store
 Content-Type: application/json
 Strict-Transport-Security: max-age=31536000; includeSubDomains
+Content-Length: 313
 ```
 ### Response body recorded for playback (200: application/json):
 
@@ -129,6 +145,8 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -140,6 +158,7 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
 Cache-Control: no-store
 Content-Type: application/json
 Strict-Transport-Security: max-age=31536000; includeSubDomains
+Content-Length: 33
 ```
 ### Response body recorded for playback (403: application/json):
 
@@ -153,6 +172,8 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 X-Vault-Token: not-the-token
 ```
 ### Request body recorded for playback ():
@@ -165,6 +186,7 @@ X-Vault-Token: not-the-token
 Cache-Control: no-store
 Content-Type: application/json
 Strict-Transport-Security: max-age=31536000; includeSubDomains
+Content-Length: 33
 ```
 ### Response body recorded for playback (403: application/json):
 

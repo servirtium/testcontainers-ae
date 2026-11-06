@@ -3,6 +3,8 @@
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -14,6 +16,7 @@
 Cache-Control: no-store
 Content-Type: application/json
 Strict-Transport-Security: max-age=31536000; includeSubDomains
+Content-Length: 295
 ```
 ### Response body recorded for playback (200: application/json):
 

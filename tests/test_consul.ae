@@ -30,17 +30,28 @@ fn call_api(method: string, url: string, body: string) -> (int, string, string) 
     return status, out, ""
 }
 
-// Wait for a leader election, which follows "agent running" by a moment.
+// Wait for a leader election, which follows "agent running" by a moment
+// (up to 10 s, a try every 100 ms).
 fn leader(base: string) -> (string, string) {
     tries = 0
     last = ""
-    while tries < 50 {
+    while tries < 100 {
         st, body, err = call_api("GET", "${base}/v1/status/leader", "")
         last = err
         if err == "" && st == 200 && string.length(body) > 4 { return body, "" }
         tries = tries + 1
+        sleep(100)
     }
     return "", "no leader: ${last}"
+}
+
+// In a live run, wait for the leader against the container itself, before
+// the recording starts: how many polls the election takes is timing, and a
+// tape that recorded them would differ run to run. The case's own leader
+// check then finds one at once, and the tape holds just that request.
+fn await_leader(c: *docker.Container) {
+    _ld, lerr = leader(agent_url(c))
+    spec.assert_ok(lerr, "leader elected before recording")
 }
 
 fn node_name(base: string) -> string {
@@ -97,8 +108,10 @@ main() {
     if servirtium.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
     // What differs run to run (and machine to machine): the Raft index
     // header, the node id, and the counters and host facts in
-    // /v1/agent/self's Stats.
-    servirtium.remove_header(servirtium.FIELD_RESPONSE_HEADERS, "X-Consul-Index")
+    // /v1/agent/self's Stats. X-Consul-Index stays on the tape (it is
+    // Consul's own, part of its API), with its value collapsed: a number
+    // still, since a client parses it as one.
+    servirtium.collapse("X-Consul-Index: [0-9]+", "X-Consul-Index: 1")
     servirtium.normalize(servirtium.UUID, "node-id")
     for stat in ["applied_index", "commit_index", "last_log_index", "last_log_term", "term",
                  "last_contact", "fsm_pending", "goroutines", "cpu_count", "max_procs",
@@ -119,6 +132,7 @@ main() {
                 spec.assert_ok(err, "consul starts")
                 if err != "" { return }
                 c = c2
+                await_leader(c)
             }
             base, rec = servirtium.recording("test_consul", "serves_the_http_api", agent_url(c))
             assert_consul_works(base, "Default")
@@ -135,6 +149,7 @@ main() {
                 spec.assert_ok(err, "consul starts")
                 if err != "" { return }
                 c = c2
+                await_leader(c)
             }
             base, rec = servirtium.recording("test_consul", "takes_a_config_string", agent_url(c))
             assert_consul_works(base, "WithConfigString")
@@ -152,6 +167,7 @@ main() {
                 spec.assert_ok(err, "consul starts")
                 if err != "" { return }
                 c = c2
+                await_leader(c)
             }
             base, rec = servirtium.recording("test_consul", "takes_a_config_file", agent_url(c))
             assert_consul_works(base, "WithConfigFile")
@@ -169,6 +185,7 @@ main() {
                 spec.assert_ok(err, "consul starts")
                 if err != "" { return }
                 c = c2
+                await_leader(c)
             }
             base, rec = servirtium.recording("test_consul", "starts_with_gos_testdata_config_json", agent_url(c))
             assert_consul_works(base, "GoConfig")

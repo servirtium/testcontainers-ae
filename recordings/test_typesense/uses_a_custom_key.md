@@ -3,6 +3,8 @@
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -11,8 +13,10 @@
 ### Response headers recorded for playback:
 
 ```
+Connection: keep-alive
 access-control-allow-origin: *
 content-type: application/json; charset=utf-8
+transfer-encoding: chunked
 ```
 ### Response body recorded for playback (200: application/json; charset=utf-8):
 
@@ -25,7 +29,10 @@ content-type: application/json; charset=utf-8
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Content-Length: 151
 Content-Type: application/json
+Host: {{request.host}}
 X-TYPESENSE-API-KEY: REDACTED[wrong-key]
 ```
 ### Request body recorded for playback ():
@@ -36,8 +43,10 @@ X-TYPESENSE-API-KEY: REDACTED[wrong-key]
 ### Response headers recorded for playback:
 
 ```
+Connection: keep-alive
 access-control-allow-origin: *
 content-type: application/json; charset=utf-8
+transfer-encoding: chunked
 ```
 ### Response body recorded for playback (401: application/json; charset=utf-8):
 
@@ -50,7 +59,10 @@ content-type: application/json; charset=utf-8
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Content-Length: 151
 Content-Type: application/json
+Host: {{request.host}}
 X-TYPESENSE-API-KEY: REDACTED[custom-key]
 ```
 ### Request body recorded for playback ():
@@ -61,8 +73,10 @@ X-TYPESENSE-API-KEY: REDACTED[custom-key]
 ### Response headers recorded for playback:
 
 ```
+Connection: keep-alive
 access-control-allow-origin: *
 content-type: application/json; charset=utf-8
+transfer-encoding: chunked
 ```
 ### Response body recorded for playback (201: application/json; charset=utf-8):
 
@@ -75,6 +89,8 @@ content-type: application/json; charset=utf-8
 ### Request headers recorded for playback:
 
 ```
+Connection: keep-alive
+Host: {{request.host}}
 X-TYPESENSE-API-KEY: REDACTED[custom-key]
 ```
 ### Request body recorded for playback ():
@@ -84,8 +100,10 @@ X-TYPESENSE-API-KEY: REDACTED[custom-key]
 ### Response headers recorded for playback:
 
 ```
+Connection: keep-alive
 access-control-allow-origin: *
 content-type: application/json; charset=utf-8
+transfer-encoding: chunked
 ```
 ### Response body recorded for playback (200: application/json; charset=utf-8):
 

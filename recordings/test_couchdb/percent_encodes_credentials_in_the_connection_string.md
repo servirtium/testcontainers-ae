@@ -4,6 +4,8 @@
 
 ```
 Authorization: Basic REDACTED[percent-encoded-user]
+Connection: keep-alive
+Host: {{request.host}}
 ```
 ### Request body recorded for playback ():
 
@@ -13,6 +15,7 @@ Authorization: Basic REDACTED[percent-encoded-user]
 
 ```
 Cache-Control: must-revalidate
+Content-Length: 12
 Content-Type: application/json
 Location: http://{{request.host}}/enc_db
 Server: CouchDB/3.5.3 (Erlang OTP/27)
