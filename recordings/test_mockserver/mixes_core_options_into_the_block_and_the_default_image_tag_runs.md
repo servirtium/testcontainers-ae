@@ -30,3 +30,16 @@ content-length: 117
 }
 ```
 
+
+## [Recording rules]
+
+What the test asked Servirtium to leave out or rewrite when it wrote this recording; everything else is as sent. Playback does not read this section.
+
+| Rule | Applies to | Matching | Written as | Interactions |
+|---|---|---|---|---|
+| removed | response headers | `Date` | (left out) | none |
+| removed | response headers | `X-Request-Id` | (left out) | none |
+| removed | response headers | `X-Correlation-Id` | (left out) | none |
+| collapsed | whole recording | *the container's mapped host:port* | `{{request.host}}` | none |
+| collapsed | whole recording | *the recorder's own host:port* | `{{request.host}}` | 0 |
+| normalized | whole recording | `[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}` | `{{expectation-id-N}}` | none |

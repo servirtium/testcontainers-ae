@@ -234,6 +234,9 @@ fn regex_quote(lit: string) -> string {
 
 fn apply_rules(h: ptr, m: int, upstream_url: string, own_host: string) -> string {
     errs = ""
+    // Each recording ends with a "## [Recording rules]" table: what these
+    // rules left out or rewrote, and where. Playback does not read it.
+    vcr.set_rules_footer_h(h, 1)
     e = vcr.remove_header_h(h, FIELD_RESPONSE_HEADERS, "Date")
     errs = "${errs}${e}"
     e = vcr.remove_header_h(h, FIELD_RESPONSE_HEADERS, "X-Request-Id")
@@ -241,9 +244,11 @@ fn apply_rules(h: ptr, m: int, upstream_url: string, own_host: string) -> string
     e = vcr.remove_header_h(h, FIELD_RESPONSE_HEADERS, "X-Correlation-Id")
     errs = "${errs}${e}"
     if m != MODE_PLAYBACK {
-        e = vcr.redact_whole_tape_h(h, regex_quote(host_port_of(upstream_url)), "{{request.host}}")
+        // Described, so the rules footer names them instead of printing
+        // patterns that hold this run's ports.
+        e = vcr.redact_whole_tape_described_h(h, regex_quote(host_port_of(upstream_url)), "{{request.host}}", "the container's mapped host:port")
         errs = "${errs}${e}"
-        e = vcr.redact_whole_tape_h(h, regex_quote(own_host), "{{request.host}}")
+        e = vcr.redact_whole_tape_described_h(h, regex_quote(own_host), "{{request.host}}", "the recorder's own host:port")
         errs = "${errs}${e}"
     }
     i = 0

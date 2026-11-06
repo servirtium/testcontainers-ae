@@ -69,6 +69,12 @@ were sent and adds none.
 
 ## Normalizations in force
 
+Each recording ends with a `## [Recording rules]` table that lists the rules
+below as they applied to it: what was left out or rewritten, and in which
+interactions (`none` for a rule that matched nothing there). A redaction's
+secret is never shown, only its placeholder. Playback does not read that
+section.
+
 Applied when a tape is written; playback serves the tape as written.
 
 Always (`testcontainers/servirtium/module.ae`):

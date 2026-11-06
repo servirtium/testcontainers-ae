@@ -170,3 +170,24 @@ Server: CouchDB/3.5.3 (Erlang OTP/27)
 
 ```
 
+
+## [Recording rules]
+
+What the test asked Servirtium to leave out or rewrite when it wrote this recording; everything else is as sent. Playback does not read this section.
+
+| Rule | Applies to | Matching | Written as | Interactions |
+|---|---|---|---|---|
+| removed | response headers | `Date` | (left out) | 0–5 |
+| removed | response headers | `X-Request-Id` | (left out) | none |
+| removed | response headers | `X-Correlation-Id` | (left out) | none |
+| removed | response headers | `X-Couch-Request-ID` | (left out) | 0–5 |
+| removed | response headers | `X-CouchDB-Body-Time` | (left out) | 0–5 |
+| redacted | request headers | (not shown: it may be the secret) | `Basic REDACTED[admin]` | 4, 5 |
+| redacted | request headers | (not shown: it may be the secret) | `Basic REDACTED[admin-wrong-password]` | 3 |
+| redacted | request headers | (not shown: it may be the secret) | `Basic REDACTED[testuser]` | none |
+| redacted | request headers | (not shown: it may be the secret) | `Basic REDACTED[percent-encoded-user]` | none |
+| collapsed | whole recording | *the container's mapped host:port* | `{{request.host}}` | 4 |
+| collapsed | whole recording | *the recorder's own host:port* | `{{request.host}}` | 0–5 |
+| normalized | whole recording | `[0-9a-f]{32}` | `{{couchdb-uuid-N}}` | 0 |
+| collapsed | whole recording | `1[0-9]{9}` | `946684800` | 5 |
+| collapsed | whole recording | `_seq":"[0-9]+-[A-Za-z0-9_-]+"` | `_seq":"0-SEQ"` | 5 |

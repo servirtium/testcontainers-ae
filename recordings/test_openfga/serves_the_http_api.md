@@ -108,3 +108,17 @@ Content-Length: 131
 {"id":"{{store-id-1}}", "name":"tcae", "created_at":"2000-01-01T00:00:00Z", "updated_at":"2000-01-01T00:00:00Z", "deleted_at":null}
 ```
 
+
+## [Recording rules]
+
+What the test asked Servirtium to leave out or rewrite when it wrote this recording; everything else is as sent. Playback does not read this section.
+
+| Rule | Applies to | Matching | Written as | Interactions |
+|---|---|---|---|---|
+| removed | response headers | `Date` | (left out) | 0–3 |
+| removed | response headers | `X-Request-Id` | (left out) | 1–3 |
+| removed | response headers | `X-Correlation-Id` | (left out) | none |
+| collapsed | whole recording | *the container's mapped host:port* | `{{request.host}}` | none |
+| collapsed | whole recording | *the recorder's own host:port* | `{{request.host}}` | 0–3 |
+| normalized | whole recording | `[0-9A-HJKMNP-TV-Z]{26}` | `{{store-id-N}}` | 1–3 |
+| collapsed | whole recording | `[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z\|[+-][0-9]{2}:[0-9]{2})` | `2000-01-01T00:00:00Z` | 1–3 |
