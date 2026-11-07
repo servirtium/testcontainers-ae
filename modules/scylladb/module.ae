@@ -23,6 +23,9 @@
 //  - custom_commands with an invalid flag is an error from run, as the
 //    option's error is in Go; new flags are appended in the order given.
 //
+// Added: rest_api() publishes the REST management API on 10000 (servirtium-vcr's
+// pre-recorded/from-testcontainers/scylladb records it).
+//
 // Not ported: the gocql / Alternator client code of Go's tests and examples.
 
 import std.string
@@ -33,13 +36,15 @@ import testcontainers.docker
 exports(
     run, config, config_file, shard_awareness, alternator, custom_commands,
     shard_aware_connection_host, non_shard_aware_connection_host,
-    alternator_connection_host, PORT, SHARD_AWARE_PORT, ALTERNATOR_PORT,
+    alternator_connection_host, rest_api, rest_api_connection_host,
+    PORT, SHARD_AWARE_PORT, ALTERNATOR_PORT, REST_API_PORT,
     DEFAULT_IMAGE, scylladb_request_new, scylladb_request_free
 )
 
 const PORT = "9042/tcp"
 const SHARD_AWARE_PORT = "19042/tcp"
 const ALTERNATOR_PORT = "8000/tcp"
+const REST_API_PORT = "10000/tcp"
 const DEFAULT_IMAGE = "scylladb/scylla:6.2"
 const SET_ERROR = "scylladb.error"
 
@@ -74,6 +79,16 @@ config_file(_ctx: ptr, host_path: string) {
 shard_awareness(_ctx: ptr) {
     tc.expose(_ctx, SHARD_AWARE_PORT)
     tc.additional_wait(_ctx, wait.for_listening_port(SHARD_AWARE_PORT))
+}
+
+// Added (not in Go): expose the REST management API (the one nodetool and
+// the monitoring tools use, port 10000), wait for it, and set
+// --api-address=0.0.0.0. Scylla binds it to 127.0.0.1 inside the container
+// by default, which a published port cannot reach.
+rest_api(_ctx: ptr) {
+    tc.expose(_ctx, REST_API_PORT)
+    tc.additional_wait(_ctx, wait.for_listening_port(REST_API_PORT))
+    set_command_flags(_ctx, ["--api-address"], ["0.0.0.0"])
 }
 
 // Go's setCommandFlags: a flag already in the command line gets the new value
@@ -166,4 +181,9 @@ non_shard_aware_connection_host(c: *docker.Container) -> (string, string) {
 // "host:port" of Alternator (needs alternator()).
 alternator_connection_host(c: *docker.Container) -> (string, string) {
     return tc.endpoint(c, ALTERNATOR_PORT, "")
+}
+
+// "host:port" of the REST management API (needs rest_api()).
+rest_api_connection_host(c: *docker.Container) -> (string, string) {
+    return tc.endpoint(c, REST_API_PORT, "")
 }

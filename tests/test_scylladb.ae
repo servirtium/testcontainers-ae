@@ -84,6 +84,26 @@ main() {
             spec.assert_contains(err, "invalid flag: smp=2", "the error")
         }
 
+        spec.it("serves the REST management API (rest_api)") callback {
+            c, err = scylladb.run(IMAGE) { rest_api() }
+            testing.cleanup_container(c)
+            spec.assert_ok(err, "scylladb starts")
+            if err == "" {
+                host, herr = scylladb.rest_api_connection_host(c)
+                spec.assert_ok(herr, "rest api host")
+                req = client.request("GET", "http://${host}/storage_service/cluster_name")
+                client.set_timeout(req, 30s)
+                r, rerr = client.send_request(req)
+                client.request_free(req)
+                spec.assert_ok(rerr, "GET /storage_service/cluster_name")
+                if rerr == "" {
+                    spec.assert_eq(client.response_status(r), 200, "the REST API answers")
+                    spec.assert_str_eq(client.response_body(r), "\"Test Cluster\"", "the cluster name")
+                    client.response_free(r)
+                }
+            }
+        }
+
         spec.it("speaks CQL on both ports and serves Alternator") callback {
             c, err = scylladb.run(IMAGE) {
                 shard_awareness()

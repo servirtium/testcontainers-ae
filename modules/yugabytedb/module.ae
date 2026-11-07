@@ -33,11 +33,16 @@ import testcontainers.docker
 exports(
     YugabyteContainer, run, ysql_connection_string, ycql_host,
     database_name, database_user, database_password, keyspace, user, password,
-    YSQL_PORT, YCQL_PORT, DEFAULT_IMAGE, yugabytedb_request_new, yugabytedb_request_free
+    master_http_host, tserver_http_host,
+    YSQL_PORT, YCQL_PORT, MASTER_HTTP_PORT, TSERVER_HTTP_PORT, DEFAULT_IMAGE, yugabytedb_request_new, yugabytedb_request_free
 )
 
 const YSQL_PORT = "5433/tcp"
 const YCQL_PORT = "9042/tcp"
+// Added (not in Go): the web servers of yb-master and yb-tserver, whose JSON
+// endpoints (/api/v1/...) servirtium-vcr's pre-recorded suite records.
+const MASTER_HTTP_PORT = "7000/tcp"
+const TSERVER_HTTP_PORT = "9000/tcp"
 const DEFAULT_IMAGE = "yugabytedb/yugabyte:2024.1.3.0-b105"
 
 struct YugabyteContainer {
@@ -58,6 +63,8 @@ yugabytedb_request_new() -> ptr {
     ]))
     tc.expose(r, YCQL_PORT)
     tc.expose(r, YSQL_PORT)
+    tc.expose(r, MASTER_HTTP_PORT)
+    tc.expose(r, TSERVER_HTTP_PORT)
     tc.env(r, "YCQL_KEYSPACE", "yugabyte")
     tc.env(r, "YCQL_USER", "yugabyte")
     tc.env(r, "YCQL_PASSWORD", "yugabyte")
@@ -113,4 +120,14 @@ ysql_connection_string(y: *YugabyteContainer, args: string[]) -> (string, string
 // "host:port" of the YCQL (CQL native protocol) port.
 ycql_host(y: *YugabyteContainer) -> (string, string) {
     return tc.endpoint(y.container, YCQL_PORT, "")
+}
+
+// "host:port" of yb-master's web server (7000; added).
+master_http_host(y: *YugabyteContainer) -> (string, string) {
+    return tc.endpoint(y.container, MASTER_HTTP_PORT, "")
+}
+
+// "host:port" of yb-tserver's web server (9000; added).
+tserver_http_host(y: *YugabyteContainer) -> (string, string) {
+    return tc.endpoint(y.container, TSERVER_HTTP_PORT, "")
 }
