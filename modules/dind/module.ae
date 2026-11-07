@@ -1,9 +1,10 @@
 // Ported from testcontainers-go modules/dind/dind.go
 //
 // modules.dind: a Docker-in-Docker container, `dockerd` listening on plain
-// tcp port 2375. STATUS: compile-checked only (needs a privileged container
-// with the host cgroup namespace; not run on the rootless Podman machine it
-// was ported on).
+// tcp port 2375. STATUS: needs a privileged container. With the host cgroup
+// namespace (the default, Go's) a rootless Podman machine refuses it; with
+// `{ dind_private_cgroupns() }` it runs there (servirtium-vcr's
+// pre-recorded/from-testcontainers/dind records against it that way).
 //
 //     import modules.dind
 //
@@ -21,7 +22,7 @@ import testcontainers as tc
 import testcontainers.wait
 import testcontainers.docker
 
-exports(run, host, PORT, DEFAULT_IMAGE, dind_request_new, dind_request_free)
+exports(run, host, dind_private_cgroupns, PORT, DEFAULT_IMAGE, dind_request_new, dind_request_free)
 
 const PORT = "2375/tcp"
 const DEFAULT_IMAGE = "docker:28.0.1-dind"
@@ -47,6 +48,19 @@ builder run(image: string) with dind_request_new -> (*docker.Container, string) 
     c, err = tc.run_request(r, image)
     if err != "" { return c, "run dind: ${err}" }
     return c, ""
+}
+
+// Not in Go's module: put the container in its own cgroup namespace instead
+// of the host's (the default above, Go's). A rootless engine, such as a
+// rootless Podman machine, refuses to let dockerd create cgroups in the
+// host's ("mkdir: can't create directory '/sys/fs/cgroup/init': Permission
+// denied"); with a private cgroup namespace, still privileged, docker:dind
+// runs there. It replaces the host mode set by default (modifiers apply in
+// order):
+//
+//     c, err = dind.run(img) { dind_private_cgroupns() }
+dind_private_cgroupns(_ctx: ptr) {
+    tc.host_config_modifier(_ctx, |hc: ptr| { json.set(hc, "CgroupnsMode", json.str("private")) })
 }
 
 // "http://host:port" of the inner Docker daemon (Go's Host).
