@@ -47,7 +47,9 @@ fn basic(user: string, pw: string) -> string {
 }
 
 // A recording shows "Authorization: Basic REDACTED[<label>]"; playback still
-// matches the real header.
+// matches the real header. Not Servirtium's redact_credentials preset: that
+// matches Authorization on presence, and these cases tell a right password
+// from a wrong one, which playback should keep checking.
 fn redact_basic(user: string, pw: string, label: string) {
     secret = encoding.base64_encode_padded(string.bytes("${user}:${pw}"))
     servirtium.redact(servirtium.FIELD_REQUEST_HEADERS, "Basic ${secret}", "Basic REDACTED[${label}]")

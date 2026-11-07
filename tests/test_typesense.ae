@@ -72,6 +72,8 @@ main() {
     fw = spec.init()
     if servirtium.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
     // The API keys are kept off the tapes; created_at differs run to run.
+    // Labelled literal redactions, not Servirtium's credential preset (which
+    // matches on presence): the wrong-key case must still send the wrong key.
     for key in ["test-api-key", "custom-key", "env-key", "wrong-key"] {
         servirtium.redact(servirtium.FIELD_REQUEST_HEADERS, "X-TYPESENSE-API-KEY: ${key}", "X-TYPESENSE-API-KEY: REDACTED[${key}]")
     }

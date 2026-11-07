@@ -89,14 +89,24 @@ Per suite (registered at the top of its `main`):
 
 | Suite | Normalized (stable `{{name-N}}` tokens) | Collapsed to a constant | Redacted (put back on playback) | Headers dropped |
 |---|---|---|---|---|
-| vault | UUIDs (request and cluster ids) | `vault-cluster-<hex>`, RFC 3339 times, Unix times | the root token in `X-Vault-Token` | |
+| vault | UUIDs (request and cluster ids) | `vault-cluster-<hex>`, RFC 3339 times, Unix times | the root token in `X-Vault-Token`, as `X_VAULT_TOKEN_1` (credential preset) | |
 | couchdb | the 32-hex server uuid | Unix start times, `*_seq` tokens | each `Authorization: Basic` credential, as `REDACTED[<label>]` | `X-Couch-Request-ID`, `X-CouchDB-Body-Time` |
 | consul | the node id | Raft indexes (the `X-Consul-Index` header's value too), runtime counters, `cpu_count`, `arch` in `/v1/agent/self` | | |
 | openfga | the store's ULID (it comes back in a later request path, and the token round-trips) | RFC 3339 times | | |
 | typesense | | `created_at` | each `X-TYPESENSE-API-KEY`, as `REDACTED[<key>]` | |
 | mockserver | the expectation's UUID | | | |
 
-A redaction is a literal swap: the secret is written as its placeholder,
+Vault uses Servirtium's credential preset
+(`servirtium.redact_credential_header("X-Vault-Token")`): the token is
+written as a numbered token, and playback matches the header on presence,
+not value, so it needs no secret. CouchDB and Typesense keep labelled literal
+redactions instead, because their cases send a wrong credential on purpose
+and playback should keep telling it from the right one. The module also
+offers `redact_credentials()`, `remove_cloud_headers(vendor)`,
+`remove_transport_headers()` and `pretty_json(indent)`; see servirtium-vcr's
+AGENTS.md, "Header presets".
+
+The other redactions are a literal swap: the secret is written as its placeholder,
 and on playback the placeholder in the tape is swapped back before the
 request is compared. Placeholders must not contain one another, hence
 `REDACTED[admin]` rather than `REDACTED-admin` beside
@@ -106,7 +116,7 @@ request is compared. Placeholders must not contain one another, hence
 
 `lib/servirtium_vcr` is a relative symlink to `../servirtium-vcr/core`, a
 sibling checkout of https://github.com/servirtium/servirtium-vcr (recorded
-against v2.0.0-alpha.11). `ae test` searches a project's `lib/` first, so
+against v2.0.0-alpha.12). `ae test` searches a project's `lib/` first, so
 `import servirtium_vcr.vcr` resolves with no flags; point the symlink at
 another checkout to use it. Only the tests that import
 `testcontainers.servirtium` need it.

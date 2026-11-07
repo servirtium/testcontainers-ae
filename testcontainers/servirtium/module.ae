@@ -60,6 +60,8 @@ import testcontainers.testing
 exports(
     mode, live, playback, recording, end_recording, tape_path, case_name,
     skip_if_no_engine, normalize, collapse, redact, remove_header, clear_rules,
+    redact_credentials, redact_credential_header, remove_cloud_headers,
+    remove_transport_headers, pretty_json,
     UUID, RFC3339, EPOCH_TIMESTAMP,
     MODE_OFF, MODE_RECORD, MODE_PLAYBACK, MODE_CHECK,
     FIELD_PATH, FIELD_REQUEST_HEADERS, FIELD_REQUEST_BODY,
@@ -89,6 +91,11 @@ const RULE_NORMALIZE = 1
 const RULE_COLLAPSE = 2
 const RULE_REDACT = 3
 const RULE_REMOVE_HEADER = 4
+const RULE_CREDENTIALS = 5
+const RULE_CREDENTIAL_HEADER = 6
+const RULE_CLOUD = 7
+const RULE_TRANSPORT = 8
+const RULE_PRETTY_JSON = 9
 
 struct Recording {
     server: ptr
@@ -192,6 +199,38 @@ remove_header(field: int, name: string) {
     add_rule(RULE_REMOVE_HEADER, field, name, "")
 }
 
+// Servirtium's header presets: each is one call registering ordinary rules,
+// listed under the preset's name in the recording's rules footer.
+//
+// The usual credential headers' values (Authorization, Cookie, Set-Cookie,
+// X-Api-Key, ...) written as tokens numbered per distinct value
+// (AUTHORIZATION_1, COOKIE_1); playback matches them on presence, so it
+// needs no secret.
+redact_credentials() {
+    add_rule(RULE_CREDENTIALS, 0, "", "")
+}
+
+// One more credential header the same way (X-Vault-Token: X_VAULT_TOKEN_1).
+redact_credential_header(name: string) {
+    add_rule(RULE_CREDENTIAL_HEADER, 0, name, "")
+}
+
+// A cloud vendor's CDN / load-balancer headers ("aws", "azure",
+// "cloudflare", "fastly", "gcp").
+remove_cloud_headers(vendor: string) {
+    add_rule(RULE_CLOUD, 0, vendor, "")
+}
+
+// Host, Connection, Content-Length and the other transport headers.
+remove_transport_headers() {
+    add_rule(RULE_TRANSPORT, 0, "", "")
+}
+
+// JSON response bodies indented by `indent` in the recording (0 is off).
+pretty_json(indent: int) {
+    add_rule(RULE_PRETTY_JSON, indent, "", "")
+}
+
 clear_rules() {
     rule_kind = []
     rule_field = []
@@ -258,6 +297,12 @@ fn apply_rules(h: ptr, m: int, upstream_url: string, own_host: string) -> string
             e = vcr.remove_header_h(h, rule_field[i], rule_a[i])
             errs = "${errs}${e}"
         }
+        // Presets apply to recording and playback alike.
+        if k == RULE_CREDENTIALS { errs = "${errs}${vcr.redact_credentials_h(h)}" }
+        if k == RULE_CREDENTIAL_HEADER { errs = "${errs}${vcr.redact_credential_header_h(h, rule_a[i])}" }
+        if k == RULE_CLOUD { errs = "${errs}${vcr.remove_cloud_headers_h(h, rule_a[i])}" }
+        if k == RULE_TRANSPORT { errs = "${errs}${vcr.remove_transport_headers_h(h)}" }
+        if k == RULE_PRETTY_JSON { vcr.set_pretty_json_h(h, rule_field[i]) }
         if m != MODE_PLAYBACK {
             if k == RULE_NORMALIZE { errs = "${errs}${vcr.normalize_whole_tape_h(h, rule_a[i], rule_b[i])}" }
             if k == RULE_COLLAPSE { errs = "${errs}${vcr.redact_whole_tape_h(h, rule_a[i], rule_b[i])}" }

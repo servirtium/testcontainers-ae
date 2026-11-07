@@ -56,8 +56,10 @@ fn kv_field(body: string, key: string) -> string {
 main() {
     fw = spec.init()
     if servirtium.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }
-    // A recording keeps the root token as REDACTED-TOKEN; playback puts it back.
-    servirtium.redact(servirtium.FIELD_REQUEST_HEADERS, TOKEN, "REDACTED-TOKEN")
+    // Servirtium's credential preset: the token is written as
+    // X_VAULT_TOKEN_1, and playback matches X-Vault-Token on presence, so it
+    // needs no secret.
+    servirtium.redact_credential_header("X-Vault-Token")
     // What differs run to run: request and cluster ids, the cluster's name,
     // created_time, and the Unix times of server_time_utc and the transit
     // key's versions.

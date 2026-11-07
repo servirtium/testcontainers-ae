@@ -34,7 +34,7 @@ Content-Length: 261
 Connection: keep-alive
 Host: {{request.host}}
 User-Agent: testcontainers-ae-tests (Aether std.http.client)
-X-Vault-Token: REDACTED-TOKEN
+X-Vault-Token: X_VAULT_TOKEN_1
 ```
 ### Request body recorded for playback ():
 
@@ -63,7 +63,7 @@ Content-Length: 279
 Connection: keep-alive
 Host: {{request.host}}
 User-Agent: testcontainers-ae-tests (Aether std.http.client)
-X-Vault-Token: REDACTED-TOKEN
+X-Vault-Token: X_VAULT_TOKEN_1
 ```
 ### Request body recorded for playback ():
 
@@ -94,7 +94,7 @@ Content-Length: 22
 Content-Type: application/json
 Host: {{request.host}}
 User-Agent: testcontainers-ae-tests (Aether std.http.client)
-X-Vault-Token: REDACTED-TOKEN
+X-Vault-Token: X_VAULT_TOKEN_1
 ```
 ### Request body recorded for playback ():
 
@@ -124,7 +124,7 @@ Content-Length: 243
 Connection: keep-alive
 Host: {{request.host}}
 User-Agent: testcontainers-ae-tests (Aether std.http.client)
-X-Vault-Token: REDACTED-TOKEN
+X-Vault-Token: X_VAULT_TOKEN_1
 ```
 ### Request body recorded for playback ():
 
@@ -181,7 +181,7 @@ Content-Length: 33
 Connection: keep-alive
 Host: {{request.host}}
 User-Agent: testcontainers-ae-tests (Aether std.http.client)
-X-Vault-Token: not-the-token
+X-Vault-Token: X_VAULT_TOKEN_2
 ```
 ### Request body recorded for playback ():
 
@@ -212,10 +212,12 @@ What the test asked Servirtium to leave out or rewrite when it wrote this record
 | removed | response headers | `Date` | (left out) | 0–6 |
 | removed | response headers | `X-Request-Id` | (left out) | none |
 | removed | response headers | `X-Correlation-Id` | (left out) | none |
-| redacted | request headers | (not shown: it may be the secret) | `REDACTED-TOKEN` | 1–4 |
+| redacted credential | request and response headers | `X-Vault-Token` | `X_VAULT_TOKEN_N` | 1–4, 6 |
 | collapsed | whole recording | *the container's mapped host:port* | `{{request.host}}` | none |
 | collapsed | whole recording | *the recorder's own host:port* | `{{request.host}}` | 0–6 |
 | normalized | whole recording | `[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}` | `{{uuid-N}}` | 0–4 |
 | collapsed | whole recording | `vault-cluster-[0-9a-f]+` | `vault-cluster-0` | 0 |
 | collapsed | whole recording | `[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z\|[+-][0-9]{2}:[0-9]{2})` | `2000-01-01T00:00:00Z` | 1, 3, 4 |
 | collapsed | whole recording | `1[0-9]{9}` | `946684800` | 0, 2 |
+
+A credential's `N` numbers each distinct value: the same value has the same number wherever it appears, and one of 8 characters or more is replaced in bodies and paths too. Playback matches credential headers on presence, not value.
