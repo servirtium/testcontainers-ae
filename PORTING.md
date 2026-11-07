@@ -84,10 +84,10 @@ that take something else.
 
 | Module | Status | Where, and what differs |
 |---|---|---|
-| activemq | tested live | `modules/activemq`, `tests/test_activemq.ae`. |
+| activemq | tested live | `modules/activemq`, servirtium-vcr `pre-recorded/from-testcontainers/activemq/test_activemq.ae` (with Servirtium recordings). |
 | aerospike | tested live | `modules/aerospike`, `tests/test_aerospike.ae`. |
-| arangodb | tested live | `modules/arangodb`, `tests/test_arangodb.ae`. |
-| artemis | tested live | `modules/artemis`, `tests/test_artemis.ae`. |
+| arangodb | tested live | `modules/arangodb`, servirtium-vcr `pre-recorded/from-testcontainers/arangodb/test_arangodb.ae` (with Servirtium recordings). |
+| artemis | tested live | `modules/artemis`, servirtium-vcr `pre-recorded/from-testcontainers/artemis/test_artemis.ae` (with Servirtium recordings). |
 | azure | family, below | Go's `modules/azure` holds six modules; the old flat package is not ported. |
 | azure/azurite | tested live | `modules/azurite`, servirtium-vcr `pre-recorded/from-testcontainers/azurite/test_azurite.ae` (with Servirtium recordings). Go's `modules/azurite` re-exports `modules/azure/azurite`; one port, `import modules.azurite`. |
 | azure/cosmosdb | compile-checked (`TCAE_LIVE_COSMOSDB=1`) | `modules/azure/cosmosdb`, `tests/test_azure_cosmosdb.ae`. Alpha, no engine used to port it; not the azcosmos SDK examples. |
@@ -98,14 +98,14 @@ that take something else.
 | azurite | tested live | `modules/azurite`, servirtium-vcr `pre-recorded/from-testcontainers/azurite/test_azurite.ae` (with Servirtium recordings). |
 | cassandra | tested live | `modules/cassandra`, `tests/test_cassandra.ae`. |
 | chroma | tested live | `modules/chroma`, servirtium-vcr `pre-recorded/from-testcontainers/chroma/test_chroma.ae` (with Servirtium recordings). |
-| clickhouse | tested live | `modules/clickhouse`, `tests/test_clickhouse.ae`. |
+| clickhouse | tested live | `modules/clickhouse`, servirtium-vcr `pre-recorded/from-testcontainers/clickhouse/test_clickhouse.ae` (with Servirtium recordings). |
 | cockroachdb | tested live | `modules/cockroachdb`, `tests/test_cockroachdb.ae`. The secure start waits with `wait.for_tls_cert` and HTTPS `/health` verified against the CA; the SQL ping is `wait.for_sql` (pgx/v5) as in Go: plain when insecure, TLS 1.3 `verify-full` against the container's CA with a password. A secure start without a password (root, Go's default) needs a client certificate, which the TLS client cannot present yet, so that one case pings with `cockroach sql` in the container. The test also queries through `sql` over TLS. |
 | compose | compile-checked (`TCAE_LIVE_COMPOSE=1`) | `modules/compose`, `tests/test_compose.ae`. Go's `ComposeStack` through the compose CLI (DESIGN.md section 11); the engine-free cases (command lines, CLI discovery, services, profiles, the label override) run in every run, the cases that start a project only with the variable. Not the compose-go / docker/compose library flavour. |
 | consul | tested live | `modules/consul`, servirtium-vcr `pre-recorded/from-testcontainers/consul/test_consul.ae` (with Servirtium recordings). Run, ApiEndpoint, WithConfigString, WithConfigFile; not the consul client used in Go's examples (the test uses the HTTP API). |
-| couchbase | tested live | `modules/couchbase`, `tests/test_couchbase.ae`. |
+| couchbase | tested live | `modules/couchbase`, servirtium-vcr `pre-recorded/from-testcontainers/couchbase/test_couchbase.ae` (with Servirtium recordings). |
 | couchdb | tested live | `modules/couchdb`, servirtium-vcr `pre-recorded/from-testcontainers/couchdb/test_couchdb.ae` (with Servirtium recordings). The test uses the HTTP API. |
-| cratedb | tested live | `modules/cratedb`, `tests/test_cratedb.ae`. |
-| databend | tested live | `modules/databend`, `tests/test_databend.ae`. |
+| cratedb | tested live | `modules/cratedb`, servirtium-vcr `pre-recorded/from-testcontainers/cratedb/test_cratedb.ae` (with Servirtium recordings). |
+| databend | tested live | `modules/databend`, servirtium-vcr `pre-recorded/from-testcontainers/databend/test_databend.ae` (with Servirtium recordings). |
 | dex | tested live | `modules/dex`, servirtium-vcr `pre-recorded/from-testcontainers/dex/test_dex.ae` (with Servirtium recordings). `user` takes a bcrypt **hash** of the password (no bcrypt in Aether's std; Go hashes at render time): make one with `htpasswd -bnBC 10 "" pw`. |
 | dind | compile-checked (`TCAE_DIND=1`) | `modules/dind`, `tests/test_dind.ae`. Needs a privileged container with the host cgroup namespace; not run on the rootless Podman machine. |
 | dockermcpgateway | tested live | `modules/dockermcpgateway`, `tests/test_dockermcpgateway.ae`. |
@@ -113,7 +113,7 @@ that take something else.
 | dolt | tested live | `modules/dolt`, `tests/test_dolt.ae`. |
 | dynamodb | tested live | `modules/dynamodb`, servirtium-vcr `pre-recorded/from-testcontainers/dynamodb/test_dynamodb.ae` (with Servirtium recordings). |
 | elasticsearch | tested live | `modules/elasticsearch`, servirtium-vcr `pre-recorded/from-testcontainers/elasticsearch/test_elasticsearch.ae` (with Servirtium recordings). 8.x secure start: the HTTP wait verifies against the CA read from the container (Go skips verification). |
-| etcd | tested live | `modules/etcd`, `tests/test_etcd.ae`. With clusters: WithNodes, WithClusterToken, WithDataDir, WithAdditionalArgs, ClientEndpoint(s), PeerEndpoint(s), Terminate. The options are module settings (`tc.set_setting`); further cluster nodes run from `tc.request_copy` of the caller's request, so they get the caller's options as in Go. `additional_args` appends on every call (Go keeps the last call's); fewer than two `nodes` means one node. Not the etcd client of Go's examples (the test uses the v3 JSON gateway and etcdctl). |
+| etcd | tested live | `modules/etcd`, servirtium-vcr `pre-recorded/from-testcontainers/etcd/test_etcd.ae` (with Servirtium recordings). With clusters: WithNodes, WithClusterToken, WithDataDir, WithAdditionalArgs, ClientEndpoint(s), PeerEndpoint(s), Terminate. The options are module settings (`tc.set_setting`); further cluster nodes run from `tc.request_copy` of the caller's request, so they get the caller's options as in Go. `additional_args` appends on every call (Go keeps the last call's); fewer than two `nodes` means one node. Not the etcd client of Go's examples (the test uses the v3 JSON gateway and etcdctl). |
 | fakegcsserver | tested live | `modules/fakegcsserver`, servirtium-vcr `pre-recorded/from-testcontainers/fakegcsserver/test_fakegcsserver.ae` (with Servirtium recordings). `scheme("https")` waits over HTTPS without verification, as Go. |
 | firebird | tested live | `modules/firebird`, `tests/test_firebird.ae`. |
 | forgejo | tested live | `modules/forgejo`, servirtium-vcr `pre-recorded/from-testcontainers/forgejo/test_forgejo.ae` (with Servirtium recordings). |
@@ -127,11 +127,11 @@ that take something else.
 | gcloud/spanner | compile-checked (`TCAE_LIVE_SPANNER=1`) | `modules/gcloud/spanner`, `tests/test_gcloud_spanner.ae`. Alpha, no engine used to port it. |
 | grafana-lgtm | tested live | `modules/grafana_lgtm`, servirtium-vcr `pre-recorded/from-testcontainers/grafana_lgtm/test_grafana_lgtm.ae` (with Servirtium recordings). `modules/grafana_lgtm` (`import modules.grafana_lgtm`): an Aether module path cannot have a `-`. |
 | inbucket | tested live | `modules/inbucket`, servirtium-vcr `pre-recorded/from-testcontainers/inbucket/test_inbucket.ae` (with Servirtium recordings). |
-| influxdb | tested live | `modules/influxdb`, `tests/test_influxdb.ae`. |
+| influxdb | tested live | `modules/influxdb`, servirtium-vcr `pre-recorded/from-testcontainers/influxdb/test_influxdb.ae` (with Servirtium recordings). |
 | k3s | compile-checked (`TCAE_K3S=1`) | `modules/k3s`, `tests/test_k3s.ae`. Needs a privileged container. |
 | k6 | tested live | `modules/k6`, `tests/test_k6.ae`. Go's default `szkiba/k6x:v0.3.1` no longer works (it fetches k6's extension catalog from a GitHub path that 404s, exit 116); the test runs the official `grafana/k6:1.0.0`, same arguments. `WithRemoteTestScript` not ported (download the script and pass it to `test_script`). |
 | kafka | tested live | `modules/kafka`, `tests/test_kafka.ae`. |
-| kurrentdb | tested live | `modules/kurrentdb`, `tests/test_kurrentdb.ae`. |
+| kurrentdb | tested live | `modules/kurrentdb`, servirtium-vcr `pre-recorded/from-testcontainers/kurrentdb/test_kurrentdb.ae` (with Servirtium recordings). |
 | localstack | tested live | `modules/localstack`, servirtium-vcr `pre-recorded/from-testcontainers/localstack/test_localstack.ae` (with Servirtium recordings). |
 | mailpit | tested live | `modules/mailpit`, servirtium-vcr `pre-recorded/from-testcontainers/mailpit/test_mailpit.ae` (with Servirtium recordings). `run` returns the `*docker.Container` and the helpers take it. |
 | mariadb | tested live | `modules/mariadb`, `tests/test_mariadb.ae`. Run, ConnectionString, WithDatabase/Username/Password, WithScripts, WithConfigFile, WithDefaultCredentials, the MYSQL_* mirroring of every MARIADB_* variable; not MustConnectionString. The connection string works with `sql.mysql` and `wait.for_sql` (`tests/test_sql_mysql.ae` runs against MariaDB 12.3.2). |
@@ -146,25 +146,25 @@ that take something else.
 | mysql | tested live | `modules/mysql`, `tests/test_mysql.ae`. Run, ConnectionString, WithDatabase/Username/Password, WithScripts, WithConfigFile, WithDefaultCredentials, ExampleRun_connect (through `sql.mysql`, waiting with `wait.for_sql`); not MustConnectionString. |
 | nats | tested live | `modules/nats`, `tests/test_nats.ae`. Go's argument options are setters on the same request. |
 | nebulagraph | tested live | `modules/nebulagraph`, `tests/test_nebulagraph.ae`. |
-| neo4j | tested live | `modules/neo4j`, `tests/test_neo4j.ae`. |
+| neo4j | tested live | `modules/neo4j`, servirtium-vcr `pre-recorded/from-testcontainers/neo4j/test_neo4j.ae` (with Servirtium recordings). |
 | nginx | tested live | `modules/nginx`, servirtium-vcr `pre-recorded/from-testcontainers/nginx/test_nginx.ae` (with Servirtium recordings). Returns the plain `*docker.Container` (Go's wrapper type stores nothing). |
 | ollama | tested live | `modules/ollama`, `tests/test_ollama.ae`. |
 | openfga | tested live | `modules/openfga`, servirtium-vcr `pre-recorded/from-testcontainers/openfga/test_openfga.ae` (with Servirtium recordings). |
 | openldap | tested live | `modules/openldap`, `tests/test_openldap.ae`. The credentials are read from the request rather than Inspect, `initial_ldif` runs ldapadd with the container's own env; not the go-ldap examples (the test binds with a hand-built BER BindRequest). |
 | opensearch | tested live | `modules/opensearch`, servirtium-vcr `pre-recorded/from-testcontainers/opensearch/test_opensearch.ae` (with Servirtium recordings). |
-| orientdb | tested live | `modules/orientdb`, `tests/test_orientdb.ae`. |
+| orientdb | tested live | `modules/orientdb`, servirtium-vcr `pre-recorded/from-testcontainers/orientdb/test_orientdb.ae` (with Servirtium recordings). |
 | papercutsmtp | tested live | `modules/papercutsmtp`, servirtium-vcr `pre-recorded/from-testcontainers/papercutsmtp/test_papercutsmtp.ae` (with Servirtium recordings). |
 | pinecone | tested live | `modules/pinecone`, servirtium-vcr `pre-recorded/from-testcontainers/pinecone/test_pinecone.ae` (with Servirtium recordings). |
 | podman | not needed | In Go it registers Podman as a runtime provider; here the engine is detected as Podman (DESIGN.md section 8). |
 | postgres | tested live | `modules/postgres`, `tests/test_postgres.ae` (with `TestContainerWithWaitForSQL` through `wait.for_sql`) and `tests/test_sql_postgres.ae`. Not `WithSQLDriver` (Snapshot/Restore keep using psql in the container), `WithSSLCert`. |
-| presto | tested live | `modules/presto`, `tests/test_presto.ae`. |
-| pulsar | tested live | `modules/pulsar`, `tests/test_pulsar.ae`. |
+| presto | tested live | `modules/presto`, servirtium-vcr `pre-recorded/from-testcontainers/presto/test_presto.ae` (with Servirtium recordings). |
+| pulsar | tested live | `modules/pulsar`, servirtium-vcr `pre-recorded/from-testcontainers/pulsar/test_pulsar.ae` (with Servirtium recordings). |
 | qdrant | tested live | `modules/qdrant`, servirtium-vcr `pre-recorded/from-testcontainers/qdrant/test_qdrant.ae` (with Servirtium recordings). |
-| questdb | tested live | `modules/questdb`, `tests/test_questdb.ae`. Go's test image `questdb/questdb:7.4.2` is amd64 only; the test runs `questdb/questdb:9.0.0` (arm64 here). Not the pgx / influxdb clients. |
-| rabbitmq | tested live | `modules/rabbitmq`, `tests/test_rabbitmq.ae`. Run, AmqpURL, AmqpsURL, HttpURL, HttpsURL, WithAdminUsername/Password, WithSSL (the config fragment is a module setting; the node config is built with interpolation instead of text/template; the verification mode is a string). |
-| ravendb | tested live | `modules/ravendb`, `tests/test_ravendb.ae`. |
+| questdb | tested live | `modules/questdb`, servirtium-vcr `pre-recorded/from-testcontainers/questdb/test_questdb.ae` (with Servirtium recordings). Go's test image `questdb/questdb:7.4.2` is amd64 only; the test runs `questdb/questdb:9.0.0` (arm64 here). Not the pgx / influxdb clients. |
+| rabbitmq | tested live | `modules/rabbitmq`, servirtium-vcr `pre-recorded/from-testcontainers/rabbitmq/test_rabbitmq.ae` (with Servirtium recordings). Run, AmqpURL, AmqpsURL, HttpURL, HttpsURL, WithAdminUsername/Password, WithSSL (the config fragment is a module setting; the node config is built with interpolation instead of text/template; the verification mode is a string). |
+| ravendb | tested live | `modules/ravendb`, servirtium-vcr `pre-recorded/from-testcontainers/ravendb/test_ravendb.ae` (with Servirtium recordings). |
 | redis | tested live | `modules/redis`, `tests/test_redis.ae`. Not `WithTLS` (needs run-time certificates). |
-| redpanda | tested live | `modules/redpanda`, `tests/test_redpanda.ae`. |
+| redpanda | tested live | `modules/redpanda`, servirtium-vcr `pre-recorded/from-testcontainers/redpanda/test_redpanda.ae` (with Servirtium recordings). |
 | registry | tested live | `modules/registry`, servirtium-vcr `pre-recorded/from-testcontainers/registry/test_registry.ae` (with Servirtium recordings). Credentials as a user / password pair on image_exists, delete_image, push_image, else the Docker config and its credential helpers; not `SetDockerAuthConfig` / `DockerAuthConfig`, nor Go's platform matching in `PullImage`. |
 | s3mock | tested live | `modules/s3mock`, servirtium-vcr `pre-recorded/from-testcontainers/s3mock/test_s3mock.ae` (with Servirtium recordings). |
 | sbx | not ported | Drives Docker's `sbx` CLI and Docker Sandboxes (a microVM per container with its own Docker engine), which are not released and not available on this Mac; nothing to port against or test. |
@@ -173,11 +173,11 @@ that take something else.
 | socat | tested live | `modules/socat`, `tests/test_socat.ae`. |
 | solace | compile-checked (skipped on Podman) | `modules/solace`, `tests/test_solace.ae`. Rootless Podman refuses the `nofile` ulimit 1048576 Solace needs (crun setrlimit). |
 | solr | tested live | `modules/solr`, servirtium-vcr `pre-recorded/from-testcontainers/solr/test_solr.ae` (with Servirtium recordings). |
-| surrealdb | tested live | `modules/surrealdb`, `tests/test_surrealdb.ae`. Not the examples module (Go SurrealDB SDK). |
+| surrealdb | tested live | `modules/surrealdb`, servirtium-vcr `pre-recorded/from-testcontainers/surrealdb/test_surrealdb.ae` (with Servirtium recordings). Not the examples module (Go SurrealDB SDK). |
 | tidb | tested live | `modules/tidb`, `tests/test_tidb.ae`. |
-| timeplus | tested live | `modules/timeplus`, `tests/test_timeplus.ae`. |
+| timeplus | tested live | `modules/timeplus`, servirtium-vcr `pre-recorded/from-testcontainers/timeplus/test_timeplus.ae` (with Servirtium recordings). |
 | toxiproxy | tested live | `modules/toxiproxy`, servirtium-vcr `pre-recorded/from-testcontainers/toxiproxy/test_toxiproxy.ae` (with Servirtium recordings). |
-| trino | tested live | `modules/trino`, `tests/test_trino.ae`. |
+| trino | tested live | `modules/trino`, servirtium-vcr `pre-recorded/from-testcontainers/trino/test_trino.ae` (with Servirtium recordings). |
 | typesense | tested live | `modules/typesense`, servirtium-vcr `pre-recorded/from-testcontainers/typesense/test_typesense.ae` (with Servirtium recordings). |
 | valkey | tested live | `modules/valkey`, `tests/test_valkey.ae`. Not `WithTLS` / `TLSConfig` (run-time certificates). |
 | vault | tested live | `modules/vault`, servirtium-vcr `pre-recorded/from-testcontainers/vault/test_vault.ae` (with Servirtium recordings). Not the vault-client-go examples (the test calls the HTTP API and the CLI). |
