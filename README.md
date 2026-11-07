@@ -79,28 +79,17 @@ says what is ported, file by file, and the state of every module.
   nothing of testcontainers and will become a package of its own;
   `sql/README.md`.
 - `tests/`, run against a real engine with `tests/run.sh`.
-- `recordings/`, Servirtium tapes of six modules' HTTP test cases, which
-  replay with no engine (`TCAE_VCR=playback`, `recordings/README.md`).
+- Servirtium recordings of modules' HTTP APIs live in servirtium-vcr
+  (`pre-recorded/from-testcontainers/`), which depends on this package.
 
 ## For test engineers
 
 ### Install
 
-Once the package is published: `ae add <host>/<owner>/testcontainers-ae`
-in the project that holds your tests. Until then, point a placeholder
-dependency at a checkout with `[patch]` in your project's `aether.toml`:
-
-```toml
-[dependencies]
-"github.com/paul-hammant/testcontainers-ae" = "v0.1.0"
-
-[patch]
-"github.com/paul-hammant/testcontainers-ae" = "../testcontainers-ae"
-```
-
-`ae run` and `ae build` honour that; `ae test` does not read
-`[dependencies]` yet (an Aether gap), so give it the checkout as a library
-directory: `AETHER_LIB_DIR=../testcontainers-ae ae test tests/`. Either way
+`ae add github.com/servirtium/testcontainers-ae` in the project that holds
+your tests (the default branch, pinned by tree hash in `aether.toml`; a
+`[patch]` entry points it at a local checkout instead). `ae test` reads
+`[dependencies]` too (checked on Aether 0.897.0). Then
 `import testcontainers`, `import testcontainers.wait` and
 `import modules.redis` resolve (the package exports its root,
 `modules = "."`). The toolchain needs the Unix-socket support in
@@ -181,23 +170,13 @@ request order (DESIGN.md section 2).
 
 ### Recording the HTTP conversation, and replaying it without the container
 
-`import testcontainers.servirtium` puts [Servirtium](https://servirtium.dev)
-between a test and a container it talks HTTP to. The case asks for its base
-URL with `base, rec = servirtium.recording("test_vault", "reads_a_secret",
-container_url)` and ends with `servirtium.end_recording(rec)`; the
-container start sits in `if servirtium.live() == 1 { ... }`. With
-`TCAE_VCR=record` every request and response is written to
-`recordings/test_vault/reads_a_secret.md`, a Servirtium markdown tape, with
-ids and timestamps normalized and credentials redacted so a re-record is
-byte-identical (`TCAE_VCR=check` fails when it is not). With
-`TCAE_VCR=playback` no container starts and no engine is needed: a
-Servirtium server in the test process answers from the tape, and a request
-that differs from the recording fails the case. Unset, nothing changes.
-Six modules' tests are wired this way (vault, couchdb, consul, openfga,
-typesense, mockserver); `recordings/README.md` has the layout, the
-normalizations and how to re-record, DESIGN.md section 15 the API. It needs
-a servirtium-vcr checkout beside this one (`lib/servirtium_vcr` links to
-`../servirtium-vcr/core`).
+Servirtium-in-the-middle recordings of modules' HTTP APIs (Vault, CouchDB,
+Consul, OpenFGA, Typesense, MockServer, ...) live in
+[servirtium-vcr](https://github.com/servirtium/servirtium-vcr), under
+`pre-recorded/from-testcontainers/`: a test per service that starts the
+container with this package and records its conversation as tapes any
+language's Servirtium can replay. They moved there on 2026-11-07, with the
+recorder, so this package does not depend on Servirtium.
 
 ### Running some of the tests
 
@@ -315,9 +294,6 @@ the port's report:
 - A string literal passed to an `int` parameter of a std extern
   (`string.pad_start(s, 4, "0")`) passes the type checker and fails in the C
   compiler.
-- `ae test` and `ae check` do not resolve a project's `[dependencies]` /
-  `[patch]` (`ae run` and `ae build` do), so a consumer's tests need
-  `AETHER_LIB_DIR` until they do.
 - A local `ptr[] xs = []` declaration does not parse (`let xs: ptr[] = []`
   does; `string[] xs = []` does). Nor does `long[] xs = []`, `n: long = 0`
   or `mod.Type[] xs = []` (the `let` form does).

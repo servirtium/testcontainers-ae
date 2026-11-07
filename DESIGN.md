@@ -14,7 +14,6 @@ writing tests with it, and an agent porting one of testcontainers-go's
 | `import testcontainers.network` | `network` | `testcontainers/network/module.ae` | Creating and removing user-defined networks. |
 | `import testcontainers.docker` | `docker` | `testcontainers/docker/module.ae` | The engine client underneath: discovery, configuration, the Engine API over a Unix socket (or plain `tcp://`), JSON, stream demultiplexing, the `Container` and `Network` structs. Imported by modules and by programs that want raw access. |
 | `import testcontainers.testing` | `testing` | `testcontainers/testing/module.ae` | `std.spec` helpers: skip when there is no engine, clean up containers and networks after a case. |
-| `import testcontainers.servirtium` | `servirtium` | `testcontainers/servirtium/module.ae` | Servirtium record/playback between an HTTP test and its container (section 15). Needs `lib/servirtium_vcr`. |
 | `import modules.redis` | `redis` | `modules/redis/module.ae` | The model module. |
 | `import sql` | `sql` | `sql/module.ae` | A `database/sql`-shaped interface with drivers registered by name (section 14). Not part of testcontainers: it imports none of it. |
 | `import sql.postgres as pgsql` | `pgsql` | `sql/postgres/module.ae` | The PostgreSQL driver, a port of jackc/pgx (`pgproto3`, `pgconn` under it). |
@@ -436,8 +435,8 @@ Rules of thumb:
    mapped port, not just that it started. Tests are **representative, not
    exhaustive**: where the service has an HTTP/REST interface (vault,
    consul, registry, couchdb, ...) exercise that interface with
-   std.http.client (Servirtium recordings may later be extracted from these
-   tests); for a pure wire-protocol service (MQTT, AMQP, LDAP, MySQL, ...)
+   std.http.client (servirtium-vcr's pre-recorded suites cover the HTTP
+   ones); for a pure wire-protocol service (MQTT, AMQP, LDAP, MySQL, ...)
    one representative check is enough (a handshake, one round trip with
    std.tcp / std.resp, or the service's own CLI through `tc.exec`). An
    option gets the one assertion that shows it took effect. It ends every container it starts (`testing.cleanup_container(c)`
@@ -678,78 +677,10 @@ connection, as Go's is on another pool connection. With one connection, a
 rather than run inside it. A pool replaces `DB.conn` without changing the
 API. Rows are read whole by the driver (no streaming cursor yet).
 
-## 15. Servirtium in the middle: recorded HTTP scenarios
+## 15. Servirtium in the middle: moved to servirtium-vcr
 
-Not in testcontainers-go. A module test that talks plain HTTP to its
-container can put a [Servirtium](https://servirtium.dev) recorder between
-the two, so each case leaves a markdown tape of the conversation, and the
-same case can later run from that tape with no container at all. The
-point is the tapes: test scenarios a project keeps after it drops the
-container (`recordings/README.md`).
-
-```aether
-import testcontainers.servirtium
-
-fw = spec.init()
-if servirtium.skip_if_no_engine(fw) == 1 { return spec.run_summary(fw) }  // playback needs none
-servirtium.redact(servirtium.FIELD_REQUEST_HEADERS, TOKEN, "REDACTED-TOKEN")
-servirtium.normalize(servirtium.UUID, "uuid")
-servirtium.collapse(servirtium.RFC3339, "2000-01-01T00:00:00Z")
-
-spec.it("reads a secret") callback {
-    addr = ""
-    if servirtium.live() == 1 {                 // 0 in playback
-        c, err = vault.run(IMAGE) { token(TOKEN) }
-        testing.cleanup_container(c)
-        spec.assert_ok(err, "vault starts")
-        if err != "" { return }
-        a, _ = vault.http_host_address(c)
-        addr = a
-    }
-    base, rec = servirtium.recording("test_vault", "reads_a_secret", addr)
-    ... requests to base ...
-    servirtium.end_recording(rec)
-}
-```
-
-`recording(suite, case, upstream_url) -> (string, ptr)` and
-`end_recording(handle)` do what `TCAE_VCR` says:
-
-| `TCAE_VCR` | `recording` returns | `end_recording` |
-|---|---|---|
-| unset / `off` | `upstream_url`, null | nothing |
-| `record` | a recorder on a free loopback port, forwarding to `upstream_url` | writes `recordings/<suite>/<case>.md` |
-| `check` | the same | fails the case when the tape differs from the committed one (`.md.actual` left beside it) |
-| `playback` | a replay server on a free loopback port, from the tape | fails the case on any mismatch or unplayed interaction |
-
-`suite` and `case` are snake-cased (`case_name`); `TCAE_VCR_DIR` moves
-`recordings/`. Rules registered with `normalize` (regex to stable
-`{{name-N}}` tokens, which round-trip when a minted id comes back in a
-later request), `collapse` (regex to a constant), `redact` (a secret to a
-placeholder on the tape, swapped back for matching on playback) and
-`remove_header` apply to every recording after them in the process
-(`clear_rules` empties them). Always applied: the `Date`, `X-Request-Id`
-and `X-Correlation-Id` response headers are dropped, and the container's
-mapped `host:port` and the recorder's own become `{{request.host}}`, which
-playback fills with the replay server's address. Servirtium leaves `Host`,
-`Connection`, `Content-Length` and `Accept-Encoding` out of a recorded
-request, and std.http.client sends nothing else of its own, so a tape's
-request headers are the ones the test set (an HTTP client that adds, say,
-`User-Agent` wants `remove_header` for it).
-
-What does not go over HTTP (`tc.exec`, `tc.inspect`, a container that must
-fail to start) stays in the `live()` part of a case, or in a case gated
-with `spec.it_when(servirtium.live(), ...)`, and does not run in playback.
-A polling loop replays exactly as it ran when recorded (the same failures
-in the same order), but a loop whose iteration count varies with timing
-makes the tape differ between records; the wired suites avoid them.
-
-**Where servirtium-vcr comes from.** `lib/servirtium_vcr` is a committed
-relative symlink to `../servirtium-vcr/core`, the workspace's
-sibling-checkout convention: `ae test` searches a project's `lib/` before
-anything else, and does not read `[dependencies]` (README, Known gaps), so
-neither `ae add` nor `[patch]` would reach `ae test`. servirtium-vcr has no
-`aether.toml` of its own; its core is pure Aether (`core/vcr.ae` and
-`core/secret_fields.ae`), compiled into each test, with no shared library.
-Only tests importing `testcontainers.servirtium` need the checkout.
+The Servirtium recorder (formerly `testcontainers.servirtium`) and the
+suites and tapes it recorded moved to servirtium-vcr's
+`pre-recorded/from-testcontainers/` on 2026-11-07. Recordings depend on
+this package; this package does not depend on Servirtium.
 
