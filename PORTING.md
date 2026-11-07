@@ -124,7 +124,7 @@ that take something else.
 | gcloud/datastore | tested live | `modules/gcloud/datastore`, servirtium-vcr `pre-recorded/from-testcontainers/gcloud_datastore/test_gcloud_datastore.ae` (with Servirtium recordings). |
 | gcloud/firestore | tested live | `modules/gcloud/firestore`, servirtium-vcr `pre-recorded/from-testcontainers/gcloud_firestore/test_gcloud_firestore.ae` (with Servirtium recordings). |
 | gcloud/pubsub | tested live | `modules/gcloud/pubsub`, servirtium-vcr `pre-recorded/from-testcontainers/gcloud_pubsub/test_gcloud_pubsub.ae` (with Servirtium recordings). |
-| gcloud/spanner | compile-checked (`TCAE_LIVE_SPANNER=1`) | `modules/gcloud/spanner`, `tests/test_gcloud_spanner.ae`. Alpha, no engine used to port it. |
+| gcloud/spanner | live (`TCAE_LIVE_SPANNER=1`) | `modules/gcloud/spanner`, `tests/test_gcloud_spanner.ae`. Checks gRPC 9010 by TCP connect and REST 9020 by HTTP. |
 | grafana-lgtm | tested live | `modules/grafana_lgtm`, servirtium-vcr `pre-recorded/from-testcontainers/grafana_lgtm/test_grafana_lgtm.ae` (with Servirtium recordings). `modules/grafana_lgtm` (`import modules.grafana_lgtm`): an Aether module path cannot have a `-`. |
 | inbucket | tested live | `modules/inbucket`, servirtium-vcr `pre-recorded/from-testcontainers/inbucket/test_inbucket.ae` (with Servirtium recordings). |
 | influxdb | tested live | `modules/influxdb`, servirtium-vcr `pre-recorded/from-testcontainers/influxdb/test_influxdb.ae` (with Servirtium recordings). |

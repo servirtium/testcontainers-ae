@@ -1,6 +1,6 @@
 // Ported from testcontainers-go modules/gcloud/examples/spanner/examples_test.go (ExampleRun)
 //
-// Compile-checked only. The engine-free case checks the module's request
+// The engine-free case checks the module's request
 // defaults, option and helper output for real. The case that starts the
 // emulator runs only with TCAE_LIVE_SPANNER=1 and an engine.
 
@@ -52,6 +52,8 @@ main() {
             exposed = tc.req_exposed(r)
             spec.assert_true(exposed.len >= 1, "ports are exposed")
             spec.assert_str_eq(exposed[0], spanner.PORT, "the emulator port")
+            spec.assert_true(exposed.len >= 2, "the REST port is exposed too")
+            spec.assert_str_eq(exposed[1], spanner.REST_PORT, "the REST port")
             spanner.project_id(r, "spanner-project")
             spec.assert_str_eq(tc.req_setting(r, "spanner.project_id"), "spanner-project", "project_id replaces it")
             spec.assert_str_eq(spanner.emulator_env_entry("localhost:1234"), "SPANNER_EMULATOR_HOST=localhost:1234", "emulator env entry")
@@ -81,6 +83,15 @@ main() {
             sock, cerr = tcp.connect(h, p)
             spec.assert_ok(cerr, "connect to the emulator")
             if cerr == "" { tcp.tcp_close(sock) }
+
+            // and the REST/JSON API on 9020 answers
+            rp, rperr = tc.mapped_port(g.container, spanner.REST_PORT)
+            spec.assert_ok(rperr, "mapped REST port")
+            spec.assert_str_eq(spanner.rest_url(g), "http://${h}:${rp}", "rest_url is http://host:port")
+            st, body, herr = http_do("GET", "${spanner.rest_url(g)}/v1/projects/spanner-project/instanceConfigs", "")
+            spec.assert_ok(herr, "REST request")
+            spec.assert_eq(st, 200, "instanceConfigs is 200: ${body}")
+            spec.assert_contains(body, "instanceConfigs", "the configs are listed")
         }
     }
     return spec.run_summary(fw)

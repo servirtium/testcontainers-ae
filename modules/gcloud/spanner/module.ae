@@ -12,12 +12,17 @@
 //     spanner.uri(c)                    // "localhost:32771" (host:port, no scheme)
 //     spanner.project_id_of(c)          // "spanner-project"
 //     spanner.emulator_env(c)           // ("SPANNER_EMULATOR_HOST", "localhost:32771")
+//     spanner.rest_url(c)               // "http://localhost:32772" (the REST/JSON API, 9020)
 //
 // The Spanner image starts the emulator by itself, so there is no command.
 // emulator_env is added: the variable the Google client libraries read to
 // talk to the emulator instead of the real service.
 //
-// Status: compile-checked only (alpha; no engine was used to port it).
+// The emulator also serves the Spanner REST/JSON API on 9020, which is what
+// rest_url gives (no gRPC client is needed to drive it).
+//
+// Status: runs live (podman, 2026-11-07): both ports answer and the REST
+// API lists instance configs.
 //
 // Not ported: Go's old flat gcloud.spanner constructor (deprecated, replaced by
 // this module) and the Google Cloud client SDK code of Go's examples (no
@@ -31,11 +36,12 @@ import testcontainers.docker
 
 exports(
     SpannerContainer, run, terminate, project_id, project_id_of, uri, emulator_env,
-    emulator_env_entry, PORT, DEFAULT_PROJECT_ID, DEFAULT_IMAGE, EMULATOR_HOST_VAR,
+    emulator_env_entry, rest_url, PORT, REST_PORT, DEFAULT_PROJECT_ID, DEFAULT_IMAGE, EMULATOR_HOST_VAR,
     spanner_request_new, spanner_request_free
 )
 
 const PORT = "9010/tcp"
+const REST_PORT = "9020/tcp"
 const DEFAULT_PROJECT_ID = "test-project"
 const DEFAULT_IMAGE = "gcr.io/cloud-spanner-emulator/emulator:1.5.40"
 const EMULATOR_HOST_VAR = "SPANNER_EMULATOR_HOST"
@@ -46,13 +52,16 @@ struct SpannerContainer {
     container: *docker.Container
     pid: string
     addr: string
+    rest: string
 }
 
 spanner_request_new() -> ptr {
     r = tc.request_new()
     tc.expose(r, PORT)
+    tc.expose(r, REST_PORT)
     tc.wait_for(r, wait.for_all([
         wait.for_listening_port(PORT),
+        wait.for_listening_port(REST_PORT),
         wait.for_log("Cloud Spanner emulator running")
     ]))
     tc.set_setting(r, SET_PROJECT, DEFAULT_PROJECT_ID)
@@ -77,11 +86,15 @@ builder run(image: string) with spanner_request_new -> (*SpannerContainer, strin
     g.container = c
     g.pid = pid
     g.addr = ""
+    g.rest = ""
     if err != "" { return g, "run spanner: ${err}" }
     // the URI uses the empty string as the protocol: host:port
     ep, eerr = tc.endpoint(c, PORT, "")
     if eerr != "" { return g, "port endpoint: ${eerr}" }
     g.addr = ep
+    rep, rerr = tc.endpoint(c, REST_PORT, "http")
+    if rerr != "" { return g, "rest endpoint: ${rerr}" }
+    g.rest = rep
     return g, ""
 }
 
@@ -99,3 +112,6 @@ uri(g: *SpannerContainer) -> string { return g.addr }
 
 // The environment variable (name, value) the Google client libraries read.
 emulator_env(g: *SpannerContainer) -> (string, string) { return EMULATOR_HOST_VAR, g.addr }
+
+// "http://host:port" of the REST/JSON API (port 9020).
+rest_url(g: *SpannerContainer) -> string { return g.rest }
