@@ -54,7 +54,7 @@ in `tests/` that name them in their first line.
 | `wait/walk.go` | | not ported | Walking a strategy tree; `describe` covers the tree for messages. |
 | `wait/errors.go`, `wait/errors_windows.go` | | not ported | Go's connection-refused classification; a dial here just retries. |
 | `wait/sql.go` | `testcontainers/wait/module.ae` (`for_sql`, `with_query`) | ported | Over this repository's `sql` package (DESIGN.md section 14). Drivers: `postgres` / `pgx` / `pgx/v5` (`sql/postgres`, ported from jackc/pgx v5.9.2; register with `sql.postgres`'s `register()`) and `mysql` (`sql/mysql`, MySQL and MariaDB, ported from go-sql-driver/mysql v1.9.3, MPL-2.0; register with `sql.mysql`'s `register()`). Each poll opens a fresh connection (Go keeps one `sql.DB`). `tests/test_sql_unit.ae` (Go's `sql_test.go` cases without a container), `tests/test_sql_postgres.ae`, `tests/test_postgres.ae` (`TestContainerWithWaitForSQL`), `tests/test_cockroachdb.ae`, `tests/test_sql_mysql.ae` (MySQL 8.0.36 and MariaDB 12.3.2), `tests/test_mysql.ae` (`ExampleRun_connect`). |
-| `wait/tls.go` | `testcontainers/wait/module.ae` (`for_tls_cert`, `for_tls_root_cas`, `with_root_cas`, `with_cert`, `with_server_name`, `tls_ca_file`, ...) | ported | The files are checked to be PEM, not parsed as X.509; the CA bundle is written to a host file for `with_tls_config_from`. No client certificates (std.http.client has none); `with_server_name` only for loopback names. Live in `tests/test_cockroachdb.ae` (secure /health verified against the CA, server name 127.0.0.1), `tests/test_elasticsearch.ae` (HTTPS wait verified against the container's CA) and `tests/test_fakegcsserver.ae` (https, no verification). |
+| `wait/tls.go` | `testcontainers/wait/module.ae` (`for_tls_cert`, `for_tls_root_cas`, `with_root_cas`, `with_cert`, `with_server_name`, `tls_ca_file`, ...) | ported | The files are checked to be PEM, not parsed as X.509; the CA bundle is written to a host file for `with_tls_config_from`. No client certificates (std.http.client has none); `with_server_name` only for loopback names. Live in `tests/test_cockroachdb.ae` (secure /health verified against the CA, server name 127.0.0.1), servirtium-vcr's `pre-recorded/from-testcontainers/elasticsearch/test_elasticsearch.ae` (HTTPS wait verified against the container's CA) and `tests/test_fakegcsserver.ae` (https, no verification). |
 | `parallel.go` | `testcontainers/module.ae` (`container_request`, `parallel`) | ported | `ParallelContainers` as `tc.parallel(reqs, workers)` on `std.worker` threads (default 8 workers, Go's); containers and errors come back index-aligned, with Go's joined error. `tests/test_parallel.ae`. |
 | `port_forwarding.go` | `testcontainers/module.ae` (`host_access_port`, `HOST_INTERNAL`) | ported, differently | `host.testcontainers.internal` through the engine's `host-gateway` extra host instead of an sshd sidecar with SSH reverse tunnels (no SSH client in Aether); DESIGN.md section 12 says where the host service must listen per engine. `tests/test_host_access.ae`. |
 | `validator.go`, `generate.go` | | not ported | Go tooling. |
@@ -101,9 +101,9 @@ that take something else.
 | clickhouse | tested live | `modules/clickhouse`, `tests/test_clickhouse.ae`. |
 | cockroachdb | tested live | `modules/cockroachdb`, `tests/test_cockroachdb.ae`. The secure start waits with `wait.for_tls_cert` and HTTPS `/health` verified against the CA; the SQL ping is `wait.for_sql` (pgx/v5) as in Go: plain when insecure, TLS 1.3 `verify-full` against the container's CA with a password. A secure start without a password (root, Go's default) needs a client certificate, which the TLS client cannot present yet, so that one case pings with `cockroach sql` in the container. The test also queries through `sql` over TLS. |
 | compose | compile-checked (`TCAE_LIVE_COMPOSE=1`) | `modules/compose`, `tests/test_compose.ae`. Go's `ComposeStack` through the compose CLI (DESIGN.md section 11); the engine-free cases (command lines, CLI discovery, services, profiles, the label override) run in every run, the cases that start a project only with the variable. Not the compose-go / docker/compose library flavour. |
-| consul | tested live | `modules/consul`, `tests/test_consul.ae`. Run, ApiEndpoint, WithConfigString, WithConfigFile; not the consul client used in Go's examples (the test uses the HTTP API). |
+| consul | tested live | `modules/consul`, servirtium-vcr `pre-recorded/from-testcontainers/consul/test_consul.ae` (with Servirtium recordings). Run, ApiEndpoint, WithConfigString, WithConfigFile; not the consul client used in Go's examples (the test uses the HTTP API). |
 | couchbase | tested live | `modules/couchbase`, `tests/test_couchbase.ae`. |
-| couchdb | tested live | `modules/couchdb`, `tests/test_couchdb.ae`. The test uses the HTTP API. |
+| couchdb | tested live | `modules/couchdb`, servirtium-vcr `pre-recorded/from-testcontainers/couchdb/test_couchdb.ae` (with Servirtium recordings). The test uses the HTTP API. |
 | cratedb | tested live | `modules/cratedb`, `tests/test_cratedb.ae`. |
 | databend | tested live | `modules/databend`, `tests/test_databend.ae`. |
 | dex | tested live | `modules/dex`, `tests/test_dex.ae`. `user` takes a bcrypt **hash** of the password (no bcrypt in Aether's std; Go hashes at render time): make one with `htpasswd -bnBC 10 "" pw`. |
@@ -112,7 +112,7 @@ that take something else.
 | dockermodelrunner | compile-checked (Docker Desktop only) | `modules/dockermodelrunner`, `tests/test_dockermodelrunner.ae`. Needs Docker Desktop's `model-runner.docker.internal`; the test skips on every other engine, as Go's does. |
 | dolt | tested live | `modules/dolt`, `tests/test_dolt.ae`. |
 | dynamodb | tested live | `modules/dynamodb`, `tests/test_dynamodb.ae`. |
-| elasticsearch | tested live | `modules/elasticsearch`, `tests/test_elasticsearch.ae`. 8.x secure start: the HTTP wait verifies against the CA read from the container (Go skips verification). |
+| elasticsearch | tested live | `modules/elasticsearch`, servirtium-vcr `pre-recorded/from-testcontainers/elasticsearch/test_elasticsearch.ae` (with Servirtium recordings). 8.x secure start: the HTTP wait verifies against the CA read from the container (Go skips verification). |
 | etcd | tested live | `modules/etcd`, `tests/test_etcd.ae`. With clusters: WithNodes, WithClusterToken, WithDataDir, WithAdditionalArgs, ClientEndpoint(s), PeerEndpoint(s), Terminate. The options are module settings (`tc.set_setting`); further cluster nodes run from `tc.request_copy` of the caller's request, so they get the caller's options as in Go. `additional_args` appends on every call (Go keeps the last call's); fewer than two `nodes` means one node. Not the etcd client of Go's examples (the test uses the v3 JSON gateway and etcdctl). |
 | fakegcsserver | tested live | `modules/fakegcsserver`, `tests/test_fakegcsserver.ae`. `scheme("https")` waits over HTTPS without verification, as Go. |
 | firebird | tested live | `modules/firebird`, `tests/test_firebird.ae`. |
@@ -138,8 +138,8 @@ that take something else.
 | meilisearch | tested live | `modules/meilisearch`, `tests/test_meilisearch.ae`. WithDumpImport's file copy and import command are one setter. |
 | memcached | tested live | `modules/memcached`, `tests/test_memcached.ae`. |
 | milvus | tested live | `modules/milvus`, `tests/test_milvus.ae`. |
-| minio | tested live | `modules/minio`, `tests/test_minio.ae`. Go's default image (`quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z`) can no longer be pulled (quay.io and Docker Hub refuse it as of 2026-11); the test runs `cgr.dev/chainguard/minio:latest`, which takes the same command. S3 calls signed with SigV4 by the test (no minio-go). |
-| mockserver | tested live | `modules/mockserver`, `tests/test_mockserver.ae`. Through the REST API (mock-server-client-go is not ported). |
+| minio | tested live | `modules/minio`, servirtium-vcr `pre-recorded/from-testcontainers/minio/test_minio.ae` (with Servirtium recordings). Go's default image (`quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z`) can no longer be pulled (quay.io and Docker Hub refuse it as of 2026-11); the test runs `cgr.dev/chainguard/minio:latest`, which takes the same command. S3 calls signed with SigV4 by the test (no minio-go). |
+| mockserver | tested live | `modules/mockserver`, servirtium-vcr `pre-recorded/from-testcontainers/mockserver/test_mockserver.ae` (with Servirtium recordings). Through the REST API (mock-server-client-go is not ported). |
 | mongodb | tested live | `modules/mongodb`, `tests/test_mongodb.ae`. Run, ConnectionString, WithUsername/Password, WithReplicaSet (with auth: Go's entrypoint-tc.sh verbatim, the key file, rs.initiate). `connection_string` does not percent-encode the credentials; not the atlaslocal sub-module. The test speaks OP_MSG to the mapped port. |
 | mosquitto | tested live | `modules/mosquitto`, `tests/test_mosquitto.ae`. Returns the plain `*docker.Container` (Go's wrapper type stores nothing). |
 | mssql | tested live | `modules/mssql`, `tests/test_mssql.ae`. |
@@ -149,9 +149,9 @@ that take something else.
 | neo4j | tested live | `modules/neo4j`, `tests/test_neo4j.ae`. |
 | nginx | tested live | `modules/nginx`, `tests/test_nginx.ae`. Returns the plain `*docker.Container` (Go's wrapper type stores nothing). |
 | ollama | tested live | `modules/ollama`, `tests/test_ollama.ae`. |
-| openfga | tested live | `modules/openfga`, `tests/test_openfga.ae`. |
+| openfga | tested live | `modules/openfga`, servirtium-vcr `pre-recorded/from-testcontainers/openfga/test_openfga.ae` (with Servirtium recordings). |
 | openldap | tested live | `modules/openldap`, `tests/test_openldap.ae`. The credentials are read from the request rather than Inspect, `initial_ldif` runs ldapadd with the container's own env; not the go-ldap examples (the test binds with a hand-built BER BindRequest). |
-| opensearch | tested live | `modules/opensearch`, `tests/test_opensearch.ae`. |
+| opensearch | tested live | `modules/opensearch`, servirtium-vcr `pre-recorded/from-testcontainers/opensearch/test_opensearch.ae` (with Servirtium recordings). |
 | orientdb | tested live | `modules/orientdb`, `tests/test_orientdb.ae`. |
 | papercutsmtp | tested live | `modules/papercutsmtp`, `tests/test_papercutsmtp.ae`. |
 | pinecone | tested live | `modules/pinecone`, `tests/test_pinecone.ae`. |
@@ -178,9 +178,9 @@ that take something else.
 | timeplus | tested live | `modules/timeplus`, `tests/test_timeplus.ae`. |
 | toxiproxy | tested live | `modules/toxiproxy`, `tests/test_toxiproxy.ae`. |
 | trino | tested live | `modules/trino`, `tests/test_trino.ae`. |
-| typesense | tested live | `modules/typesense`, `tests/test_typesense.ae`. |
+| typesense | tested live | `modules/typesense`, servirtium-vcr `pre-recorded/from-testcontainers/typesense/test_typesense.ae` (with Servirtium recordings). |
 | valkey | tested live | `modules/valkey`, `tests/test_valkey.ae`. Not `WithTLS` / `TLSConfig` (run-time certificates). |
-| vault | tested live | `modules/vault`, `tests/test_vault.ae`. Not the vault-client-go examples (the test calls the HTTP API and the CLI). |
+| vault | tested live | `modules/vault`, servirtium-vcr `pre-recorded/from-testcontainers/vault/test_vault.ae` (with Servirtium recordings). Not the vault-client-go examples (the test calls the HTTP API and the CLI). |
 | vearch | tested live | `modules/vearch`, `tests/test_vearch.ae`. |
 | weaviate | tested live | `modules/weaviate`, `tests/test_weaviate.ae`. |
 | yugabytedb | compile-checked (`TCAE_YUGABYTEDB=1`) | `modules/yugabytedb`, `tests/test_yugabytedb.ae`. On the Podman machine the container was killed (exit 137) while yugabyted was starting. |

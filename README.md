@@ -171,7 +171,7 @@ request order (DESIGN.md section 2).
 ### Recording the HTTP conversation, and replaying it without the container
 
 Servirtium-in-the-middle recordings of modules' HTTP APIs (Vault, CouchDB,
-Consul, OpenFGA, Typesense, MockServer, ...) live in
+Consul, OpenFGA, Typesense, MockServer, MinIO, OpenSearch, Elasticsearch) live in
 [servirtium-vcr](https://github.com/servirtium/servirtium-vcr), under
 `pre-recorded/from-testcontainers/`: a test per service that starts the
 container with this package and records its conversation as tapes any
