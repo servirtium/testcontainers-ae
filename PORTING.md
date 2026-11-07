@@ -54,7 +54,7 @@ in `tests/` that name them in their first line.
 | `wait/walk.go` | | not ported | Walking a strategy tree; `describe` covers the tree for messages. |
 | `wait/errors.go`, `wait/errors_windows.go` | | not ported | Go's connection-refused classification; a dial here just retries. |
 | `wait/sql.go` | `testcontainers/wait/module.ae` (`for_sql`, `with_query`) | ported | Over this repository's `sql` package (DESIGN.md section 14). Drivers: `postgres` / `pgx` / `pgx/v5` (`sql/postgres`, ported from jackc/pgx v5.9.2; register with `sql.postgres`'s `register()`) and `mysql` (`sql/mysql`, MySQL and MariaDB, ported from go-sql-driver/mysql v1.9.3, MPL-2.0; register with `sql.mysql`'s `register()`). Each poll opens a fresh connection (Go keeps one `sql.DB`). `tests/test_sql_unit.ae` (Go's `sql_test.go` cases without a container), `tests/test_sql_postgres.ae`, `tests/test_postgres.ae` (`TestContainerWithWaitForSQL`), `tests/test_cockroachdb.ae`, `tests/test_sql_mysql.ae` (MySQL 8.0.36 and MariaDB 12.3.2), `tests/test_mysql.ae` (`ExampleRun_connect`). |
-| `wait/tls.go` | `testcontainers/wait/module.ae` (`for_tls_cert`, `for_tls_root_cas`, `with_root_cas`, `with_cert`, `with_server_name`, `tls_ca_file`, ...) | ported | The files are checked to be PEM, not parsed as X.509; the CA bundle is written to a host file for `with_tls_config_from`. No client certificates (std.http.client has none); `with_server_name` only for loopback names. Live in `tests/test_cockroachdb.ae` (secure /health verified against the CA, server name 127.0.0.1), servirtium-vcr's `pre-recorded/from-testcontainers/elasticsearch/test_elasticsearch.ae` (HTTPS wait verified against the container's CA) and `tests/test_fakegcsserver.ae` (https, no verification). |
+| `wait/tls.go` | `testcontainers/wait/module.ae` (`for_tls_cert`, `for_tls_root_cas`, `with_root_cas`, `with_cert`, `with_server_name`, `tls_ca_file`, ...) | ported | The files are checked to be PEM, not parsed as X.509; the CA bundle is written to a host file for `with_tls_config_from`. No client certificates (std.http.client has none); `with_server_name` only for loopback names. Live in `tests/test_cockroachdb.ae` (secure /health verified against the CA, server name 127.0.0.1), servirtium-vcr's `pre-recorded/from-testcontainers/elasticsearch/test_elasticsearch.ae` (HTTPS wait verified against the container's CA) and servirtium-vcr `pre-recorded/from-testcontainers/fakegcsserver/test_fakegcsserver.ae` (with Servirtium recordings) (https, no verification). |
 | `parallel.go` | `testcontainers/module.ae` (`container_request`, `parallel`) | ported | `ParallelContainers` as `tc.parallel(reqs, workers)` on `std.worker` threads (default 8 workers, Go's); containers and errors come back index-aligned, with Go's joined error. `tests/test_parallel.ae`. |
 | `port_forwarding.go` | `testcontainers/module.ae` (`host_access_port`, `HOST_INTERNAL`) | ported, differently | `host.testcontainers.internal` through the engine's `host-gateway` extra host instead of an sshd sidecar with SSH reverse tunnels (no SSH client in Aether); DESIGN.md section 12 says where the host service must listen per engine. `tests/test_host_access.ae`. |
 | `validator.go`, `generate.go` | | not ported | Go tooling. |
@@ -89,13 +89,13 @@ that take something else.
 | arangodb | tested live | `modules/arangodb`, `tests/test_arangodb.ae`. |
 | artemis | tested live | `modules/artemis`, `tests/test_artemis.ae`. |
 | azure | family, below | Go's `modules/azure` holds six modules; the old flat package is not ported. |
-| azure/azurite | tested live | `modules/azurite`, `tests/test_azurite.ae`. Go's `modules/azurite` re-exports `modules/azure/azurite`; one port, `import modules.azurite`. |
+| azure/azurite | tested live | `modules/azurite`, servirtium-vcr `pre-recorded/from-testcontainers/azurite/test_azurite.ae` (with Servirtium recordings). Go's `modules/azurite` re-exports `modules/azure/azurite`; one port, `import modules.azurite`. |
 | azure/cosmosdb | compile-checked (`TCAE_LIVE_COSMOSDB=1`) | `modules/azure/cosmosdb`, `tests/test_azure_cosmosdb.ae`. Alpha, no engine used to port it; not the azcosmos SDK examples. |
 | azure/eventhubs | compile-checked (`TCAE_LIVE_EVENTHUBS=1`) | `modules/azure/eventhubs`, `tests/test_azure_eventhubs.ae`. With its Azurite and a typed config. |
 | azure/lowkeyvault | compile-checked (`TCAE_LIVE_LOWKEYVAULT=1`) | `modules/azure/lowkeyvault`, `tests/test_azure_lowkeyvault.ae`.  |
 | azure/servicebus | compile-checked (`TCAE_LIVE_SERVICEBUS=1`) | `modules/azure/servicebus`, `tests/test_azure_servicebus.ae`. With its SQL Server. |
 | azure/sqledge | compile-checked (`TCAE_LIVE_SQLEDGE=1`) | `modules/azure/sqledge`, `tests/test_azure_sqledge.ae`.  |
-| azurite | tested live | `modules/azurite`, `tests/test_azurite.ae`. |
+| azurite | tested live | `modules/azurite`, servirtium-vcr `pre-recorded/from-testcontainers/azurite/test_azurite.ae` (with Servirtium recordings). |
 | cassandra | tested live | `modules/cassandra`, `tests/test_cassandra.ae`. |
 | chroma | tested live | `modules/chroma`, `tests/test_chroma.ae`. |
 | clickhouse | tested live | `modules/clickhouse`, `tests/test_clickhouse.ae`. |
@@ -111,19 +111,19 @@ that take something else.
 | dockermcpgateway | tested live | `modules/dockermcpgateway`, `tests/test_dockermcpgateway.ae`. |
 | dockermodelrunner | compile-checked (Docker Desktop only) | `modules/dockermodelrunner`, `tests/test_dockermodelrunner.ae`. Needs Docker Desktop's `model-runner.docker.internal`; the test skips on every other engine, as Go's does. |
 | dolt | tested live | `modules/dolt`, `tests/test_dolt.ae`. |
-| dynamodb | tested live | `modules/dynamodb`, `tests/test_dynamodb.ae`. |
+| dynamodb | tested live | `modules/dynamodb`, servirtium-vcr `pre-recorded/from-testcontainers/dynamodb/test_dynamodb.ae` (with Servirtium recordings). |
 | elasticsearch | tested live | `modules/elasticsearch`, servirtium-vcr `pre-recorded/from-testcontainers/elasticsearch/test_elasticsearch.ae` (with Servirtium recordings). 8.x secure start: the HTTP wait verifies against the CA read from the container (Go skips verification). |
 | etcd | tested live | `modules/etcd`, `tests/test_etcd.ae`. With clusters: WithNodes, WithClusterToken, WithDataDir, WithAdditionalArgs, ClientEndpoint(s), PeerEndpoint(s), Terminate. The options are module settings (`tc.set_setting`); further cluster nodes run from `tc.request_copy` of the caller's request, so they get the caller's options as in Go. `additional_args` appends on every call (Go keeps the last call's); fewer than two `nodes` means one node. Not the etcd client of Go's examples (the test uses the v3 JSON gateway and etcdctl). |
-| fakegcsserver | tested live | `modules/fakegcsserver`, `tests/test_fakegcsserver.ae`. `scheme("https")` waits over HTTPS without verification, as Go. |
+| fakegcsserver | tested live | `modules/fakegcsserver`, servirtium-vcr `pre-recorded/from-testcontainers/fakegcsserver/test_fakegcsserver.ae` (with Servirtium recordings). `scheme("https")` waits over HTTPS without verification, as Go. |
 | firebird | tested live | `modules/firebird`, `tests/test_firebird.ae`. |
 | forgejo | tested live | `modules/forgejo`, `tests/test_forgejo.ae`. |
-| garage | tested live | `modules/garage`, `tests/test_garage.ae`. |
+| garage | tested live | `modules/garage`, servirtium-vcr `pre-recorded/from-testcontainers/garage/test_garage.ae` (with Servirtium recordings). |
 | gcloud | family, below | Go's `modules/gcloud` holds six emulators; its deprecated flat `RunBigQuery` ... functions (`gcloud.go` and friends) are not ported. |
-| gcloud/bigquery | compile-checked (`TCAE_LIVE_BIGQUERY=1`) | `modules/gcloud/bigquery`, `tests/test_gcloud_bigquery.ae`. Alpha, no engine used to port it. |
+| gcloud/bigquery | tested live | `modules/gcloud/bigquery`, servirtium-vcr `pre-recorded/from-testcontainers/gcloud_bigquery/test_gcloud_bigquery.ae` (with Servirtium recordings). |
 | gcloud/bigtable | compile-checked (`TCAE_LIVE_BIGTABLE=1`) | `modules/gcloud/bigtable`, `tests/test_gcloud_bigtable.ae`. Alpha, no engine used to port it. |
-| gcloud/datastore | compile-checked (`TCAE_LIVE_DATASTORE=1`) | `modules/gcloud/datastore`, `tests/test_gcloud_datastore.ae`. Alpha, no engine used to port it. |
-| gcloud/firestore | compile-checked (`TCAE_LIVE_FIRESTORE=1`) | `modules/gcloud/firestore`, `tests/test_gcloud_firestore.ae`. Alpha, no engine used to port it. |
-| gcloud/pubsub | compile-checked (`TCAE_LIVE_PUBSUB=1`) | `modules/gcloud/pubsub`, `tests/test_gcloud_pubsub.ae`. Alpha, no engine used to port it. |
+| gcloud/datastore | tested live | `modules/gcloud/datastore`, servirtium-vcr `pre-recorded/from-testcontainers/gcloud_datastore/test_gcloud_datastore.ae` (with Servirtium recordings). |
+| gcloud/firestore | tested live | `modules/gcloud/firestore`, servirtium-vcr `pre-recorded/from-testcontainers/gcloud_firestore/test_gcloud_firestore.ae` (with Servirtium recordings). |
+| gcloud/pubsub | tested live | `modules/gcloud/pubsub`, servirtium-vcr `pre-recorded/from-testcontainers/gcloud_pubsub/test_gcloud_pubsub.ae` (with Servirtium recordings). |
 | gcloud/spanner | compile-checked (`TCAE_LIVE_SPANNER=1`) | `modules/gcloud/spanner`, `tests/test_gcloud_spanner.ae`. Alpha, no engine used to port it. |
 | grafana-lgtm | tested live | `modules/grafana_lgtm`, `tests/test_grafana_lgtm.ae`. `modules/grafana_lgtm` (`import modules.grafana_lgtm`): an Aether module path cannot have a `-`. |
 | inbucket | tested live | `modules/inbucket`, `tests/test_inbucket.ae`. |
@@ -132,7 +132,7 @@ that take something else.
 | k6 | tested live | `modules/k6`, `tests/test_k6.ae`. Go's default `szkiba/k6x:v0.3.1` no longer works (it fetches k6's extension catalog from a GitHub path that 404s, exit 116); the test runs the official `grafana/k6:1.0.0`, same arguments. `WithRemoteTestScript` not ported (download the script and pass it to `test_script`). |
 | kafka | tested live | `modules/kafka`, `tests/test_kafka.ae`. |
 | kurrentdb | tested live | `modules/kurrentdb`, `tests/test_kurrentdb.ae`. |
-| localstack | tested live | `modules/localstack`, `tests/test_localstack.ae`. |
+| localstack | tested live | `modules/localstack`, servirtium-vcr `pre-recorded/from-testcontainers/localstack/test_localstack.ae` (with Servirtium recordings). |
 | mailpit | tested live | `modules/mailpit`, `tests/test_mailpit.ae`. `run` returns the `*docker.Container` and the helpers take it. |
 | mariadb | tested live | `modules/mariadb`, `tests/test_mariadb.ae`. Run, ConnectionString, WithDatabase/Username/Password, WithScripts, WithConfigFile, WithDefaultCredentials, the MYSQL_* mirroring of every MARIADB_* variable; not MustConnectionString. The connection string works with `sql.mysql` and `wait.for_sql` (`tests/test_sql_mysql.ae` runs against MariaDB 12.3.2). |
 | meilisearch | tested live | `modules/meilisearch`, `tests/test_meilisearch.ae`. WithDumpImport's file copy and import command are one setter. |
@@ -166,7 +166,7 @@ that take something else.
 | redis | tested live | `modules/redis`, `tests/test_redis.ae`. Not `WithTLS` (needs run-time certificates). |
 | redpanda | tested live | `modules/redpanda`, `tests/test_redpanda.ae`. |
 | registry | tested live | `modules/registry`, `tests/test_registry.ae`. Credentials as a user / password pair on image_exists, delete_image, push_image, else the Docker config and its credential helpers; not `SetDockerAuthConfig` / `DockerAuthConfig`, nor Go's platform matching in `PullImage`. |
-| s3mock | tested live | `modules/s3mock`, `tests/test_s3mock.ae`. |
+| s3mock | tested live | `modules/s3mock`, servirtium-vcr `pre-recorded/from-testcontainers/s3mock/test_s3mock.ae` (with Servirtium recordings). |
 | sbx | not ported | Drives Docker's `sbx` CLI and Docker Sandboxes (a microVM per container with its own Docker engine), which are not released and not available on this Mac; nothing to port against or test. |
 | scylladb | tested live | `modules/scylladb`, `tests/test_scylladb.ae`. |
 | sftp | tested live | `modules/sftp`, `tests/test_sftp.ae`. The test checks the SSH banner on the mapped port and the configured users inside the container (no SSH client in Aether's std, so not Go's x/crypto/ssh + pkg/sftp session). |
