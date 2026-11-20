@@ -89,12 +89,12 @@ says what is ported, file by file, and the state of every module.
 `ae add github.com/servirtium/testcontainers-ae` in the project that holds
 your tests (the default branch, pinned by tree hash in `aether.toml`; a
 `[patch]` entry points it at a local checkout instead). `ae test` reads
-`[dependencies]` too (checked on Aether 0.897.0). Then
+`[dependencies]` too (checked on Aether 0.931.0). Then
 `import testcontainers`, `import testcontainers.wait` and
 `import modules.redis` resolve (the package exports its root,
 `modules = "."`). The toolchain needs the Unix-socket support in
-`std.tcp` / `std.http.client`, on aether's `feat/unix-socket-client`
-branch (0.885.0 dev tree), not yet in a release.
+`std.tcp` / `std.http.client`; released Aether has it (0.931.0 reached a
+rootless Podman engine over its socket).
 
 ### The engine
 
