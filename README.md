@@ -324,6 +324,50 @@ the port's report:
   `client_ed25519` (the scalar of SHA-512 of a password of any length) is
   not ported.
 
+## For consideration: connection deadlines and cancellation
+
+Aether 0.936.0 added, in `std.tcp` and `std.cryptography.tls13_client`
+(design: aether `docs/design/tcp-tls-deadlines-and-cancellation.md`):
+
+- **One absolute deadline per connection** on the monotonic clock
+  (`tcp.connect_until(host, port, due_ms, cancel)`, `tcp.set_deadline(sock,
+  due_ms, cancel)`, `tls13_client.conn_set_deadline(conn, due_ms, cancel)`,
+  and `due_ms:` / `cancel:` on the `tls13_client.connect*` calls). It covers
+  the dial, the handshake and every read and write after; a peer that
+  trickles a byte inside each per-call timeout no longer resets it.
+- **A cancel handle** (`tcp.cancel_new`, `cancel`, `cancel_retain`,
+  `cancel_free`) that another thread or actor trips to wake a blocked
+  connection. The canceller never touches the descriptor, so the owner stays
+  the only closer.
+- Two exact errors, `tcp.DEADLINE_EXCEEDED` and `tcp.CANCELLED`, distinct
+  from `"timeout"`, a peer's close and a TLS failure.
+
+It does **not** reach `std.http.client` or the WebSocket calls: those still
+have only their own per-request timeout. Nothing here is required; these are
+places it could help, not work that is planned.
+
+Where it might apply here:
+
+- **Wait strategies** (`testcontainers/wait/module.ae`,
+  `testcontainers/module.ae`): the port and HTTP waits loop with a startup
+  timeout, dialling with `tcp.connect` each round. A container that accepts
+  the connection and then says nothing can hold one round past the startup
+  timeout. `tcp.connect_until(host, port, due_ms, null)` with the strategy's
+  own deadline as `due_ms` would make the startup timeout the real bound, in
+  one place.
+- **The SQL drivers** (`sql/postgres/pgconn`, `sql/mysql/mysqlconn`) dial
+  with `tcp.connect`/`connect_unix` and upgrade with
+  `tls13_client.connect_socket`. Their timeout settings bound the reads
+  (the MySQL driver notes that `std.tcp.connect` has no dial timeout); `tcp.set_deadline` on the socket before the
+  handshake would bound the whole connection attempt, and
+  `conn_set_deadline` per query would give a real statement timeout on the
+  client side. A cancel handle is also the missing half of query
+  cancellation (wake the blocked read, then send the server its cancel
+  request on a second connection).
+- **Engine calls** (`testcontainers/docker/module.ae`) use
+  `std.http.client` over the engine socket, which the new API does not
+  reach.
+
 ## Credits
 
 testcontainers-ae is a port of testcontainers-go
