@@ -195,6 +195,7 @@ config() -> *Config {
 // environment again. For tests of configuration.
 config_reset() {
     cfg_cache = null
+    close_idle(client_cache)
     client_cache = null
     session_cache = ""
 }
@@ -257,6 +258,11 @@ struct Client {
     os_type: string
     remote_socket: string // the engine's socket as the containers see it
     probed: bool          // remote_socket looked up
+    pool: ptr             // this client's own HTTP connection pool: its API calls share
+                          // connections with each other and with no other client's.
+                          // A Container keeps the client it was made with, so the pool
+                          // lives as long as the client does (client_reset only closes
+                          // its idle connections); null means each call opens its own
 }
 
 var client_cache: ptr = null
@@ -265,6 +271,8 @@ fn client_from_host(host: string) -> (*Client, string) {
     cl = heap.new(Client)
     cl.host = host
     cl.api = MAX_API
+    pool, _perr = client.pool_new()
+    cl.pool = pool
     if string.starts_with(host, "unix://") == 1 {
         cl.unix_path = string.substring(host, 7, string.length(host))
         cl.base_url = "http://localhost"
@@ -292,6 +300,7 @@ fn client_from_host(host: string) -> (*Client, string) {
 // the lower of the server's and ours; DOCKER_API_VERSION pins it).
 fn negotiate(cl: *Client) -> string {
     req = client.request("GET", "${cl.base_url}/_ping")
+    if cl.pool != null { client.set_pool(req, cl.pool) }
     if string.length(cl.unix_path) > 0 { client.set_unix_socket(req, cl.unix_path) }
     client.set_timeout(req, 5s)
     r, err = client.send_request(req)
@@ -419,7 +428,18 @@ client() -> (*Client, string) {
     return null, "no container engine reachable: ${errs}"
 }
 
-client_reset() { client_cache = null }
+client_reset() {
+    close_idle(client_cache)
+    client_cache = null
+}
+
+// Close the idle connections the session's client holds. The client itself is
+// not freed (a Container made with it still points at it), so its pool stays.
+fn close_idle(cp: ptr) {
+    if cp == null { return }
+    cl = cp as *Client
+    if cl.pool != null { client.pool_clear(cl.pool) }
+}
 
 // 1 when an engine answers, the cheap check a test uses to skip.
 engine_available() -> bool {
@@ -465,6 +485,7 @@ engine_socket_for_mounts(cl: *Client) -> string {
     cl.remote_socket = "/var/run/docker.sock"
     if cl.podman {
         req = client.request("GET", "${cl.base_url}/v4.0.0/libpod/info")
+        if cl.pool != null { client.set_pool(req, cl.pool) }
         if string.length(cl.unix_path) > 0 { client.set_unix_socket(req, cl.unix_path) }
         client.set_timeout(req, 10s)
         r, err = client.send_request(req)
@@ -499,6 +520,7 @@ engine_socket_for_mounts(cl: *Client) -> string {
 
 fn make_request(cl: *Client, method: string, path: string, timeout: Duration) -> ptr {
     req = client.request(method, "${cl.base_url}/v${cl.api}${path}")
+    if cl.pool != null { client.set_pool(req, cl.pool) }
     if string.length(cl.unix_path) > 0 { client.set_unix_socket(req, cl.unix_path) }
     client.set_timeout(req, timeout)
     return req
