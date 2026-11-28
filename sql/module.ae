@@ -807,7 +807,7 @@ float_at(r: *Rows, col: int) -> (float, string) {
     if err != "" { return 0.0, err }
     if r.nulls[k] { return 0.0, null_err(col, "float64") }
     s = r.cells[k]
-    v, perr = string.to_double(s)
+    v, perr = string.to_float(s)
     if perr != "" {
         return 0.0, "sql: Scan error on column index ${col}: converting driver.Value type string (\"${s}\") to a float64: invalid syntax"
     }

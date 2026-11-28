@@ -697,7 +697,7 @@ format_float(f: float, is32: bool) -> string {
         if carry { e = e + 1 }
         d = strip_zeros(d)
         cand = layout_e("", d, e)
-        back, perr = string.to_double(cand)
+        back, perr = string.to_float(cand)
         ok = false
         if perr == "" {
             if is32 { ok = round32(back) == a } else { ok = back == a }
